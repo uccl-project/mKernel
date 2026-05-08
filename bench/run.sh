@@ -195,6 +195,9 @@ run_one_2node() {
     if [[ -n "${MKERNEL_PREP_EPOCH_FAST:-}" ]]; then
         env_str="$env_str MKERNEL_PREP_EPOCH_FAST=$MKERNEL_PREP_EPOCH_FAST"
     fi
+    if [[ -n "${MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET:-}" ]]; then
+        env_str="$env_str MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=$MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET"
+    fi
     # Allow per-shape SM-split overrides for gemm_ar tuning sweeps. These
     # take precedence over the COMMON_ENV defaults because later assignments
     # in the env_str win.

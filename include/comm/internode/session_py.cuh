@@ -108,6 +108,14 @@ inline int64_t get_arrival_flags_ptr(Session* session) {
     return reinterpret_cast<int64_t>(internode::get_arrival_device_ptr(session));
 }
 
+// Total number of u32 words in the arrival region (count + tail_count).
+// Used by kernels that perform on-device iter-end reset paired with
+// MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1 in commit_epoch.
+inline int64_t get_arrival_flags_total_words(Session* session) {
+    if (!session) return 0;
+    return (int64_t)session->arrival.count + (int64_t)session->arrival.tail_count;
+}
+
 inline int64_t get_recv_buf_ptr(Session* session) {
     return reinterpret_cast<int64_t>(internode::get_recv_buf_ptr(session));
 }

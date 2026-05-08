@@ -1006,7 +1006,9 @@ __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
             // Reset arrival flags on-stream BEFORE the barrier — the barrier then
             // gates peer's next-iter send, so no clobber race with peer RDMA.
             gemm_ar_iter_end_reset_arrival_flags(G, reduce_base, G.num_inter_reduce_store_sms);
-            gemm_ar_hierarchical_xnode_barrier(G, reduce_base);
+            if (!G.skip_final_barrier) {
+                gemm_ar_hierarchical_xnode_barrier(G, reduce_base);
+            }
         }
     }
 }
@@ -1026,7 +1028,9 @@ __device__ inline void fused_epilogue_kernel(const fused_globals& G) {
         // Reset arrival flags on-stream BEFORE the barrier; gating peer's
         // next-iter RDMA writes behind our push means no clobber race.
         gemm_ar_iter_end_reset_arrival_flags(G, reduce_base, G.num_inter_reduce_store_sms);
-        gemm_ar_hierarchical_xnode_barrier(G, reduce_base);
+        if (!G.skip_final_barrier) {
+            gemm_ar_hierarchical_xnode_barrier(G, reduce_base);
+        }
     }
 }
 

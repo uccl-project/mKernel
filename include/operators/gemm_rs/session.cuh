@@ -71,6 +71,9 @@ std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
     return internode::py::get_fifo_handles(g_session);
 }
 int64_t get_arrival_flags_ptr_py() { return internode::py::get_arrival_flags_ptr(g_session); }
+int64_t get_arrival_flags_total_words_py() {
+    return internode::py::get_arrival_flags_total_words(g_session);
+}
 int64_t get_recv_buf_ptr_py() { return internode::py::get_recv_buf_ptr(g_session); }
 
 #include <torch/csrc/utils/pybind.h>
@@ -96,6 +99,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_epoch", &set_epoch_py);
     m.def("get_fifo_handles", &get_fifo_handles_py);
     m.def("get_arrival_flags_ptr", &get_arrival_flags_ptr_py);
+    m.def("get_arrival_flags_total_words", &get_arrival_flags_total_words_py);
     m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);
     m.def("gemm_rs_fused", &gemm_rs_multinode::entrypoint_fused,
           pybind11::arg("A"),
@@ -122,5 +126,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("reduce_poll_sleep_ns") = (int64_t)100,
           pybind11::arg("ready_chunk"),
           pybind11::arg("staging") = pybind11::none(),
-          pybind11::arg("num_nodes") = 2);
+          pybind11::arg("num_nodes") = 2,
+          pybind11::arg("arrival_total_words") = 0);
 }

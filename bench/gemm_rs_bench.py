@@ -12,6 +12,10 @@ from pathlib import Path
 # Keep the release default, but allow parity tests against the experiment
 # harness, which leaves this unset.
 os.environ.setdefault("MKERNEL_BIND_RETAINED_HANDLE", "1")
+# team_v14: skip the host-side reset_arrival_flags + cudaDeviceSynchronize in
+# commit_epoch. Safe because the gemm_rs kernel now resets the arrival region
+# on-device at iter-end via the dedicated reduce CTAs (mirrors gemm_ar).
+os.environ.setdefault("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
 
 import torch
 import torch.distributed as dist
@@ -201,6 +205,10 @@ def main():
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
         recv_ptr = mod.get_recv_buf_ptr()
+        # Total u32 words (count + tail_count) in the arrival region. Passed to
+        # the kernel so the dedicated reduce CTAs can perform the iter-end
+        # on-device reset (paired with MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1).
+        arrival_total_words = mod.get_arrival_flags_total_words()
 
         epoch = 1
         mod.set_epoch(epoch)
@@ -224,6 +232,7 @@ def main():
                 ready_chunk,
                 staging_dbuf,
                 num_nodes=NUM_NODES,
+                arrival_total_words=arrival_total_words,
             )
 
         for wi in range(args.warmup):
