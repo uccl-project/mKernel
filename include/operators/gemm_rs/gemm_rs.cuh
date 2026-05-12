@@ -240,6 +240,11 @@ struct fused_globals {
         uint8_t use_intra_rs_dual_write;
         uint8_t _pad0[2];
         uint32_t reduce_poll_sleep_ns;
+        // Total number of u32 words in the arrival region (count + tail_count).
+        // Populated from session at entry; used by the on-device iter-end reset
+        // to zero the entire arrival region cooperatively. When 0, the kernel
+        // skips the on-device reset and the host commit_epoch path is responsible.
+        uint32_t arrival_total_words;
     };
 
     intra_globals intra;
@@ -385,6 +390,50 @@ __device__ __forceinline__ int gemm_rs_send_ready_bitmap_region_base(
 }
 
 
+// Cooperative iter-end reset of arrival flags (and per-queue tails). Mirrors
+// gemm_ar_iter_end_reset_arrival_flags in gemm_ar.cuh. Called by the dedicated
+// reduce CTAs after reduce_tiles_ws drains the work-stealing pool, before the
+// kernel exits. Pairs with MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1 in the
+// host commit_epoch path: that env var elides the host-side memset over the
+// arrival region and the cudaDeviceSynchronize that follows; the kernel does
+// the equivalent zeroing here.
+//
+// Safety: the reduce CTAs only enter this routine after every chunk's
+// arrival_flags slot has been polled to == epoch in reduce_tiles_ws (the
+// next_reduce work-stealing counter exits the loop only when chunk_id >=
+// total_chunks, meaning every claimed chunk's flag was read). After zeroing,
+// peer's next-iter RDMA WRITEs of the next epoch land on a clean slot — the
+// same window the host-side memset relies on, just moved earlier on-stream.
+__device__ inline void gemm_rs_iter_end_reset_arrival_flags(
+    const fused_globals::runtime_state& Rt,
+    int participating_block_start, int participating_block_count
+) {
+    if (Rt.arrival_total_words == 0u) return;
+    const int local_bid = blockIdx.x - participating_block_start;
+    if (local_bid < 0 || local_bid >= participating_block_count) return;
+    // Spin until every chunk has published completion. reduce_tiles_ws
+    // increments Rt.chunks_processed once per chunk; when it reaches
+    // total_chunks every reducer (including recycled compute/send CTAs)
+    // has finished polling arrival_flags for this iter, so it's safe to
+    // wipe. Only thread 0 polls the counter; the rest wait at __syncthreads.
+    const unsigned int total_chunks =
+        (unsigned int)Rt.row_blocks_per_slice * (unsigned int)Rt.chunks_per_row;
+    if (threadIdx.x == 0) {
+        while (comm::atomic_u32::acquire_load_gpu(Rt.chunks_processed) < total_chunks) {
+        }
+    }
+    __syncthreads();
+    const int total_words = (int)Rt.arrival_total_words;
+    const int stride = participating_block_count * blockDim.x;
+    const int offset = local_bid * blockDim.x + threadIdx.x;
+    volatile uint32_t* flag_ptr = Rt.arrival_flags;
+    for (int i = offset; i < total_words; i += stride) {
+        flag_ptr[i] = 0u;
+    }
+    __threadfence_system();
+    __syncthreads();
+}
+
 // ============================================================================
 // Host entrypoint
 // ============================================================================
@@ -475,8 +524,13 @@ void entrypoint_fused(
     dist::ParallelBuffer &ready_chunk,
     // Staging DistBuffer used as the chunk-major intra-RS atomic-add target.
     pybind11::object staging_obj,
-    int num_nodes = 2  // Total node count (>= 2). N == 2 reproduces the
-                       // legacy 2-node behavior bit-for-bit.
+    int num_nodes = 2,  // Total node count (>= 2). N == 2 reproduces the
+                        // legacy 2-node behavior bit-for-bit.
+    int arrival_total_words = 0  // Total u32 words in the arrival region
+                                 // (session arrival.count + arrival.tail_count).
+                                 // When > 0, the kernel performs an on-device
+                                 // iter-end reset; pairs with
+                                 // MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1.
 ) {
     const int dev_idx = output.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -703,6 +757,7 @@ void entrypoint_fused(
             .use_intra_rs_dual_write = (uint8_t)(use_intra_rs_dual_write_rt ? 1u : 0u),
             ._pad0 = {0, 0},
             .reduce_poll_sleep_ns = (uint32_t)(reduce_poll_sleep_ns > 0 ? reduce_poll_sleep_ns : 100),
+            .arrival_total_words = (uint32_t)(arrival_total_words > 0 ? arrival_total_words : 0),
         };
         cudaMemcpyAsync(g_fused_runtime[dev_idx], &rt, sizeof(rt),
                         cudaMemcpyHostToDevice, stream);

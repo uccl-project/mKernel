@@ -328,6 +328,12 @@ struct fused_globals {
     int remote_queue_stride;
     int defer_final_multicast_finish;
     int work_steal_enabled;
+    // MKERNEL_GEMM_AR_SKIP_FINAL_BARRIER: when 1, skip the iter-end
+    // hierarchical_xnode_barrier entirely (no NOTIFY push, no spin). For
+    // experimental measurement of barrier cost. Correctness only holds if
+    // host-side dist.barrier()/synchronize keeps ranks aligned per iter
+    // (i.e., legacy-sync mode), or the workload tolerates >=1 iter of drift.
+    int skip_final_barrier;
     // When true, intra-AR xdev barrier waits use acquire loads instead of
     // relaxed loads. The branch is outside the spin body.
     bool use_acquire_poll = false;
@@ -1220,6 +1226,7 @@ __host__ inline fused_globals gemm_ar_make_globals(
         .remote_queue_stride = scratch.remote_queue_stride,
         .defer_final_multicast_finish = 0,
         .work_steal_enabled = 0,
+        .skip_final_barrier = 0,
         .total_chunks = scratch.total_chunks,
         .total_tiles_per_device = scratch.slice_tiles,
         .chunk_tiles = scratch.chunk_tiles,
@@ -1317,6 +1324,10 @@ void entrypoint(
     {
         const char* ws_env = std::getenv("GEMM_AR_WORK_STEAL");
         G.work_steal_enabled = (ws_env != nullptr && ws_env[0] == '1') ? 1 : 0;
+    }
+    {
+        const char* sb_env = std::getenv("MKERNEL_GEMM_AR_SKIP_FINAL_BARRIER");
+        G.skip_final_barrier = (sb_env != nullptr && sb_env[0] == '1') ? 1 : 0;
     }
     {
         const char* r8_env = std::getenv("GEMM_AR_R8_WARP_SPEC");

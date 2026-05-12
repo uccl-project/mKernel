@@ -426,6 +426,16 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
                 *reinterpret_cast<uint4*>(Rt.output_local + si) = ov;
             }
         }
+        // Publish per-chunk completion. Used by the iter-end on-device
+        // arrival-flag reset (gemm_rs_iter_end_reset_arrival_flags) to wait
+        // for ALL claimed chunks to drain — including those still being
+        // polled by a peer reduce CTA after this one has exited via the
+        // chunk_id >= total_chunks branch.
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence();
+            atomicAdd(Rt.chunks_processed, 1u);
+        }
     }
 
 }
@@ -547,7 +557,20 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         reduce_tiles_ws<fused_globals>(G);
     }
 
-
+    // On-device iter-end reset of arrival flags. Mirrors gemm_ar's
+    // gemm_ar_iter_end_reset_arrival_flags pattern: the dedicated reduce
+    // CTAs cooperatively zero the arrival region after reduce_tiles_ws has
+    // drained — by then every chunk's flag has been polled to == epoch and
+    // the slots are no longer read this iter. Pairs with
+    // MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1 in commit_epoch, which then
+    // skips the host-side memset + cudaDeviceSynchronize.
+    if (G.rt != nullptr) {
+        const int reduce_base = I.num_comp_sms + I.num_comm_sms + G.num_send_sms;
+        const int reduce_count = (int)gridDim.x - reduce_base;
+        if (reduce_count > 0 && (int)blockIdx.x >= reduce_base) {
+            gemm_rs_iter_end_reset_arrival_flags(*G.rt, reduce_base, reduce_count);
+        }
+    }
 
     // Match the split intra kernel when we intentionally launch only the
     // compute + intranode CTAs for debugging/reuse checks.
