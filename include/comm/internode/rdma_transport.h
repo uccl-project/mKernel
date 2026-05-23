@@ -282,7 +282,7 @@ inline int post_write_with_flag(ibv_qp* qp,
 }
 
 // ---------------------------------------------------------------------------
-// TCP Bootstrap: exchange ConnectionInfo between two nodes
+// TCP Bootstrap: exchange ConnectionInfo between peer nodes
 // ---------------------------------------------------------------------------
 
 namespace detail {

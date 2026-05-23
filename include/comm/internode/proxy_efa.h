@@ -158,9 +158,8 @@ struct ProxyConfig {
     // for AH/dst_qpns/remote_*. peer_slot_by_rank is owned by the Session
     // (lifetime > Proxy); per_peer is owned by the Session too.
     //
-    // For num_peers == 1 (the validated 2-node configuration) per_peer is
-    // optional and unused — the existing scalar dst_ah / dst_qpns / remote_*
-    // fields above are read directly so the fast path is byte-identical.
+    // For num_peers == 1, per_peer[0] aliases the scalar dst_ah / dst_qpns /
+    // remote_* fields.
     int                  num_peers           = 1;
     const PerPeerProxyData* per_peer         = nullptr;  // length = num_peers
     const int*           peer_slot_by_rank   = nullptr;  // length = kMaxPeers + 1
@@ -915,22 +914,16 @@ private:
 
                 ibv_qp_ex* qpx = qpx_[batch_qp];
 
-                // Resolve the per-peer endpoint for this batch. Today's
-                // batch-fill loop only breaks on QP changes — for N>2
-                // we'd need to also break on cmd.dst_rank changes to keep
-                // batches single-peer. At N=2 every cmd.dst_rank is the
-                // same value (1 - node_idx), so single-peer-per-batch
-                // already holds. For num_peers <= 1 we use per_peer[0]
-                // unconditionally; per_peer[0] aliases the legacy fields
-                // at slot 0, so the fast path is byte-identical.
+                // Resolve the per-peer endpoint for this batch. Batches are
+                // filled per QP; callers that mix dst_rank values on one QP
+                // should split batches by peer before posting.
                 int peer_slot = 0;
                 if (cfg_.num_peers > 1 && cfg_.peer_slot_by_rank != nullptr) {
                     const uint8_t r = batch[0].dst_rank;
                     const int s = cfg_.peer_slot_by_rank[r];
                     if (s >= 0) peer_slot = s;
                 }
-                // Session always populates per_peer (slot 0 mirrors the
-                // legacy single-peer fields in the 2-node config).
+                // Session always populates per_peer.
                 const PerPeerProxyData& eff = cfg_.per_peer[peer_slot];
                 const uint32_t dst_qpn = eff.dst_qpns[batch_qp];
 

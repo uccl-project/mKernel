@@ -11,7 +11,7 @@
  *
  * Original design notes (from src/ring_attention.cu pre-split):
  *
- *  2-node x 8-GPU Ring Attention.
+ *  Multi-node Ring Attention.
  *
  *  Algorithm (16 logical ring stages = 8 local + 1 inter-node hop + 8 local):
  *    Stage 0:        Each GPU computes attention(Q, local KV in K0/V0) -> O, L

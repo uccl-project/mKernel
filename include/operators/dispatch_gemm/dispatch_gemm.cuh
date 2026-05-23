@@ -2,7 +2,7 @@
 
 /**
  * @file moe_dispatch_gemm_multinode.cu
- * @brief 2-node × 8-GPU MoE Dispatch + Group GEMM.
+ * @brief Multi-node MoE Dispatch + Group GEMM.
  *
  * Uses the intra-node 8-GPU dispatch pattern
  * (pre_tokens_distributed_tensor + pull-based dispatch + per-row-block barrier counter +

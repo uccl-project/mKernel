@@ -321,10 +321,8 @@ struct fused_globals {
     // Dimensions
     int N;                    // output columns
     int dev_idx;              // local rank (0..7)
-    int node_idx;             // 0 or 1 in the validated 2-node config
-    int num_nodes;            // total node count (>= 2). Scaffolding for
-                              // N-node fan-out; receive-buffer sizing not
-                              // yet generalized for N > 2.
+    int node_idx;             // node rank
+    int num_nodes;            // total node count (>= 2)
     int slice_rows;           // M / NUM_DEVICES
     int row_blocks_per_slice; // slice_rows / ROW_BLOCK
     int col_blocks;           // N / COL_BLOCK

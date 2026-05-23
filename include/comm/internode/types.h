@@ -28,7 +28,7 @@ enum class CmdType : uint8_t {
 #pragma pack(push, 1)
 struct TransferCmd {
     CmdType  cmd_type;       // WRITE or FENCE
-    uint8_t  dst_rank;       // target node rank (0/1 in the 2-node setup)
+    uint8_t  dst_rank;       // target node rank
     uint16_t tile_id;        // first tile of this transfer (arrival metadata payload base)
     uint32_t bytes;          // transfer size in bytes
     uint32_t local_offset;   // byte offset into RDMA-registered local buffer
@@ -85,9 +85,7 @@ __host__ __device__ inline uint32_t unpack_arrival_num_tiles(uint32_t packed) {
 
 static constexpr int kMaxExchangeQPs = 24;
 static constexpr int kMaxRails = 4;
-// Cap on inter-node peer slots per session (== num_nodes - 1). The 2-node
-// case uses 1; left generous so a single header bump can support larger
-// N-node tests.
+// Cap on inter-node peer slots per session (== num_nodes - 1).
 static constexpr int kMaxPeers = 16;
 
 // Map a peer slot index to a global node rank, in "skip self" ordering:
@@ -95,9 +93,6 @@ static constexpr int kMaxPeers = 16;
 //   slot 1 = (node_idx + 2) % num_nodes
 //   ...
 //   slot num_nodes - 2 = (node_idx + num_nodes - 1) % num_nodes
-//
-// For num_nodes == 2, slot 0 returns 1 - node_idx — bit-identical to today's
-// hard-coded `(uint8_t)(1 - G.node_idx)` 2-node peer.
 //
 // Used by every kernel's inter-node send path to fan out (num_nodes - 1)
 // commands per logical send. The session-side peer_slot_by_rank[] table
@@ -117,12 +112,11 @@ __host__ __device__ inline int peer_rank_for_slot(int node_idx,
 // peer_rank_for_slot from the perspective of the receiver:
 //   peer_rank_for_slot(peer_rank, num_nodes, slot_at_peer) == my_rank
 //
-// For N == 2 (the validated configuration) slot_at_peer is always 0,
-// regardless of (my_rank, peer_rank). The expressions
+// For N == 2, slot_at_peer is always 0, regardless of (my_rank, peer_rank).
+// The expressions
 //   cmd.remote_offset = slot_at_peer * single_peer_bytes + base_offset
 //   cmd.tile_id      = slot_at_peer * single_peer_tiles + chunk_id
-// therefore add zero offsets at N == 2 and keep behavior bit-identical to
-// the legacy 2-node code. For N > 2 the offsets partition the receiver's
+// therefore add zero offsets at N == 2. For N > 2 the offsets partition the receiver's
 // recv_buf and arrival flag array by sender slot.
 __host__ __device__ inline int slot_at_peer(int my_rank, int peer_rank, int num_nodes) {
     int slot = my_rank - peer_rank - 1;

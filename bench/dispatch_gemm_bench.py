@@ -212,13 +212,8 @@ def main():
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
 
-    # Peer IP / TCP port for session bootstrap (matches experiment harness).
-    peer_ip = os.environ.get("PEER_IP")
-    if not peer_ip:
-        peer_node = 1 if node_idx == 0 else 0
-        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
-        if not peer_ip:
-            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+    peer_ips = get_peer_ips(node_idx, NUM_NODES)
+    peer_ip = os.environ.get("PEER_IP", peer_ips[0])
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -330,8 +325,8 @@ def main():
 
         pre_tokens_bytes = num_local_tokens * H * 2
         total_chunks = (pre_tokens_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
-        # Per-peer sizing. At N == 2 the multiplier is 1 — same buffer /
-        # arrival-flag sizing as the legacy single-peer setup.
+        # Per-peer sizing. At N == 2 the multiplier is 1; larger runs allocate
+        # one receive/arrival slot per remote peer.
         recv_buf_chunks = n_peers * total_chunks
         copy_ready = mod.DistBuffer(
             (world_size, recv_buf_chunks, 1), dtype=torch.int32,
@@ -350,7 +345,6 @@ def main():
         external_recv_buf_ptr = int(peer_tokens.data_.data_ptr())
         # Zero-copy send: register pre_tokens as the proxy's data MR. Kernel
         # reads straight from pre_tokens — no send_buf pack required.
-        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             int(pre_tokens.data_.data_ptr()), pre_tokens_bytes,
@@ -391,10 +385,8 @@ def main():
             sync_barrier.data_.zero_()
             copy_ready.data_.zero_()
 
-        # Prime: first epoch is a known stale-state warmup on the legacy
-        # two-node path. On N-node fanout it can mask the real check by
-        # deadlocking before the measured iteration, so start from a fresh
-        # epoch/reset there instead.
+        # Prime only for the single-peer path. N-node fanout starts from a
+        # fresh epoch/reset before the measured iteration.
         if NUM_NODES <= 2:
             reset_state(); dist.barrier(); time.sleep(0.05)
             run_once(); torch.cuda.synchronize(); dist.barrier()

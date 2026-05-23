@@ -2,7 +2,7 @@
 
 /**
  * @file gemm_rs_multinode.cu
- * @brief 2-node × 8-GPU GEMM + Reduce-Scatter.
+ * @brief Multi-node GEMM + Reduce-Scatter.
  *
  * Uses the intra-node 8-GPU pattern
  * (output_distributed_tensor + tma::store_add_async + per-task ready flags + atomic

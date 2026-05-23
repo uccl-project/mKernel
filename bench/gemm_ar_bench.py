@@ -240,12 +240,8 @@ def main():
 
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
-    peer_ip = os.environ.get("PEER_IP")
-    if not peer_ip:
-        peer_node = 1 if node_idx == 0 else 0
-        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
-        if not peer_ip:
-            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+    peer_ips = get_peer_ips(node_idx, NUM_NODES)
+    peer_ip = os.environ.get("PEER_IP", peer_ips[0])
     tcp_port = int(os.environ.get("TCP_PORT", "19730")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -344,7 +340,6 @@ def main():
         direct_src_ptr = int(remote_accum.data_ptr()) if ring_experiment and remote_accum is not None else clocal_ptr
         direct_src_bytes = staging_bytes if ring_experiment and remote_accum is not None else clocal_bytes
         row_stride_bytes = N * 2
-        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             staging_buf.data_ptr(), staging_bytes,

@@ -100,7 +100,7 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     }
     // Throughput-oriented defaults for true multi-node (N>2 peers): more QPs +
     // more D2H FIFO / proxy threads reduce host-side serialization. Opt out
-    // with AG_GEMM_PERF_PRESET=legacy (2-node regression / A/B parity).
+    // with AG_GEMM_PERF_PRESET=legacy for A/B comparisons.
     if (!perf_legacy && cfg.num_peers > 1) {
         if (std::getenv("MKERNEL_EFA_NUM_QPS") == nullptr &&
             std::getenv("MKERNEL_INTERNODE_NUM_QPS") == nullptr &&

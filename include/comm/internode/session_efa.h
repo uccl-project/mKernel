@@ -55,10 +55,7 @@ static constexpr int kMaxQPs = kEfaMaxQPs;
 
 struct SessionConfig {
     int         rank;
-    // Legacy single-peer fields. Still honored when `num_peers == 0`, which
-    // create_session() interprets as "treat (peer_ip, tcp_port) as the sole
-    // peer". New callers should set num_peers + peer_ips + peer_tcp_ports
-    // and leave peer_ip/tcp_port null/0.
+
     const char* peer_ip   = nullptr;
     int         tcp_port  = 0;
     // Multi-peer (N-node) fields. When num_peers > 0, peer_ips[i] /
@@ -178,13 +175,12 @@ struct Session {
 
     // Per-QP destination QPN (remote QP number). Single-peer slice; the
     // multi-peer table below is what proxy_efa.h reads when dispatching a
-    // TransferCmd. dst_qpns[i] aliases dst_qpns_per_peer[0][i] for the
-    // 2-node case (num_peers == 1) so legacy code paths that read dst_qpns
-    // directly still see the right values.
+    // TransferCmd. dst_qpns[i] aliases dst_qpns_per_peer[0][i] when there is
+    // only one peer.
     uint32_t      dst_qpns[kEfaMaxQPs];
 
     // Multi-peer destination QPN table. Indexed [peer_slot][qp_idx].
-    // Populated for every session — for the 2-node case num_peers == 1 and
+    // Populated for every session; when there is one peer,
     // dst_qpns_per_peer[0][:] == dst_qpns[:].
     int           num_peers;
     uint32_t      dst_qpns_per_peer[kMaxPeers][kEfaMaxQPs];
@@ -198,8 +194,7 @@ struct Session {
     int           peer_slot_by_rank[kMaxPeers + 1];
 
     // Translate a cmd.dst_rank (global node rank) to a peer slot for
-    // dst_qpns_per_peer / remote_infos lookup. Returns 0 in the legacy
-    // 2-node configuration regardless of dst_rank value.
+    // dst_qpns_per_peer / remote_infos lookup.
     inline int peer_slot_of_rank(int dst_rank) const {
         if (num_peers <= 1) return 0;
         if (dst_rank < 0 || dst_rank > kMaxPeers) return 0;
@@ -532,11 +527,8 @@ inline Session* create_session(const SessionConfig& cfg) {
         ri.barrier_rkey = s->rails[r].barrier_mr->rkey;
     }
 
-    // Multi-peer config resolution. Today the EFA path's TCP exchange + RTR
-    // is single-peer; this block normalizes the (legacy peer_ip, multi-peer
-    // peer_ips[]) inputs into a single uniform "(peer_slot, ip, port,
-    // remote_rank)" tuple list so subsequent code can iterate. For N=2 the
-    // list has length 1 and the loop body runs once, identical to before.
+    // Multi-peer config resolution. Normalize the single-peer shorthand and
+    // peer_ips[] inputs into "(peer_slot, ip, port, remote_rank)" tuples.
     int            sess_num_peers = (cfg.num_peers > 0) ? cfg.num_peers : 1;
     if (sess_num_peers > kMaxPeers) sess_num_peers = kMaxPeers;
     const char*    sess_peer_ips[kMaxPeers];
@@ -554,7 +546,7 @@ inline Session* create_session(const SessionConfig& cfg) {
     } else {
         sess_peer_ips[0]   = cfg.peer_ip;
         sess_peer_ports[0] = cfg.tcp_port;
-        sess_peer_ranks[0] = 1 - cfg.rank;  // 2-node binary peer
+        sess_peer_ranks[0] = (cfg.rank == 0) ? 1 : 0;
     }
 
     // Populate Session.peer_slot_by_rank: rank → slot, -1 for self / unused.
@@ -571,12 +563,8 @@ inline Session* create_session(const SessionConfig& cfg) {
     // remote_infos[p], then build per-rail AHs for that peer's GID. The
     // server/client convention is by rank: lower-ranked side is the server.
     //
-    // Two ranks must use a symmetric port for their pair. Today's 2-node
-    // setup uses a single shared port — in that degenerate case each rank
-    // has only one peer and they trivially agree. For N>2 callers must pass
-    // peer_tcp_ports[] aligned across nodes (e.g., port_base + symmetric_pair_offset).
-    // The loop below is correct for any well-formed input; it has only been
-    // exercised end-to-end with num_peers == 1.
+    // Every rank pair must use a symmetric port. For N>2 callers pass
+    // peer_tcp_ports[] aligned across nodes, e.g. port_base + pair offset.
     for (int p = 0; p < sess_num_peers; ++p) {
         const int peer_rank = sess_peer_ranks[p];
         const bool is_server = (cfg.rank < peer_rank);
@@ -584,9 +572,7 @@ inline Session* create_session(const SessionConfig& cfg) {
             local_info, sess_peer_ips[p], sess_peer_ports[p], is_server);
         s->remote_infos[p] = remote;
         if (p == 0) {
-            // Slot 0 aliases the legacy single-peer fields so existing
-            // single-peer code paths (proxy hot path, diagnostic prints)
-            // continue to read the same data without changes.
+            // Slot 0 aliases the single-peer fields for compatibility.
             s->remote_info = remote;
             s->dst_qpns[0] = remote.qp_num;
             for (int i = 1; i < num_qps; i++) {
@@ -610,8 +596,7 @@ inline Session* create_session(const SessionConfig& cfg) {
             ibv_ah* ah = rdma::create_ah(s->rails[r].pd, remote_gid);
             s->rails[r].dst_ah_per_peer[p] = ah;
             if (p == 0) {
-                // Legacy single-peer AH alias used by the existing proxy
-                // hot path until per-peer routing lands.
+                // Single-peer AH alias.
                 s->rails[r].dst_ah = ah;
             }
         }
@@ -718,10 +703,7 @@ inline Session* create_session(const SessionConfig& cfg) {
         pcfg.remote_barrier_rkey = remote_barrier_rkey;
 
         // Multi-peer endpoint table for the proxy hot path. Each entry
-        // covers a single peer slot from the perspective of THIS proxy's
-        // rail. For the validated 2-node configuration (sess_num_peers ==
-        // 1) the proxy hot path reads the legacy scalar fields above and
-        // ignores per_peer; the table is still populated for symmetry.
+        // covers a single peer slot from this proxy's rail.
         for (int p = 0; p < sess_num_peers; ++p) {
             const ConnectionInfo& ri = s->remote_infos[p];
             const int p_remote_rail = (ri.num_rails > 1)

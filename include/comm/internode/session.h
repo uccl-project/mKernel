@@ -165,16 +165,12 @@ inline std::string select_nic_for_device(int device_id) {
 // ---------------------------------------------------------------------------
 
 struct SessionConfig {
-    int         rank;                // 0 or 1 (our node rank)
-    const char* peer_ip   = nullptr; // legacy single peer; honored when
+    int         rank;                // node rank
+    const char* peer_ip   = nullptr; // single-peer shorthand; honored when
                                      // num_peers == 0 (peer_ips unused).
-    int         tcp_port  = 0;       // legacy single TCP port for bootstrap.
-    // Multi-peer (N-node) fields. When num_peers > 0 the create_session()
-    // implementation should iterate over peer_ips[]/peer_tcp_ports[] for
-    // its TCP exchange + RC RTR transition. Today CX7's create_session
-    // still requires num_peers <= 1; >1 aborts with a clear message.
-    // (The EFA backend has the per-peer loop wired through; CX7 mirror
-    // is the natural next step at a CX7 testbed.)
+    int         tcp_port  = 0;       // single-peer TCP port for bootstrap.
+    // Multi-peer (N-node) fields. When num_peers > 0, create_session()
+    // iterates over peer_ips[]/peer_tcp_ports[] for TCP exchange and QP setup.
     int                num_peers       = 0;
     const char* const* peer_ips        = nullptr;
     const int*         peer_tcp_ports  = nullptr;

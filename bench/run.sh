@@ -178,7 +178,7 @@ run_one_2node() {
             return 1
         fi
         # First positional to nccl_baseline_bench.py is kernel name (ag_gemm, ...).
-        extra_args="ag_gemm"
+        extra_args="${NCCL_BASELINE_KERNEL:-ag_gemm}"
         if [[ -n "$SHAPES" ]]; then
             extra_args="$extra_args --shapes $SHAPES"
         fi

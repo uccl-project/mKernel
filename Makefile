@@ -2,8 +2,8 @@
 #
 # Usage:
 #   make all       — build all 5 .so's into build/
-#   make check     — run correctness check across all 5 kernels (2-node)
-#   make bench     — run wall-time bench across all 5 kernels (2-node)
+#   make check     — run correctness check across all 5 kernels
+#   make bench     — run wall-time bench across all 5 kernels
 #   make plots     — regenerate TFLOPS bar charts under plots/
 #   make clean     — remove build/
 

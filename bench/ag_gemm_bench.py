@@ -99,12 +99,8 @@ def main():
 
     node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
     is_chief = (local_rank == 0 and node_idx == 0)
-    peer_ip = os.environ.get("PEER_IP")
-    if not peer_ip:
-        peer_node = 1 if node_idx == 0 else 0
-        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
-        if not peer_ip:
-            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+    peer_ips = get_peer_ips(node_idx, NUM_NODES)
+    peer_ip = os.environ.get("PEER_IP", peer_ips[0])
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -228,10 +224,9 @@ def main():
         if os.environ.get("AG_GEMM_TILED_DIRECT") == "1":
             total_chunks *= 2
 
-        # Per-peer recv_buf / arrival flag scaling. At N == 2 the multiplier
-        # is 1 — single-peer-sized, identical to the legacy allocation. At
-        # N > 2 the receiver gets one slot of size a_half_bytes + total_chunks
-        # arrival flag entries per sender.
+        # Per-peer recv_buf / arrival flag scaling. N == 2 has one peer slot;
+        # larger runs allocate one slot of size a_half_bytes + total_chunks
+        # arrival flag entries per remote sender.
         recv_buf_bytes = n_peers * a_half_bytes * ring_recv_banks
         recv_buf_chunks = n_peers * total_chunks * ring_recv_banks
 
@@ -244,7 +239,6 @@ def main():
         # Direct mode sends local A through MR1 (src_view=1). Ring mode also
         # registers A_recv as MR0 (src_view=0) so received shards can be
         # forwarded to the next node after phase-2 republishes them.
-        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             send_buf_ptr, send_buf_size, recv_buf_bytes,

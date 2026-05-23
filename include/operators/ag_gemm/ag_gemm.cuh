@@ -79,7 +79,6 @@ struct comp_task {
 
 struct globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
-    static constexpr int NUM_NODES = 2;
     // Three stages keep the producer/consumer pipeline deep enough while
     // leaving more shared memory headroom than a four-stage pipeline.
     static constexpr int PIPELINE_STAGES = 3;
@@ -648,8 +647,7 @@ void entrypoint(
     dist::ParallelBuffer& A_recv,  // #8: multicast-backed peer A_half
     const int active_sms = config::NUM_BLOCKS,
     int num_intra_comm_override = 0,
-    int num_nodes = 2  // total node count (>= 2). N == 2 reproduces the
-                       // legacy 2-node behavior bit-for-bit.
+    int num_nodes = 2  // total node count (>= 2).
 ) {
     TORCH_CHECK(B.is_cuda() && B.is_contiguous(), "B must be contiguous CUDA");
     TORCH_CHECK(C.is_cuda() && C.is_contiguous(), "C must be contiguous CUDA");
@@ -730,7 +728,7 @@ void entrypoint(
         fifo_triggers, fifo_head, fifo_tail, fifo_tail_cache, fifo_capacity,
         16, logical_lq);
     // Internode AG pattern: ring when num_nodes > 2 unless overridden.
-    //   unset / "auto"  → ring if num_nodes > 2 else direct (2-node)
+    //   unset / "auto"  → ring if num_nodes > 2 else direct
     //   "ring" / "direct" → force that mode
     int collective_mode = 0;
     const char* ic = std::getenv("AG_GEMM_INTERNODE_COLLECTIVE");

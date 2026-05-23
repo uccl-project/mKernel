@@ -142,12 +142,8 @@ def main():
         for lr in range(world_size)
     ]
 
-    peer_ip = os.environ.get("PEER_IP")
-    if not peer_ip:
-        peer_node = 1 if node_idx == 0 else 0
-        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
-        if not peer_ip:
-            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+    peer_ips = get_peer_ips(node_idx, NUM_NODES)
+    peer_ip = os.environ.get("PEER_IP", peer_ips[0])
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -242,7 +238,6 @@ def main():
             fifo_cap *= 2
 
         dist.barrier()
-        peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
             staging_buf.data_ptr(), staging_bytes,

@@ -45,7 +45,7 @@ inline SessionConfig make_base_config(
 // caller-supplied vector storage; the caller must keep that storage alive
 // until the session is destroyed (typically file-scope statics in each
 // operator shim). When peer_ips is empty, leaves cfg unchanged so the
-// legacy single-peer path (cfg.peer_ip / cfg.tcp_port) is used.
+// single-peer shorthand (cfg.peer_ip / cfg.tcp_port) is used.
 inline void apply_peer_ips(
     SessionConfig& cfg,
     std::vector<std::string>& peer_ips,
