@@ -38,8 +38,10 @@
 
 namespace internode {
 
-// Match CX7: two stage-barrier slots per session.
-static constexpr int kEfaStageBarrierSlots = 2;
+// One stage-barrier slot per peer (sender-indexed via slot_at_peer). Sized to
+// kMaxPeers so the GPU-driven cross-node barrier can be fanned out to every
+// peer in a multi-node run without resizing.
+static constexpr int kEfaStageBarrierSlots = kMaxPeers;
 // Cap total QPs per session (mirrors CX7's kMaxQPs/kMaxExchangeQPs).
 static constexpr int kEfaMaxQPs = kMaxExchangeQPs;
 // Operator session.cuh code (shared across CX7 + EFA backends) references
@@ -1083,7 +1085,9 @@ inline void stage_barrier(Session* s, int slot, uint32_t token) {
         s->proxies[t]->reset_inflight();
     }
 
-    s->proxies[0]->post_stage_barrier(slot, token);
+    // Host-driven stage_barrier targets peer slot 0 (single-peer convention).
+    // The receiver-side slot is the caller-provided `slot`.
+    s->proxies[0]->post_stage_barrier(/*peer_slot=*/0, slot, token);
     s->proxies[0]->drain_cq();
     s->proxies[0]->reset_inflight();
 

@@ -478,31 +478,89 @@ __device__ inline void gemm_ar_iter_end_reset_arrival_flags(
     __syncthreads();
 }
 
+// ----- Multi-peer cross-node barrier helpers -----
+//
+// stage_barrier on each rank is an array (sized kEfaStageBarrierSlots / kStageBarrierSlots
+// = kMaxPeers). When peer P writes to me, the slot it targets is slot_at_peer(P, me, N)
+// — the same convention used by the recv_buf data path. The kernel side mirrors that:
+//
+//   * push:  for each peer P in [0, N-1), push one BARRIER_NOTIFY tagged with
+//            cmd.dst_rank = P's global rank and cmd.tile_id = slot_at_peer(my, P, N)
+//            (the slot in P's barrier array that I will be writing into).
+//   * wait:  spin until every peer's slot in OUR barrier array is >= G.epoch.
+//
+// For N=2 both loops have one iteration and slot_at_peer evaluates to 0 — bit-identical
+// to the pre-fan-out behavior.
+__device__ inline void gemm_ar_xnode_push_to_all_peers(const fused_globals& G) {
+    const int n_peers = G.num_nodes - 1;
+    for (int p = 0; p < n_peers; ++p) {
+        const int peer_rank = internode::peer_rank_for_slot(
+            G.node_idx, G.num_nodes, p);
+        const int my_slot_at_peer = internode::slot_at_peer(
+            G.node_idx, peer_rank, G.num_nodes);
+        internode::TransferCmd cmd{};
+        cmd.cmd_type = internode::CmdType::BARRIER_NOTIFY;
+        cmd.dst_rank = (uint8_t)peer_rank;
+        cmd.tile_id = (uint16_t)my_slot_at_peer;
+        cmd.enqueue_device_ns = comm::globaltimer();
+        gemm_ar_send_fifo_for_lane(G, 0).push(cmd);
+    }
+}
+
+// Spin until every peer's stage_barrier slot in OUR array is >= G.epoch. Single
+// thread should call this — caller is responsible for restricting to tid==0.
+__device__ inline void gemm_ar_xnode_wait_all_peers_sys(const fused_globals& G) {
+    const int n_peers = G.num_nodes - 1;
+    for (int p = 0; p < n_peers; ++p) {
+        const int peer_rank = internode::peer_rank_for_slot(
+            G.node_idx, G.num_nodes, p);
+        const int peer_slot_at_me = internode::slot_at_peer(
+            peer_rank, G.node_idx, G.num_nodes);
+        volatile uint32_t* slot_ptr =
+            const_cast<volatile uint32_t*>(G.cross_node_barrier) + peer_slot_at_me;
+        while (comm::atomic_u32::acquire_load_sys(
+                   const_cast<uint32_t*>(slot_ptr)) < G.epoch) {}
+    }
+}
+
+// Same as gemm_ar_xnode_wait_all_peers_sys but using volatile load (no acquire
+// fence). Matches the "non-acquire" spin used by the legacy hierarchical path
+// where the PCIe-mapped barrier flag is read directly.
+__device__ inline void gemm_ar_xnode_wait_all_peers_vol(const fused_globals& G) {
+    const int n_peers = G.num_nodes - 1;
+    for (int p = 0; p < n_peers; ++p) {
+        const int peer_rank = internode::peer_rank_for_slot(
+            G.node_idx, G.num_nodes, p);
+        const int peer_slot_at_me = internode::slot_at_peer(
+            peer_rank, G.node_idx, G.num_nodes);
+        volatile uint32_t* slot_ptr =
+            const_cast<volatile uint32_t*>(G.cross_node_barrier) + peer_slot_at_me;
+        while (*slot_ptr < G.epoch) {}
+    }
+}
+
 // GPU-side cross-node barrier: the caller-designated CTA (`push_block_id`)
-// pushes BARRIER_NOTIFY to the proxy, which posts an RDMA write of epoch to
-// the remote node's stage_barrier slot. All participating CTAs spin-poll the
-// local barrier flag until the remote has signaled. Used both at kernel start
-// (push_block=0, all 132 CTAs poll) and at iter-end in the epilogue
-// (push_block=reduce_base, only epilogue CTAs poll).
+// pushes BARRIER_NOTIFY to every peer's proxy, each of which posts an RDMA write
+// of epoch into the receiver's matching stage_barrier slot. All participating
+// CTAs spin-poll until every slot has observed epoch (one slot at N=2). Used
+// both at kernel start (push_block=0, all 132 CTAs poll) and at iter-end in
+// the epilogue (push_block=reduce_base, only epilogue CTAs poll).
 __device__ inline void gemm_ar_cross_node_barrier_push_from(
     const fused_globals& G, int push_block_id
 ) {
     if (G.cross_node_barrier == nullptr) return;
 
     if (blockIdx.x == push_block_id && threadIdx.x == 0) {
-        internode::TransferCmd cmd{};
-        cmd.cmd_type = internode::CmdType::BARRIER_NOTIFY;
-        cmd.enqueue_device_ns = comm::globaltimer();
-        gemm_ar_send_fifo_for_lane(G, 0).push(cmd);
+        gemm_ar_xnode_push_to_all_peers(G);
     }
 
     // cross_node_barrier lives in cudaHostAllocMapped memory — every GPU read
     // traverses PCIe. With ~132 blocks * 12 warps spinning (~1600 readers) the
     // PCIe gets saturated and adds milliseconds. Hierarchical spin: ONE thread
-    // (push_block_id, tid 0) polls the PCIe flag; when it clears, it publishes
-    // to a device-memory mirror (xnode_ready_device) in HBM. All other CTAs
-    // spin on that HBM mirror — same monotonic epoch semantics, but PCIe
-    // traffic stays at a single reader.
+    // (push_block_id, tid 0) polls the PCIe flag(s); when all peers have signaled,
+    // it publishes to a device-memory mirror (xnode_ready_device) in HBM. All
+    // other CTAs spin on that HBM mirror — same monotonic epoch semantics, but
+    // PCIe traffic stays at a single reader.
     //
     // Monotonic compare (>=): commit_epoch resets the flag to 0 each iter, so
     // in steady-state drift a remote RDMA write of epoch N could land after
@@ -511,8 +569,7 @@ __device__ inline void gemm_ar_cross_node_barrier_push_from(
     // newer than our current epoch satisfies the barrier.
     if (blockIdx.x == push_block_id) {
         if (threadIdx.x == 0) {
-            while (*G.cross_node_barrier < G.epoch) {
-            }
+            gemm_ar_xnode_wait_all_peers_vol(G);
             if (G.xnode_ready_device != nullptr) {
                 comm::atomic_u32::release_store_gpu(G.xnode_ready_device, G.epoch);
             }
@@ -525,10 +582,9 @@ __device__ inline void gemm_ar_cross_node_barrier_push_from(
             } while (v < G.epoch);
         }
     } else {
-        // Fallback (no HBM mirror wired): all blocks spin on PCIe flag.
+        // Fallback (no HBM mirror wired): all blocks spin on PCIe flag(s).
         if (threadIdx.x == 0) {
-            while (*G.cross_node_barrier < G.epoch) {
-            }
+            gemm_ar_xnode_wait_all_peers_vol(G);
         }
     }
     __syncthreads();
@@ -575,23 +631,13 @@ __device__ inline void gemm_ar_hierarchical_xnode_barrier(
     // each reduce CTA's slot). Re-doing barrier_all here is redundant and
     // costs an extra NVSwitch round-trip. Gated so we can ablate.
 
-    // Step 2: pairwise cross-node handshake. Push NOTIFY (proxy drains inflight
-    // data WRs, then RDMA-writes cfg_.epoch into pair-peer's slot 0), then
-    // spin on our local slot until pair-peer's proxy has published an epoch
-    // >= ours.
-    internode::TransferCmd cmd{};
-    cmd.cmd_type = internode::CmdType::BARRIER_NOTIFY;
-    cmd.enqueue_device_ns = comm::globaltimer();
-    gemm_ar_send_fifo_for_lane(G, 0).push(cmd);
-
-
-    // ld.acquire.sys: system-scope acquire so writes from the NIC (populated
-    // via peer's RDMA) are observed with proper ordering.
-    uint32_t v;
-    do {
-        v = comm::atomic_u32::acquire_load_sys(const_cast<uint32_t*>(G.cross_node_barrier));
-    } while (v < G.epoch);
-
+    // Step 2: pairwise cross-node handshake. Push one NOTIFY per peer (proxy
+    // drains inflight data WRs, then RDMA-writes cfg_.epoch into each peer's
+    // own slot), then spin on every local slot until every peer's proxy has
+    // published an epoch >= ours. ld.acquire.sys: system-scope acquire so
+    // writes from the NIC are observed with proper ordering.
+    gemm_ar_xnode_push_to_all_peers(G);
+    gemm_ar_xnode_wait_all_peers_sys(G);
 }
 
 // Split xbar into push-only and wait-only phases so the ~RTT can overlap
@@ -608,10 +654,7 @@ __device__ inline void gemm_ar_xbar_push_only(
 ) {
     if (G.cross_node_barrier == nullptr) return;
     if (blockIdx.x != driver_block_id || threadIdx.x != 0) return;
-    internode::TransferCmd cmd{};
-    cmd.cmd_type = internode::CmdType::BARRIER_NOTIFY;
-    cmd.enqueue_device_ns = comm::globaltimer();
-    gemm_ar_send_fifo_for_lane(G, 0).push(cmd);
+    gemm_ar_xnode_push_to_all_peers(G);
 }
 
 __device__ inline void gemm_ar_xbar_wait_only(
@@ -619,10 +662,7 @@ __device__ inline void gemm_ar_xbar_wait_only(
 ) {
     if (G.cross_node_barrier == nullptr) return;
     if (blockIdx.x != driver_block_id || threadIdx.x != 0) return;
-    uint32_t v;
-    do {
-        v = comm::atomic_u32::acquire_load_sys(const_cast<uint32_t*>(G.cross_node_barrier));
-    } while (v < G.epoch);
+    gemm_ar_xnode_wait_all_peers_sys(G);
 }
 
 __host__ __device__ inline int gemm_ar_tiles_for_queue(

@@ -259,18 +259,9 @@ def main():
             workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
             barrier.data_.zero_(); ready_chunk.data_.zero_()
             staging_dbuf.data_.zero_()
-            if NUM_NODES > 2 and hasattr(mod, "zero_recv_buf"):
-                mod.zero_recv_buf()
 
         def advance_epoch(next_epoch: int):
-            # Queue-mode arrivals carry packed work, not an epoch value. Keep
-            # all nodes quiesced before any rank clears arrival slots.
-            if NUM_NODES > 2 and hasattr(mod, "prepare_epoch"):
-                mod.prepare_epoch()
-                dist.barrier()
-                mod.commit_epoch(next_epoch)
-            else:
-                mod.set_epoch(next_epoch)
+            mod.set_epoch(next_epoch)
 
         def run_once():
             mod.gemm_rs_fused(
@@ -287,15 +278,10 @@ def main():
 
         def start_iter():
             nonlocal epoch
-            if NUM_NODES > 2 and hasattr(mod, "prepare_epoch"):
-                epoch += 1
-                advance_epoch(epoch)
-                reset_state()
-            else:
-                # Clear local state before publishing the next epoch to the session.
-                reset_state()
-                epoch += 1
-                advance_epoch(epoch)
+            # Clear local state before publishing the next epoch to the session.
+            reset_state()
+            epoch += 1
+            advance_epoch(epoch)
 
         for wi in range(args.warmup):
             start_iter()
@@ -354,8 +340,11 @@ def main():
                 row_hi = row_lo + m_local
                 # Mirror the kernel topology: first reduce this row slice across
                 # all 8 local GPUs in the node, then reduce the owning local-rank
-                # slice across nodes.
-                ref_slice = torch.matmul(A[row_lo:row_hi], B).cpu()
+                # slice across nodes. Keep ref_slice on GPU (NCCL rejects CPU
+                # tensors with "No backend type associated with device type cpu").
+                # Stay in the original bf16 dtype so the FAIL diagnostic isolates
+                # "is it my fp32 promotion?" from "is the check broken regardless?".
+                ref_slice = torch.matmul(A[row_lo:row_hi], B)
                 dist.all_reduce(
                     ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
                 )

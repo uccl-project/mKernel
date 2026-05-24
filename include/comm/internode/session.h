@@ -220,7 +220,10 @@ struct SessionConfig {
 
 /** Maximum number of QPs per session (QP 0 + up to 23 extra). */
 static constexpr int kMaxQPs = 24;
-static constexpr int kStageBarrierSlots = 2;
+// One stage-barrier slot per peer (sender-indexed via slot_at_peer). Sized to
+// kMaxPeers so the GPU-driven cross-node barrier can be fanned out to every
+// peer in a multi-node run without resizing.
+static constexpr int kStageBarrierSlots = kMaxPeers;
 
 struct Session {
     // RDMA resources (QP 0 / CQ 0 — used by proxy today)
@@ -932,7 +935,9 @@ inline void stage_barrier(Session* s, int slot, uint32_t token) {
         s->proxies[t]->reset_inflight();
     }
 
-    s->proxies[0]->post_stage_barrier(slot, token);
+    // Host-driven stage_barrier targets peer slot 0 (single-peer convention).
+    // The receiver-side slot is the caller-provided `slot`.
+    s->proxies[0]->post_stage_barrier(/*peer_slot=*/0, slot, token);
     s->proxies[0]->drain_cq();
     s->proxies[0]->reset_inflight();
 

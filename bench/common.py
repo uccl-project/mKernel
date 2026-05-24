@@ -281,8 +281,11 @@ def check_close(
         print(f"[correctness-local] rank={dist.get_rank()} {name}: "
               f"max_abs={max_abs:.6f} max_rel={max_rel:.6f}",
               flush=True)
+    # device="cuda" so the NCCL backend can run the reduction. With a CPU
+    # tensor the bench scripts (which all init NCCL) hit
+    # "No backend type associated with device type cpu" at the first check.
     stats = torch.tensor([max_abs, max_rel, 0.0 if local_ok else 1.0],
-                         dtype=torch.float64)
+                         dtype=torch.float64, device="cuda")
     dist.all_reduce(stats, op=dist.ReduceOp.MAX)
     ok = bool(stats[2].item() == 0.0)
     if dist.get_rank() == 0:

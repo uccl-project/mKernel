@@ -354,8 +354,6 @@ def main():
         num_qps = max(1, int(mod.get_num_qps()))
         arrival_tails_ptr = mod.get_arrival_tails_ptr() if hasattr(mod, "get_arrival_tails_ptr") else 0
         barrier_device_ptr = mod.get_barrier_device_ptr() if hasattr(mod, "get_barrier_device_ptr") else 0
-        if NUM_NODES > 2:
-            barrier_device_ptr = 0
 
         logical_queues_per_qp = max(1, int(os.environ.get("GEMM_AR_LOGICAL_QUEUES_PER_QP", "1")))
         # Apply per-shape intra override (small-M shapes benefit from fewer
@@ -509,11 +507,14 @@ def main():
             print(f"[gemm_ar] M={M} samples={sample_str} min={min(samples):.4f} median={sorted(samples)[len(samples)//2]:.4f}", flush=True)
             print(f"[gemm_ar] M={M} wall={wall_ms:.3f} ms", flush=True)
         if args.mode == "check":
-            C_ref_cpu = torch.matmul(A, B).detach().float().cpu()
-            local_ref_cpu = C_ref_cpu.clone()
-            dist.all_reduce(C_ref_cpu, op=dist.ReduceOp.SUM)
+            # Keep on GPU: NCCL backend rejects CPU tensors with "No backend
+            # type associated with device type cpu" — moving to CPU broke
+            # `bench/run.sh gemm_ar check`.
+            C_ref = torch.matmul(A, B).detach().float()
+            local_ref = C_ref.clone()
+            dist.all_reduce(C_ref, op=dist.ReduceOp.SUM)
             correctness_ok = check_close(
-                f"gemm_ar M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
+                f"gemm_ar M={M}", C_final.data_, C_ref, atol=0.55, rtol=0.12
             ) and correctness_ok
         result_sizes.append(f"M={M}")
         result_fused.append(wall_ms)

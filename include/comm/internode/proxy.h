@@ -201,7 +201,17 @@ public:
         memset(sender_seq_, 0, sizeof(sender_seq_));
     }
 
-    /** Post a 4-byte RDMA write to the peer's stage barrier slot.
+    /** Post a 4-byte RDMA write to peer `peer_slot`'s stage-barrier slot
+     * `dst_slot`. The CX7 proxy currently only routes to one peer (cfg_.qp +
+     * cfg_.remote_barrier_addr/rkey); multi-peer CX7 needs a peer→QP map in
+     * ProxyConfig before peer_slot != 0 can be honored. Until then, peer_slot
+     * != 0 is rejected with a warning so the EFA-side multi-peer fan-out
+     * doesn't silently degrade to single-peer when the kernel is run on a
+     * CX7 cluster with N > 2.
+     *
+     * TODO(multi-peer-cx7): add cfg_.peer_slot_by_rank + per-peer QP table to
+     * ProxyConfig, route post on the correct QP, and remove the peer_slot==0
+     * guard below.
      *
      * Uses IBV_SEND_INLINE so the 4-byte token is copied into the WQE
      * at ibv_post_send time — the NIC does NOT later DMA-read any host
@@ -212,7 +222,13 @@ public:
      * the barrier WR, causing the peer to spin on a stale/zero value
      * forever. INLINE avoids the DMA-read race entirely.
      */
-    void post_stage_barrier(int slot, uint32_t token) {
+    void post_stage_barrier(int peer_slot, int dst_slot, uint32_t token) {
+        if (peer_slot != 0) {
+            fprintf(stderr,
+                    "proxy (CX7): post_stage_barrier peer_slot=%d not supported "
+                    "(see TODO(multi-peer-cx7) in proxy.h)\n", peer_slot);
+            return;
+        }
         barrier_token_ = token;
         ibv_sge sge{};
         sge.addr   = (uint64_t)&barrier_token_;
@@ -225,7 +241,7 @@ public:
         wr.num_sge = 1;
         wr.opcode  = IBV_WR_RDMA_WRITE;
         wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = cfg_.remote_barrier_addr + (uint64_t)slot * sizeof(uint32_t);
+        wr.wr.rdma.remote_addr = cfg_.remote_barrier_addr + (uint64_t)dst_slot * sizeof(uint32_t);
         wr.wr.rdma.rkey        = cfg_.remote_barrier_rkey;
         wr.next = nullptr;
 
@@ -865,7 +881,12 @@ private:
                         }
                     }
                     if (cmd.cmd_type == CmdType::BARRIER_NOTIFY) {
-                        post_stage_barrier(/*slot=*/0, cfg_.epoch);
+                        // CX7 single-peer: peer_slot is always 0 here. The
+                        // dst_slot comes from cmd.tile_id (kernel stamps it
+                        // via slot_at_peer). See proxy.h post_stage_barrier
+                        // TODO(multi-peer-cx7).
+                        post_stage_barrier(/*peer_slot=*/0, /*dst_slot=*/(int)cmd.tile_id,
+                                           cfg_.epoch);
                         continue;
                     }
                     if (cmd.cmd_type != CmdType::WRITE) continue;
@@ -915,7 +936,9 @@ private:
                         }
                     }
                     if (batch[count].cmd_type == CmdType::BARRIER_NOTIFY) {
-                        post_stage_barrier(/*slot=*/0, cfg_.epoch);
+                        post_stage_barrier(/*peer_slot=*/0,
+                                           /*dst_slot=*/(int)batch[count].tile_id,
+                                           cfg_.epoch);
                     } else if (batch[count].cmd_type == CmdType::WRITE) {
                         if (cfg_.channelize_gpu_peers) {
                             const int cmd_qp = route_global_qp(batch[count]) - cfg_.qp_base_idx;

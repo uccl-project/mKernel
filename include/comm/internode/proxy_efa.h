@@ -317,15 +317,31 @@ public:
     }
 
     /**
-     * Post a 4-byte SRD send of `token` into the peer's stage-barrier slot.
-     * Call while the proxy is paused (host thread owns the QP). Always issued
-     * on local QP 0 / remote QP 0 for deterministic ordering with the peer.
+     * Post a 4-byte SRD send of `token` into peer `peer_slot`'s stage-barrier
+     * slot `dst_slot`. Call while the proxy is paused (host thread owns the
+     * QP). Always issued on local QP 0 / the peer's QP 0 for deterministic
+     * ordering. Multi-peer routing reads AH/QPN/remote_barrier from
+     * `cfg_.per_peer[peer_slot]`; for a single-peer config (num_peers==1)
+     * per_peer[0] aliases the legacy scalar fields, so peer_slot=0 is
+     * bit-identical to the pre-multi-peer path.
      */
-    void post_stage_barrier(int slot, uint32_t token) {
-        if (cfg_.remote_barrier_addr == 0 || cfg_.flag_staging == nullptr ||
-            cfg_.flag_staging->mr == nullptr) {
-            fprintf(stderr, "proxy_efa: post_stage_barrier called without remote "
-                            "barrier or flag staging configured\n");
+    void post_stage_barrier(int peer_slot, int dst_slot, uint32_t token) {
+        if (cfg_.flag_staging == nullptr || cfg_.flag_staging->mr == nullptr) {
+            fprintf(stderr, "proxy_efa: post_stage_barrier called without flag "
+                            "staging configured\n");
+            return;
+        }
+        if (peer_slot < 0 || peer_slot >= cfg_.num_peers ||
+            cfg_.per_peer == nullptr) {
+            fprintf(stderr, "proxy_efa: post_stage_barrier peer_slot=%d out of "
+                            "range (num_peers=%d)\n",
+                    peer_slot, cfg_.num_peers);
+            return;
+        }
+        const PerPeerProxyData& pp = cfg_.per_peer[peer_slot];
+        if (pp.remote_barrier_addr == 0) {
+            fprintf(stderr, "proxy_efa: post_stage_barrier peer_slot=%d has no "
+                            "remote_barrier_addr configured\n", peer_slot);
             return;
         }
         // Claim our own unique slot in the staging ring — mirrors the WRITE cmd
@@ -347,9 +363,9 @@ public:
         qpx->comp_mask = 0;
         qpx->wr_flags = IBV_SEND_SIGNALED;
         ibv_wr_rdma_write(qpx,
-            cfg_.remote_barrier_rkey,
-            cfg_.remote_barrier_addr + (uint64_t)slot * sizeof(uint32_t));
-        ibv_wr_set_ud_addr(qpx, cfg_.dst_ah, cfg_.dst_qpns[0], rdma::QKEY);
+            pp.remote_barrier_rkey,
+            pp.remote_barrier_addr + (uint64_t)dst_slot * sizeof(uint32_t));
+        ibv_wr_set_ud_addr(qpx, pp.dst_ah, pp.dst_qpns[0], rdma::QKEY);
         ibv_wr_set_sge(qpx,
             cfg_.flag_staging->mr->lkey,
             (uint64_t)(cfg_.flag_staging->host_ptr + barrier_slot),
@@ -446,6 +462,10 @@ private:
     // CQ (so every prior WRITE is PCIe-committed at the peer's HBM — SRD
     // WRITE CQE == reliable delivery), and posts BARRIER_NOTIFY.
     bool has_pending_barrier_ = false;
+    // Cmd that triggered has_pending_barrier_. Stashed so the post-flush handler
+    // at run() top can recover dst_rank (→ peer_slot) and tile_id (→ dst_slot)
+    // for multi-peer barrier fan-out.
+    TransferCmd pending_barrier_cmd_{};
     uint64_t diag_total_loops_ = 0;
     uint64_t diag_empty_loops_ = 0;
     uint64_t diag_inflight_limited_ = 0;
@@ -760,7 +780,10 @@ private:
             if (has_pending_barrier_ && pending_count == 0 && !has_pending_cmd_) {
                 has_pending_barrier_ = false;
                 drain_cq();
-                post_stage_barrier(/*slot=*/0, cfg_.epoch);
+                const int bps = (cfg_.num_peers > 1 && cfg_.peer_slot_by_rank != nullptr)
+                    ? cfg_.peer_slot_by_rank[pending_barrier_cmd_.dst_rank] : 0;
+                const int bds = (int)pending_barrier_cmd_.tile_id;
+                post_stage_barrier(bps, bds, cfg_.epoch);
                 continue;
             }
 
@@ -815,10 +838,14 @@ private:
                         // first (top-of-loop gate posts BARRIER next iter).
                         if (count > 0) {
                             has_pending_barrier_ = true;
+                            pending_barrier_cmd_ = cmd;
                             break;
                         }
                         drain_cq();
-                        post_stage_barrier(/*slot=*/0, cfg_.epoch);
+                        const int bps = (cfg_.num_peers > 1 && cfg_.peer_slot_by_rank != nullptr)
+                            ? cfg_.peer_slot_by_rank[cmd.dst_rank] : 0;
+                        const int bds = (int)cmd.tile_id;
+                        post_stage_barrier(bps, bds, cfg_.epoch);
                         continue;
                     }
                     if (cmd.cmd_type != CmdType::WRITE) continue;
@@ -876,6 +903,7 @@ private:
                             // and posts BARRIER. See has_pending_barrier_
                             // member-doc for the SRD ordering rationale.
                             has_pending_barrier_ = true;
+                            pending_barrier_cmd_ = cmd;
                             break;
                         }
                         if (cmd.cmd_type != CmdType::WRITE) continue;
