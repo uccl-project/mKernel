@@ -157,7 +157,7 @@ __device__ inline void dispatch_fused(const fused_globals &G, const int sm_idx) 
                             // generates IPC/PCIe traffic without reducing
                             // observed latency. 100ns sleep cuts poll rate
                             // ~30x. Mirrors the arrival_flags spin pattern
-                            // in fused_inter_comm_sm.
+                            // in fused_inter_copy_sm.
                             if (v == 1) break;
                             __nanosleep(100);
                         } while (true);
@@ -197,15 +197,7 @@ __device__ inline void dispatch_fused(const fused_globals &G, const int sm_idx) 
     }
 }
 
-// DISPATCH_L2_SWIZZLE: bijective decode of `task_id ∈ [0, row_blocks*col_blocks)`
-// into (row, col) using SUPER_M-grouped traversal. Walks SUPER_M consecutive
-// rows for each col before moving to the next col, then advances to the next
-// SUPER_M-row group. The last partial super-group (when row_blocks % SUPER_M
-// != 0) is handled inline so the bijection covers all task_ids.
-//
-// Goal: improve B-tile (weights) L2 reuse across CTAs in a wave. Likely modest
-// for our shape (col_blocks=8, num_sms=72) since baseline row-major already
-// gives both A and B reuse — confirmed via empirical sweep.
+// Row-major decode of `task_id ∈ [0, row_blocks*col_blocks)` into (row, col).
 __device__ inline void dispatch_swizzle_decode(int task_id, int row_blocks, int col_blocks,
                                           int& row_in_grid, int& col_idx) {
     row_in_grid = task_id / col_blocks;
@@ -228,9 +220,7 @@ __device__ inline void group_gemm_fused(const fused_globals &G, const int sm_idx
             G.padded_tokens_per_expert[{expert_offset + (int)threadIdx.x}];
     // Per-expert count of pure-local row_blocks (first N rb of each expert
     // are all-local under DISPATCH_LOCAL_FIRST). Used by DISPATCH_GEMM_LOCAL_FIRST for
-    // its two-pass schedule, and by DISPATCH_HYBRID_DISPATCH to classify each tile
-    // as pure-local (cp.async gather from pre_tokens) vs peer (TMA from
-    // post_tokens).
+    // its two-pass schedule.
     __shared__ int local_rb_per_expert[fused_globals::NUM_EXPERTS_PER_DEV];
     if (threadIdx.x < fused_globals::NUM_EXPERTS_PER_DEV)
         local_rb_per_expert[threadIdx.x] =
@@ -270,12 +260,7 @@ __device__ inline void group_gemm_fused(const fused_globals &G, const int sm_idx
     if (wg_id == 2) {
         warpgroup::decrease_registers<40>();
         if (w_id == 0) {
-            // Loader warp. Baseline path uses lane 0 for big-TMA A+B loads.
-            // Under DISPATCH_HYBRID_DISPATCH, pure-local row_blocks gather A rows
-            // across all 32 lanes via cp.async (16-byte per lane per iter)
-            // into swizzled SMEM, skipping the post_tokens HBM round-trip.
-            // Peer row_blocks still take the baseline TMA path since those
-            // tokens arrived scattered into post_tokens via dispatch.
+            // Loader warp. Lane 0 issues big-TMA A+B loads.
             #pragma unroll 1
             for (int pass = 0; pass < NUM_PASSES; ++pass) {
                 int task_id = sm_idx;
@@ -424,10 +409,8 @@ __device__ inline void group_gemm_fused(const fused_globals &G, const int sm_idx
 
 // Two-pass dispatch walker, parameterized by (sm_idx, stride).
 // Stride controls how widely workers spread across the per-expert task lists.
-// Real dispatch CTAs use sm_idx ∈ [0, num_dispatch_sms); when DISPATCH_DISPATCH_DONATE_INTER_SEND
-// is on, post-push inter-send CTAs claim virtual sm_idx ∈ [num_dispatch_sms, num_dispatch_sms+num_send_sms)
-// and ALL dispatch workers (real + helpers) use stride = num_dispatch_sms + num_send_sms.
-// Refactored from the inline two-pass walker so both call sites share one body.
+// Real dispatch CTAs use sm_idx ∈ [0, num_dispatch_sms) with stride =
+// num_dispatch_sms.
 __device__ inline void dispatch_two_pass_walk(const fused_globals &G, int sm_idx, int stride) {
     constexpr int SLICES_PER_RB =
         fused_globals::ROW_BLOCK / fused_globals::TOKENS_PER_BLOCK;

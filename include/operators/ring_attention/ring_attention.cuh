@@ -138,8 +138,8 @@ struct globals {
 // Inter-node KV exchange globals
 // ============================================================================
 //
-// At session bringup kv_send_kernel posts RDMA WRs from every GPU to its
-// same-index counterpart on every remote node. The peers' K/V land in this
+// In the entrypoint prologue kv_send_kernel posts RDMA WRs from every GPU to
+// its same-index counterpart on every remote node. The peers' K/V land in this
 // rank's recv_buf, partitioned into (num_nodes - 1) [K | V] slots.
 //
 // Between rounds, kv_copy_kernel(peer_slot) does:
@@ -151,11 +151,10 @@ struct globals {
 // copied peer KV around the local M-GPU ring just like the round-0 local KV.
 
 struct kv_exchange_globals {
-    bf16 *send_buf;          // registered [K | V] staging buffer
-    // The send buffer (registered with RDMA) holds [K | V] contiguously.
-    // The host stages K0_local→send_buf[0:K_bytes], V0_local→send_buf[K_bytes:]
-    // before launching this kernel. The kernel pushes FIFO commands referencing
-    // local_offset within that send buffer.
+    bf16 *send_buf;          // legacy staging buffer pointer, unused under
+                             // zero-copy send (K0/V0 are RDMA-registered
+                             // directly via DMA-BUF; src_view selects between
+                             // them at the proxy).
     // Base pointer to the receive buffer. At N peers the buffer is laid out
     // as (N-1) consecutive [K | V] slots; the kv_copy kernel takes a peer
     // slot argument and reads from `recv_buf + peer_slot * single_peer_bytes`.
@@ -324,7 +323,7 @@ inline void entrypoint(
         int kv_copy_grid      = n_send + n_copy;
 
 
-        // Prologue: post RDMA WRs so peer-KV transfer overlaps with stages 0-7.
+        // Prologue: post RDMA WRs so peer-KV transfer overlaps with round-0 stages.
         // kv_send/kv_copy don't use dynamic smem — launch with smem=0.
         kv_send_kernel<<<kv_send_grid, config::NUM_THREADS, 0, stream>>>(KE);
         // Match persistent kernel: barrier_all after send, before stages start.

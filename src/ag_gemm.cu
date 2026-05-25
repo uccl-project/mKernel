@@ -146,11 +146,11 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // cheap correctness safeguard and matches how plane-0 flags on
                 // col=0 already ratchet visibility for later cols.
                 //
-                // Inter-comm pushes per-chunk WRs striped across 4 QPs.
-                // Cross-QP arrival is unordered so poll every chunk flag in
-                // each inter rb. One intra tile is 256 rows but RDMA
-                // arrivals are tracked in 128-row blocks — wait for both
-                // halves.
+                // One intra tile is 256 rows but RDMA arrivals are tracked in
+                // 128-row blocks — wait for both halves. Each inter rb is
+                // posted as one WR (WR_SPLIT_CEILING=1) whose completion
+                // raises the first chunk's arrival flag, so polling the
+                // first chunk of each inter rb suffices.
                 const int first_chunk_a = (2 * global_row_idx)     * chunks_per_inter_rb;
                 const int first_chunk_b = (2 * global_row_idx + 1) * chunks_per_inter_rb;
                 ag_gemm_wait_arrival_slot(G, virt_arrival_slot, first_chunk_a);
@@ -241,7 +241,7 @@ __device__ inline comp_task decode_comp_task(int task_id,
         t.rb      = globals::SUPER_M * (flat / super_blocks) + flat % globals::SUPER_M;
         t.col_idx = (flat % super_blocks) / globals::SUPER_M;
     } else {
-        // Unreachable when final_rows==0 (then super_rows==half_row_blocks and
+        // Unreachable when final_rows==0 (then super_rows==node_row_blocks and
         // flat is always < super_tile_limit). Guard with max(1, ...) so the
         // div instruction the compiler emits is well-defined even on dead path.
         const int fr_safe = final_rows > 0 ? final_rows : 1;
@@ -310,10 +310,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
     const int K_val = G.A_local.cols();
     const int chunks_per_rb = max(1, (globals::ROW_BLOCK * K_val * (int)sizeof(bf16)) / CHUNK_BYTES);
 
-    // Task layout: phase-major. task_id < num_local_blocks → local tile;
-    // task_id >= num_local_blocks → remote tile. Within each phase, flat index
-    // is SUPER_M-swizzled over (half_row_blocks × col_blocks). See
-    // decode_comp_task() above for the swizzle math.
+    // Task layout: shard-major. task_id < num_node_blocks → local shard;
+    // task_id >= num_node_blocks → remote shards (one shard per shard_step).
+    // Within each shard, flat index is SUPER_M-swizzled over
+    // (node_row_blocks × col_blocks). See decode_comp_task() above for the
+    // swizzle math.
     const int comp_idx = blockIdx.x - G.num_intra_comm;
 
     if (warpgroup_id == config::NUM_WARPGROUPS - 1) {

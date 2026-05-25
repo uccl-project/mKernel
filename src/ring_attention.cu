@@ -7,8 +7,9 @@
  * ptxas spills in the attention path:
  *
  *   KV send prologue:
- *     Stages local K/V data and posts RDMA writes to the peer node. It returns
- *     after WRs are queued so network transfer overlaps the early ring stages.
+ *     Stages local K/V data and posts RDMA writes to every remote peer node.
+ *     It returns after WRs are queued so network transfer overlaps the early
+ *     ring stages.
  *
  *   Per-ring comm+partial kernels:
  *     Comm CTAs exchange K/V tiles around the local node while compute CTAs run
@@ -440,10 +441,11 @@ __device__ inline void attn_comm(const globals &G, const int block_idx, const in
 // Layout invariants:
 //   - K0/V0 are row-major contiguous DistBuffers of size K_bytes/V_bytes.
 //   - chunk_id ∈ [0, total_chunks_K) → K side, local_offset = chunk*CHUNK_BYTES
-//     within K0; remote_offset = same (lands at recv_buf[0..K_bytes]).
+//     within K0; remote_offset = sap*single_peer_bytes + chunk*CHUNK_BYTES
+//     (lands at this rank's slot within the peer's recv_buf K region).
 //   - chunk_id ∈ [total_chunks_K, ...) → V side, local_offset = chunk*CHUNK_BYTES
-//     within V0; remote_offset = K_bytes + chunk*CHUNK_BYTES (lands at
-//     recv_buf[K_bytes..K_bytes+V_bytes]).
+//     within V0; remote_offset = sap*single_peer_bytes + K_bytes +
+//     chunk*CHUNK_BYTES (lands in the peer's recv_buf V region for this slot).
 __device__ inline void kv_stage_and_send_sm(const kv_exchange_globals &G) {
     int send_id = blockIdx.x;
     int total_chunks = G.total_chunks_K + G.total_chunks_V;
@@ -648,8 +650,9 @@ void attn_reduction_stage_kernel(
     attn_reduction<false>(G, blockIdx.x);
 }
 
-// Send-only: posts RDMA WRs for local K0/V0 → peer node. Non-blocking; kernel
-// returns once WRs are queued. Used as prologue so RDMA overlaps with stages 0-7.
+// Send-only: posts RDMA WRs for local K0/V0 → every remote peer node.
+// Non-blocking; kernel returns once WRs are queued. Used as prologue so RDMA
+// overlaps with round-0 stages.
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
 void kv_send_kernel(
     const __grid_constant__ kv_exchange_globals KE

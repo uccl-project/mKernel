@@ -282,7 +282,7 @@ struct Session {
  *   2. Register local GPU buffer for RDMA (so NIC can read for sends)
  *   3. Allocate + register receive buffer on GPU (remote writes land here)
  *   4. Create D2H FIFO (host-pinned triggers, device-memory head)
- *   5. Create arrival flags (host-pinned, RDMA-registered)
+ *   5. Create arrival flags (device memory, RDMA-registered)
  *   6. Create flag staging (host-pinned, RDMA-registered)
  *   7. Fill local ConnectionInfo, exchange with peer over TCP
  *   8. Transition QP: INIT → RTR → RTS

@@ -766,7 +766,7 @@ void entrypoint_fused(
         add(g_peer_accum_done_count[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
         add(g_chunk_reduce_done[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
         add(g_chunk_accum_lock[dev_idx], (size_t)total_chunks * sizeof(uint32_t));
-        // Grid = one block per region (up to 12); 128 threads/block, strided.
+        // Grid = one block per region (up to 16); 128 threads/block, strided.
         if (regs.n > 0) {
             gemm_rs_fused_zero_kernel<<<dim3((unsigned)regs.n, 1, 1),
                                    dim3(128, 1, 1), 0, stream>>>(regs);

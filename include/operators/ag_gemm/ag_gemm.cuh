@@ -7,16 +7,17 @@
  * Single kernel launch. Two CTA groups run concurrently:
  *
  *   Intra-comm CTAs [0, num_intra_comm):
- *     IPC multicast gather of A shards within the node.
- *     Also post zero-copy RDMA WRs for this rank's M_local slice at kernel
- *     entry (src_view=1 → DMA-BUF MR aliasing A.data_), so the NIC pipelines
- *     the inter-node send concurrently with intra-gather + compute.
+ *     IPC multicast gather of A shards within the node, then phase-2
+ *     republish of RDMA-received peer shards into A_recv. Zero-copy RDMA WRs
+ *     for this rank's M_local slice (src_view=1 → DMA-BUF MR aliasing A.data_)
+ *     are posted by a separate prologue kernel so the NIC pipelines the
+ *     inter-node send concurrently with intra-gather + compute.
  *     Signals barrier[row_block] when each row block is fully gathered.
  *
  *   Comp CTAs [num_intra_comm, 132):
- *     GEMM on all M rows. Atomically claim tiles:
- *       - Local-half tile: wait on intra-node barrier, TMA load from A_distributed_tensor
- *       - Remote-half tile: wait on arrival_flags, TMA load from A_recv_local_tensor
+ *     GEMM on all M rows. CTAs claim tiles by CTA-stride:
+ *       - Local-half tile: wait on intra-node barrier (plane 0), TMA load from A_local
+ *       - Remote-half tile: wait on intra-node barrier (plane 2), TMA load from A_recv
  *
  * The distributed A buffer is DMA-BUF-registered for RDMA (no staging copy).
  */
@@ -207,10 +208,10 @@ __device__ __forceinline__ int ag1_compute_wr_split(int rb_bytes, int ceiling) {
 // Merge: post both inter rbs' DMA-BUF WRs for a single intra row that this
 // rank owns (intra 256-row unit = 2 inter 128-row rbs).
 //
-// Under AG1_MERGE_WR_SPLIT (ceiling N>1), each inter-rb is split into
-// effective_split sub-WRs sized rb_bytes/split, striped across QPs by
-// (rb*split + sw) key. effective_split computed from rb_bytes — only kicks
-// in at large shapes where sub-WR stays >= 2 MB.
+// When WR_SPLIT_CEILING > 1, each inter-rb is split into effective_split
+// sub-WRs sized rb_bytes/split, striped across QPs by (rb*split + sw) key.
+// effective_split computed from rb_bytes — only kicks in at large shapes
+// where sub-WR stays >= 2 MB.
 __device__ inline void post_merge_wrs_for_intra_row(
     const globals& G, int global_row_idx, int chunks_per_rb) {
     constexpr int WR_SPLIT_CEILING = 1;

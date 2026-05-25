@@ -1040,7 +1040,7 @@ struct gemm_ar_scratch_layout {
     int local_done_flag_offset;
     int remote_arrived_flag_offset;
     int remote_arrived_peer_mask_offset;
-    // GEMM_AR_STAGGER_INTRA: per-primary-CTA started signal (max 4 entries).
+    // GEMM_AR_STAGGER_INTRA: per-primary-CTA started signal (max 16 entries).
     // Primary intra CTAs (offset < num_intra_ar_sms/2) set these after passing
     // their first tile barrier; secondary CTAs poll these (L2-cached, no NVSwitch).
     int intra_started_flag_offset;

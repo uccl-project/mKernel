@@ -49,8 +49,9 @@ struct ArrivalFlags {
 
 /**
  * Create arrival flags array.
- * Allocates host-pinned memory with cudaHostAllocMapped, gets device pointer.
- * RDMA registration is done separately (caller passes pd + registers mr).
+ * Allocates device memory with cudaMalloc; the host_ptr field aliases the
+ * same device pointer. RDMA registration is done separately (caller passes
+ * pd + registers mr).
  */
 inline ArrivalFlags create_arrival_flags(int count, int tail_count = 0) {
     ArrivalFlags flags{};
@@ -109,7 +110,8 @@ inline void reset_arrival_flags(ArrivalFlags& flags) {
 }
 
 /**
- * Destroy arrival flags. Deregisters MR if set, frees host-pinned memory.
+ * Destroy arrival flags. Caller must already have deregistered the MR;
+ * this releases device memory (default) or host-pinned memory (mapped flags).
  */
 inline void destroy_arrival_flags(ArrivalFlags& flags) {
     // MR deregistration is caller's responsibility (needs ibv_dereg_mr)
