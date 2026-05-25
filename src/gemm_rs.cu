@@ -320,10 +320,10 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
-                cmd.tile_id  = (uint16_t)(sap * single_peer_tiles + chunk_first_tile);
+                cmd.tile_id = (uint32_t)(sap * single_peer_tiles + chunk_first_tile);
                 cmd.bytes    = chunk_bytes;
                 cmd.local_offset = offset;
-                cmd.remote_offset = (uint32_t)((long)sap * single_peer_bytes) + offset;
+                cmd.remote_offset = (uint64_t)((long)sap * single_peer_bytes) + offset;
                 cmd.lane_id  = (uint16_t)(
                     Rt.use_transport_arrival_queue != 0
                         ? (peer_slot * queues_per_peer + logical_q)

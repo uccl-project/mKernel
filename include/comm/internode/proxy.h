@@ -712,8 +712,8 @@ private:
         const int dst_virtual = dst_slot + n_peers * (src_bank + 1);
         const uint32_t chunk = n.tile_id % (uint32_t)cfg_.total_chunks;
         const uint32_t base = (uint32_t)((uint64_t)n.local_offset % cfg_.a_half_bytes);
-        cmd.tile_id = (uint16_t)(dst_virtual * cfg_.total_chunks + chunk);
-        cmd.remote_offset = (uint32_t)((uint64_t)dst_virtual * cfg_.a_half_bytes + base);
+        cmd.tile_id = (uint32_t)(dst_virtual * cfg_.total_chunks + chunk);
+        cmd.remote_offset = (uint64_t)((uint64_t)dst_virtual * cfg_.a_half_bytes + base);
         return cmd;
     }
 

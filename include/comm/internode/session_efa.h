@@ -1176,10 +1176,10 @@ inline void prime_first_launch_transport(Session* s) {
             TransferCmd cmd{};
             cmd.cmd_type = CmdType::WRITE;
             cmd.dst_rank = (uint8_t)(s->rank == 0 ? 1 : 0);
-            cmd.tile_id = (uint16_t)dummy_tile;
+            cmd.tile_id = (uint32_t)dummy_tile;
             cmd.bytes = prime_bytes;
-            cmd.local_offset = (uint32_t)global_qp * prime_bytes;
-            cmd.remote_offset = (uint32_t)global_qp * prime_bytes;
+            cmd.local_offset = (uint64_t)global_qp * prime_bytes;
+            cmd.remote_offset = (uint64_t)global_qp * prime_bytes;
             cmd.lane_id = (uint16_t)global_qp;
             cmd.src_view = 0;
             cmd.reserved0 = 0;

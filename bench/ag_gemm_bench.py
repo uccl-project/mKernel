@@ -34,7 +34,7 @@ CHUNK_BYTES = 64 * 1024  # baked from AG_CHUNK_BYTES=65536
 
 DEFAULT_SHAPES = (
     # M=57344 hangs during default-warmup 4-node sweeps on H200x.
-    [8192, 16384, 32768, 49152]
+    [8192, 16384, 32768, 49152, 65536]
     if NUM_NODES == 4 else
     [6144, 12288, 24576, 49152, 73728]
     if NUM_NODES == 3 else
@@ -46,7 +46,7 @@ DEFAULT_SHAPES = (
 # unless we cut the comm-CTA budget). The 64-sms default oversubscribes comm
 # CTAs at medium M where the GEMM wave count is lower.
 SMS_PER_SHAPE = {4096: 8, 6144: 8, 8192: 8, 12288: 8, 16384: 8,
-                 24576: 8, 49152: 8, 57344: 8, 73728: 8}
+                 24576: 8, 49152: 8, 65536: 8, 57344: 8, 73728: 8}
 
 
 def avg_then_max_cuda(samples):

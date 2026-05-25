@@ -57,10 +57,10 @@ __device__ inline void fused_inter_send_sm(const fused_globals &G) {
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
-                cmd.tile_id = (uint16_t)(sap * single_peer_tiles + chunk_id);
+                cmd.tile_id = (uint32_t)(sap * single_peer_tiles + chunk_id);
                 cmd.bytes = bytes;
                 cmd.local_offset = off;
-                cmd.remote_offset = (uint32_t)sap * (uint32_t)single_peer_bytes + off;
+                cmd.remote_offset = (uint64_t)sap * (uint32_t)single_peer_bytes + off;
                 cmd.lane_id = (uint16_t)chunk_id;
                 cmd.reserved0 = (uint8_t)(peer_slot * fused_globals::NUM_DEVICES + G.dev_idx);
                 internode::D2HFifoDevice fifo =

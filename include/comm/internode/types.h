@@ -26,23 +26,34 @@ enum class CmdType : uint8_t {
 };
 
 #pragma pack(push, 1)
+// Fields are laid out so each multi-byte field sits entirely inside a single
+// 8-byte word. The D2H FIFO publish writes 8-byte words and uses a release
+// store on word 0 (cmd_type) to commit; straddling a field across two words
+// can produce torn reads on the host. Keep this property when adding fields.
 struct TransferCmd {
+    // Word 0 [0..8): committed last by release-store; host acquires on cmd_type.
     CmdType  cmd_type;       // WRITE or FENCE
     uint8_t  dst_rank;       // target node rank (0..num_nodes-1)
-    uint16_t tile_id;        // first tile of this transfer (arrival metadata payload base)
-    uint32_t bytes;          // transfer size in bytes
-    uint32_t local_offset;   // byte offset into RDMA-registered local buffer
-    uint32_t remote_offset;  // byte offset into RDMA-registered remote buffer
     uint16_t lane_id;        // logical lane / remote queue for structural routing
+    uint32_t tile_id;        // first tile of this transfer (arrival metadata payload base)
+    // Word 1 [8..16):
+    uint64_t remote_offset;  // byte offset into RDMA-registered remote buffer
+    // Word 2 [16..24):
+    uint64_t local_offset;   // byte offset into RDMA-registered local buffer
+    // Word 3 [24..32): packed small fields.
+    uint32_t bytes;          // transfer size in bytes
     uint8_t  src_view;       // 0 = staging buffer, 1 = C_local direct (DMA-BUF), 2 = C_local strided (multi-SGE gather)
     uint8_t  reserved0;      // optional peer/GPU channel id; zero preserves legacy routing
     uint16_t row_span;       // src_view=2: bytes per row run (dst_cols * sizeof(bf16))
+    // Word 4 [32..40):
     uint16_t row_count;      // src_view=2: number of rows gathered (<= ROW_BLOCK)
+    uint8_t  _pad[6];
+    // Word 5 [40..48):
     uint64_t enqueue_device_ns; // GPU globaltimer timestamp just before fifo.push()
 };
 #pragma pack(pop)
 
-static_assert(sizeof(TransferCmd) == 32, "TransferCmd must be exactly 32 bytes");
+static_assert(sizeof(TransferCmd) == 48, "TransferCmd must be exactly 48 bytes");
 
 #pragma pack(push, 1)
 struct ForwardNotify {

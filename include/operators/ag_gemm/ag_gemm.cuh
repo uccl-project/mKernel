@@ -245,10 +245,10 @@ __device__ inline void post_merge_wrs_for_intra_row(
                 internode::TransferCmd cmd{};
                 cmd.cmd_type = internode::CmdType::WRITE;
                 cmd.dst_rank = (uint8_t)peer_rank;
-                cmd.tile_id = (uint16_t)(sap * G.total_chunks + first_chunk);
+                cmd.tile_id = (uint32_t)(sap * G.total_chunks + first_chunk);
                 cmd.bytes = rb_bytes;
                 cmd.local_offset = base_offset;
-                cmd.remote_offset = (uint32_t)sap * (uint32_t)G.a_half_bytes + base_offset;
+                cmd.remote_offset = (uint64_t)sap * (uint64_t)G.a_half_bytes + base_offset;
                 cmd.src_view = 1;
                 cmd.lane_id = (uint16_t)rb;
                 cmd.reserved0 = (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
@@ -271,10 +271,10 @@ __device__ inline void post_merge_wrs_for_intra_row(
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
-                    cmd.tile_id = (uint16_t)(sap * G.total_chunks + sub_first_chunk);
+                    cmd.tile_id = (uint32_t)(sap * G.total_chunks + sub_first_chunk);
                     cmd.bytes = sub_bytes;
                     cmd.local_offset = sub_base;
-                    cmd.remote_offset = (uint32_t)sap * (uint32_t)G.a_half_bytes + sub_base;
+                    cmd.remote_offset = (uint64_t)sap * (uint64_t)G.a_half_bytes + sub_base;
                     cmd.src_view = 1;
                     cmd.lane_id = (uint16_t)(rb * split + sw);
                     cmd.reserved0 = (uint8_t)(peer_slot * globals::NUM_DEVICES + G.dev_idx);
@@ -300,10 +300,10 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
     const int dst_slot = internode::slot_at_peer(origin_rank, next_rank, G.num_nodes);
     const int n_peers = G.num_nodes - 1;
     const int dst_virtual = dst_slot + n_peers * dst_bank;
-    const uint32_t src_slot_base =
-        (uint32_t)source_slot * (uint32_t)G.a_half_bytes;
-    const uint32_t dst_slot_base =
-        (uint32_t)dst_virtual * (uint32_t)G.a_half_bytes;
+    const uint64_t src_slot_base =
+        (uint64_t)source_slot * (uint64_t)G.a_half_bytes;
+    const uint64_t dst_slot_base =
+        (uint64_t)dst_virtual * (uint64_t)G.a_half_bytes;
 #pragma unroll
     for (int sub = 0; sub < 2; ++sub) {
         int rb = 2 * global_row_idx + sub;
@@ -330,7 +330,7 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
             internode::TransferCmd cmd{};
             cmd.cmd_type = internode::CmdType::WRITE;
             cmd.dst_rank = (uint8_t)next_rank;
-            cmd.tile_id = (uint16_t)(dst_virtual * G.total_chunks + sub_first_chunk);
+            cmd.tile_id = (uint32_t)(dst_virtual * G.total_chunks + sub_first_chunk);
             cmd.bytes = sub_bytes;
             cmd.local_offset = src_slot_base + sub_base;
             cmd.remote_offset = dst_slot_base + sub_base;

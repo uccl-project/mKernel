@@ -103,7 +103,7 @@ run_one() {
         "GEMM_AR_ARRIVAL_QUEUE=1"
         "GEMM_AR_K_DIV=global_world"
         "MKERNEL_BIND_RETAINED_HANDLE=1"
-        "MKERNEL_EFA_NUM_QPS=4"
+        "MKERNEL_EFA_NUM_QPS=${MKERNEL_EFA_NUM_QPS:-4}"
         "MKERNEL_BENCH_BEST_OF_N=0"
         "TORCH_CUDA_ARCH_LIST=9.0a"
         "NUM_NODES=4"

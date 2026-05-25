@@ -548,14 +548,14 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
                     internode::TransferCmd cmd{};
                     cmd.cmd_type = internode::CmdType::WRITE;
                     cmd.dst_rank = (uint8_t)peer_rank;
-                    cmd.tile_id = (uint16_t)(sap * single_peer_tiles + pack_first_tile);
+                    cmd.tile_id = (uint32_t)(sap * single_peer_tiles + pack_first_tile);
                     cmd.bytes = (uint32_t)((long)group_tiles * TILE_BYTES);
                     cmd.local_offset = offset;
                     cmd.src_view = 0;
                     // Encode the grouped tile count so the proxy can publish all
                     // arrivals covered by this send.
                     cmd.row_count = (uint16_t)group_tiles;
-                    cmd.remote_offset = (uint32_t)((long)sap * single_peer_bytes) + offset;
+                    cmd.remote_offset = (uint64_t)((long)sap * single_peer_bytes) + offset;
                     cmd.lane_id = (uint16_t)(sap * queues_per_peer + logical_q);
                     cmd.reserved0 = (uint8_t)(peer_slot * fused_globals::NUM_DEVICES + G.dev_idx);
                     cmd.enqueue_device_ns = gemm_ar_globaltimer();
@@ -828,10 +828,10 @@ __device__ inline void gemm_ar_post_ring_forward_cmd(
     // Forwarded ring traffic intentionally lands in a caller-selected receive
     // slot instead of the sender's natural peer slot, so reduce-forward and
     // final-forward stages can be distinguished by their arrival bits.
-    cmd.tile_id = (uint16_t)(dst_slot * single_peer_tiles + pack_first_tile);
+    cmd.tile_id = (uint32_t)(dst_slot * single_peer_tiles + pack_first_tile);
     cmd.bytes = (uint32_t)((long)tiles_this_chunk * TILE_BYTES);
     cmd.local_offset = offset;
-    cmd.remote_offset = (uint32_t)((long)dst_slot * single_peer_bytes) + offset;
+    cmd.remote_offset = (uint64_t)((long)dst_slot * single_peer_bytes) + offset;
     cmd.lane_id = (uint16_t)logical_q;
     cmd.src_view = 1; // registered C_remote_accum source for ring path
     cmd.reserved0 = (uint8_t)(G.dev_idx);

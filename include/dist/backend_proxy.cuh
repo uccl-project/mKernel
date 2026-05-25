@@ -106,10 +106,10 @@ distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types
     internode::TransferCmd cmd{};
     cmd.cmd_type      = internode::CmdType::WRITE;
     cmd.dst_rank      = (uint8_t)dst_node;
-    cmd.tile_id       = (uint16_t)imm;
+    cmd.tile_id = (uint32_t)imm;
     cmd.bytes         = bytes;
-    cmd.local_offset  = (uint32_t)local_off;
-    cmd.remote_offset = (uint32_t)remote_off;
+    cmd.local_offset = (uint64_t)local_off;
+    cmd.remote_offset = (uint64_t)remote_off;
     cmd.lane_id       = (uint16_t)lane_id;
     cmd.src_view      = (uint8_t)ch.mode;
 
