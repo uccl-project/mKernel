@@ -791,7 +791,6 @@ private:
             n.src_view = src.src_view;
             n.epoch = src.epoch;
             n.reserved1 = src.reserved1;
-            n.reserved2 = src.reserved2;
             if (n.epoch != cfg_.epoch) continue;
             if (n.tile_id != (uint32_t)slot) continue;
             TransferCmd fwd = make_forward_cmd_from_notify(n);

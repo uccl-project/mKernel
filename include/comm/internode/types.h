@@ -58,14 +58,13 @@ static_assert(sizeof(TransferCmd) == 48, "TransferCmd must be exactly 48 bytes")
 #pragma pack(push, 1)
 struct ForwardNotify {
     uint32_t bytes;
-    uint32_t local_offset;   // offset in the receiver's local_data MR
+    uint64_t local_offset;   // offset in the receiver's local_data MR
     uint32_t tile_id;        // arrival slot that just became ready
     uint16_t lane_id;
     uint8_t  reserved0;
     uint8_t  src_view;
     uint32_t epoch;          // written last in the source struct before RDMA
     uint64_t reserved1;
-    uint32_t reserved2;
 };
 #pragma pack(pop)
 
