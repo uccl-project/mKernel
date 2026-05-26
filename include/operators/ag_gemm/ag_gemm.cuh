@@ -220,11 +220,12 @@ __device__ inline void post_merge_wrs_for_intra_row(
         int rb = 2 * global_row_idx + sub;
         int first_chunk = rb * chunks_per_rb;
         int last_chunk = min(first_chunk + chunks_per_rb, G.total_chunks);
-        uint32_t base_offset = (uint32_t)(first_chunk * CHUNK_BYTES);
-        uint32_t end_offset = (last_chunk * CHUNK_BYTES > G.a_half_bytes)
-            ? (uint32_t)G.a_half_bytes
-            : (uint32_t)(last_chunk * CHUNK_BYTES);
-        uint32_t rb_bytes = end_offset - base_offset;
+        uint64_t base_offset = (uint64_t)first_chunk * CHUNK_BYTES;
+        uint64_t last_chunk_bytes = (uint64_t)last_chunk * CHUNK_BYTES;
+        uint64_t end_offset = (last_chunk_bytes > (uint64_t)G.a_half_bytes)
+            ? (uint64_t)G.a_half_bytes
+            : last_chunk_bytes;
+        uint32_t rb_bytes = (uint32_t)(end_offset - base_offset);
 
         // Decide runtime split: knee-based + divisibility check on chunks_per_rb.
         int split = ag1_compute_wr_split((int)rb_bytes, WR_SPLIT_CEILING);
@@ -260,10 +261,10 @@ __device__ inline void post_merge_wrs_for_intra_row(
         } else {
             for (int sw = 0; sw < split; ++sw) {
                 int sub_first_chunk = first_chunk + sw * chunks_per_sub;
-                uint32_t sub_base = (uint32_t)(sub_first_chunk * CHUNK_BYTES);
-                uint32_t sub_end = sub_base + bytes_per_sub;
+                uint64_t sub_base = (uint64_t)sub_first_chunk * CHUNK_BYTES;
+                uint64_t sub_end = sub_base + bytes_per_sub;
                 if (sw == split - 1 && sub_end > end_offset) sub_end = end_offset;
-                uint32_t sub_bytes = sub_end - sub_base;
+                uint32_t sub_bytes = (uint32_t)(sub_end - sub_base);
                 for (int peer_slot = 0; peer_slot < 1; ++peer_slot) {
                     const int peer_rank = internode::peer_rank_for_slot(
                         G.node_idx, G.num_nodes, peer_slot);
@@ -309,11 +310,12 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
         int rb = 2 * global_row_idx + sub;
         int first_chunk = rb * chunks_per_rb;
         int last_chunk = min(first_chunk + chunks_per_rb, G.total_chunks);
-        uint32_t base_offset = (uint32_t)(first_chunk * CHUNK_BYTES);
-        uint32_t end_offset = (last_chunk * CHUNK_BYTES > G.a_half_bytes)
-            ? (uint32_t)G.a_half_bytes
-            : (uint32_t)(last_chunk * CHUNK_BYTES);
-        uint32_t rb_bytes = end_offset - base_offset;
+        uint64_t base_offset = (uint64_t)first_chunk * CHUNK_BYTES;
+        uint64_t last_chunk_bytes = (uint64_t)last_chunk * CHUNK_BYTES;
+        uint64_t end_offset = (last_chunk_bytes > (uint64_t)G.a_half_bytes)
+            ? (uint64_t)G.a_half_bytes
+            : last_chunk_bytes;
+        uint32_t rb_bytes = (uint32_t)(end_offset - base_offset);
 
         int split = ag1_compute_wr_split((int)rb_bytes, WR_SPLIT_CEILING);
         if (chunks_per_rb < split || (chunks_per_rb % split) != 0) split = 1;
@@ -322,10 +324,10 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
 
         for (int sw = 0; sw < split; ++sw) {
             int sub_first_chunk = first_chunk + sw * chunks_per_sub;
-            uint32_t sub_base = (uint32_t)(sub_first_chunk * CHUNK_BYTES);
-            uint32_t sub_end = sub_base + bytes_per_sub;
+            uint64_t sub_base = (uint64_t)sub_first_chunk * CHUNK_BYTES;
+            uint64_t sub_end = sub_base + bytes_per_sub;
             if (sw == split - 1 && sub_end > end_offset) sub_end = end_offset;
-            uint32_t sub_bytes = sub_end - sub_base;
+            uint32_t sub_bytes = (uint32_t)(sub_end - sub_base);
 
             internode::TransferCmd cmd{};
             cmd.cmd_type = internode::CmdType::WRITE;

@@ -531,7 +531,7 @@ __device__ inline void fused_inter_send_sm(const fused_globals& G) {
             __syncthreads();  // intra_ar wrote staging during reduce
 
             if (tid == 0) {
-                const uint32_t offset = (uint32_t)((long)pack_first_tile * TILE_BYTES);
+                const uint64_t offset = (uint64_t)pack_first_tile * (uint64_t)TILE_BYTES;
                 // Per-peer slot offsets: at N == 2, sap == 0 so the offsets
                 // are zero (bit-identical). At N > 2 they partition the
                 // receiver's recv_buf / arrival flag space by sender slot.
@@ -812,7 +812,7 @@ __device__ inline void gemm_ar_post_ring_forward_cmd(
     int dst_slot = 0
 ) {
     const int pack_first_tile = rb_in_slice * G.col_blocks + col_start;
-    const uint32_t offset = (uint32_t)((long)pack_first_tile * TILE_BYTES);
+    const uint64_t offset = (uint64_t)pack_first_tile * (uint64_t)TILE_BYTES;
     const int peer_rank = internode::peer_rank_for_slot(G.node_idx, G.num_nodes, 0);
     const long single_peer_bytes =
         (long)G.row_blocks_per_slice * (long)G.col_blocks * TILE_BYTES;

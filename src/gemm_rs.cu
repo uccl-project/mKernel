@@ -297,7 +297,7 @@ __device__ inline void send_tiles_coalesced(const G &Gv) {
             gemm_rs_release_store_u32(Rt.sender_done + global_chunk_id, 1u);
 
             const uint32_t chunk_bytes = (uint32_t)((long)cols_this_chunk * TILE_BYTES);
-            const uint32_t offset = (uint32_t)((long)chunk_first_tile * TILE_BYTES);
+            const uint64_t offset = (uint64_t)chunk_first_tile * (uint64_t)TILE_BYTES;
             // Per-peer slot offsets: bit-identical at N == 2 (sap == 0).
             // single_peer_bytes / tiles = local scratch sized for one peer.
             const long single_peer_bytes =
