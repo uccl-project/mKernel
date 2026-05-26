@@ -799,8 +799,8 @@ __device__ inline void reduce_tiles_ws(const G &Gv) {
         const int col_elem = vec_lane * ELEMS_PER_VEC;
         for (int ti = 0; ti < cols_this_chunk; ++ti) {
             for (int r = row_lane; r < G::ROW_BLOCK; r += ROWS_PER_WAVE) {
-                const int si = (rb * G::ROW_BLOCK + r) * Rt.N
-                             + (col_start + ti) * G::COL_BLOCK + col_elem;
+                const long si = (long)(rb * G::ROW_BLOCK + r) * Rt.N
+                              + (col_start + ti) * G::COL_BLOCK + col_elem;
                 // Local and remote chunks are both tile-major; write the final
                 // reduced values back to row-major output.
                 const bf16 *local_src = Rt.staging_buf

@@ -13,7 +13,7 @@ namespace internode {
 
 // ---------------------------------------------------------------------------
 // Transfer command: GPU comm CTA pushes this to the D2H FIFO.
-// 32 bytes total. The FIFO publishes bytes [8, 32) first, then commits the
+// 48 bytes total. The FIFO publishes bytes [8, 48) first, then commits the
 // first 8-byte header with a release store so the host can acquire on cmd_type.
 // ---------------------------------------------------------------------------
 
