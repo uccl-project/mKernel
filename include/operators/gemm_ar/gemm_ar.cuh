@@ -335,7 +335,6 @@ struct fused_globals {
     int num_remote_queues;
     int remote_queue_stride;
     int defer_final_multicast_finish;
-    int work_steal_enabled;
     int intra_ready_multimem;
     // When true, intra-AR xdev barrier waits use acquire loads instead of
     // relaxed loads. The branch is outside the spin body.
@@ -1358,7 +1357,6 @@ __host__ inline fused_globals gemm_ar_make_globals(
         .num_remote_queues = num_remote_queues,
         .remote_queue_stride = scratch.remote_queue_stride,
         .defer_final_multicast_finish = 0,
-        .work_steal_enabled = 0,
         .intra_ready_multimem = 0,
         .total_chunks = scratch.total_chunks,
         .total_tiles_per_device = scratch.slice_tiles,
@@ -1461,10 +1459,6 @@ void entrypoint(
     // epilogue launch overhead. For larger shapes, keep the epilogue path.
     const bool need_epilogue = (scratch.total_chunks > 16);
     G.defer_final_multicast_finish = need_epilogue ? 1 : 0;
-    {
-        const char* ws_env = std::getenv("GEMM_AR_WORK_STEAL");
-        G.work_steal_enabled = (ws_env != nullptr && ws_env[0] == '1') ? 1 : 0;
-    }
     {
         const char* r8_env = std::getenv("GEMM_AR_R8_WARP_SPEC");
         G.r8_warp_spec = (r8_env != nullptr && r8_env[0] == '1') ? 1u : 0u;
