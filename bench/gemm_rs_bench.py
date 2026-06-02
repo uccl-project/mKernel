@@ -36,11 +36,10 @@ COL_BLOCK = 256
 DEFAULT_SHAPES = (
     [3072, 6144, 12288, 24576, 49152]
     if NUM_NODES == 3 else
-    [4096, 8192, 16384, 32768, 65536]
+    [4096, 8192, 16384, 32768, 65536, 98304]
     if NUM_NODES == 4 else
     [2048, 4096, 8192, 16384, 32768]
 )
-# M=65536 is supported as an explicit shape but excluded from the default sweep.
 
 # Tuned role split for the fused compute/intra/send/reduce path:
 # (n_comp, n_intra, n_send, n_reduce, chunk_tiles).
@@ -51,6 +50,7 @@ SM_SPLIT = {
     16384: (120, 0, 4,  8,  4),
     32768: (120, 0, 4,  8,  8),
     65536: (124, 0, 2,  6,  32),
+    98304: (118, 0, 6,  8,  4),
     # Multi-node shapes use smaller chunks for M=24576 and conservative chunks
     # at the extremes.
     6144:  (116, 0, 8,  8,  4),
@@ -311,12 +311,13 @@ def main():
             dist.barrier()
 
         samples = []
-        # Canonical: NCCL-style no-sync timing — N back-to-back iters with a
-        # SINGLE sync after, divide by N. Set MKERNEL_BENCH_LEGACY_SYNC=1 (or
-        # MKERNEL_BENCH_NO_SYNC=0) to opt back into per-iter sync.
-        legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
-        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
-            legacy_sync = True
+        # Per-iter inter-node sync is the default: gemm_rs advances a fresh epoch
+        # each iter, which deadlocks the proxy without a per-iter barrier+settle.
+        # MKERNEL_BENCH_NO_SYNC=1 (or MKERNEL_BENCH_LEGACY_SYNC=0) forces the
+        # NCCL-style back-to-back path.
+        legacy_sync = os.environ.get("MKERNEL_BENCH_NO_SYNC") != "1"
+        if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "0":
+            legacy_sync = False
         if not legacy_sync:
             # No-sync (steady-state): per-iter reset_state + epoch bump (which
             # internally syncs the proxy-side via set_epoch) but skip the
@@ -350,6 +351,13 @@ def main():
         wall_ms = median_then_max_cuda(samples)
         if is_chief:
             print(f"[gemm_rs] M={m} wall={wall_ms:.3f} ms", flush=True)
+            if samples:
+                _ss = sorted(float(x) for x in samples)
+                _n = len(_ss)
+                _med = _ss[_n // 2]
+                _p99 = _ss[min(_n - 1, int(0.99 * _n))]
+                print(f"[gemm_rs-dist] M={m} n={_n} min={_ss[0]:.3f} "
+                      f"med={_med:.3f} p99={_p99:.3f} max={_ss[-1]:.3f}", flush=True)
         C_ref = None
         for target_lr in range(world_size):
             row_lo = target_lr * m_local

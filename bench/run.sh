@@ -2,22 +2,22 @@
 # bench/run.sh — multi-node launcher for the 5 release kernels.
 #
 # Usage:
-#   bash run.sh <kernel|all> [check|bench] [num_nodes] [shapes_csv]
-#   bash run.sh nccl_baseline bench 3 55296   # NCCL+GEMM baseline (nccl_baseline_bench.py)
+# bash run.sh <kernel|all> [check|bench] [num_nodes] [shapes_csv]
+# bash run.sh nccl_baseline bench 3 55296   # NCCL+GEMM baseline (nccl_baseline_bench.py)
 #
 # Examples:
-#   bash run.sh dispatch_gemm bench               # default NUM_NODES=2
-#   bash run.sh ag_gemm check 2
-#   bash run.sh all bench 2 4096,8192
-#   NUM_NODES=2 bash run.sh all bench             # via env, equivalent
+# bash run.sh dispatch_gemm bench               # default NUM_NODES=2
+# bash run.sh ag_gemm check 2
+# bash run.sh all bench 2 4096,8192
+# NUM_NODES=2 bash run.sh all bench             # via env, equivalent
 #
 # Cluster configuration:
-#   NODE{i}_IP   — data-plane IP for node i
-#   NODE{i}_SSH  — SSH target for peer node i (i > 0)
-#   NODE{i}_SSH_PORT — optional SSH port for peer node i
+# NODE{i}_IP   — data-plane IP for node i
+# NODE{i}_SSH  — SSH target for peer node i (i > 0)
+# NODE{i}_SSH_PORT — optional SSH port for peer node i
 #
 # H200 etiquette:
-#   Point NODE0_IP / NODE{i}_SSH at GPU-idle nodes only (no shared SGLang/training).
+# Point NODE0_IP / NODE{i}_SSH at GPU-idle nodes only (no shared SGLang/training).
 #
 # Runtime triage (during a run): if per-GPU utilization stays >99% for ≥15s
 # with no log / iter progress, treat the job as stuck (e.g. ring wait) — stop
@@ -134,6 +134,12 @@ if [[ -n "${GEMM_AR_INTER_SEND_SMS:-}" ]]; then
 fi
 if [[ -n "${GEMM_AR_NUM_INTRA_COMM_SMS:-}" ]]; then
     COMMON_ENV+=("GEMM_AR_NUM_INTRA_COMM_SMS=$GEMM_AR_NUM_INTRA_COMM_SMS")
+fi
+# Super-M L2-rasterization decode factor for dispatch_gemm_glu_combine. Forwarded
+# to BOTH node launches only when explicitly set by the caller; unset => the kernel
+# defaults to 8. Set DGC_SUPER_M=1 for plain row-major decode.
+if [[ -n "${DGC_SUPER_M:-}" ]]; then
+    COMMON_ENV+=("DGC_SUPER_M=$DGC_SUPER_M")
 fi
 KERNELS_ALL="dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention"
 STALE_BENCH_PATTERN='[d]ispatch_gemm_bench.py|[g]emm_rs_bench.py|[a]g_gemm_bench.py|[g]emm_ar_bench.py|[r]ing_attention_bench.py|[n]ccl_baseline_bench.py|[b]enchmark_gemm_ar_multinode.py'
@@ -393,6 +399,10 @@ run_one_2node() {
     if [[ -n "${GEMM_AR_RDMA_CHUNK_TILES_RT:-}" ]]; then
         env_str="$env_str GEMM_AR_RDMA_CHUNK_TILES_RT=$GEMM_AR_RDMA_CHUNK_TILES_RT"
     fi
+    # Forward all DGC_* gather/debug knobs to both nodes.
+    for var in $(compgen -e | grep '^DGC_' || true); do
+        env_str="$env_str ${var}=${!var}"
+    done
     if [[ -n "${MKERNEL_DISPATCH_GEMM_ROUTING:-}" ]]; then
         env_str="$env_str MKERNEL_DISPATCH_GEMM_ROUTING=$MKERNEL_DISPATCH_GEMM_ROUTING"
     fi
