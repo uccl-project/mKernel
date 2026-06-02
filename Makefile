@@ -75,12 +75,13 @@ TK_MOE_NUM_NODES ?= 2
 DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 DEFS_ring_attention :=
 DEFS_gemm_rs        :=
+DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 
 # === Build targets ===
 BUILD := build
 SRC   := src
 
-KERNELS := dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention
+KERNELS := dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention dispatch_gemm_glu_combine
 
 all: $(addprefix $(BUILD)/lib,$(addsuffix .so,$(KERNELS)))
 

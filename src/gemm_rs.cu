@@ -881,12 +881,10 @@ __device__ inline void fused_kernel(const fused_globals &G) {
 
     const int row_blocks_per_slice = row_blocks / intra_globals::NUM_DEVICES;
 
-    // CTA role dispatch with recycling:
+    // CTA role dispatch:
     // - Compute: static stride claiming
-    // - Intra-RS: work-stealing
     // - Send: static row-block ownership + coalesced RDMA
-    // - Reduce: work-stealing with remote_arrived_flag
-    // All roles recycle to reduce after primary role completes.
+    // - Reduce: dedicated CTAs, work-stealing claim with remote_arrived_flag
     if ((int)blockIdx.x < I.num_comp_sms) {
         // Phase bits persist across tasks because the pipeline semaphores are
         // shared CTA state.
@@ -949,13 +947,9 @@ __device__ inline void fused_kernel(const fused_globals &G) {
                 }
             }
         }
-        // Reuse the CTA for any remaining reduce chunks.
-        reduce_tiles_ws<fused_globals>(G);
     } else if ((int)blockIdx.x < I.num_comp_sms + I.num_comm_sms + G.num_send_sms) {
         // Primary: inter-node send (static row-block ownership, coalesced RDMA)
         send_tiles_coalesced<fused_globals>(G);
-        // Reuse the CTA for any remaining reduce chunks.
-        reduce_tiles_ws<fused_globals>(G);
     } else {
         // Dedicated reduce CTAs: work-stealing from the start
         const int reduce_base = I.num_comp_sms + I.num_comm_sms + G.num_send_sms;
