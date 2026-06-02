@@ -75,15 +75,7 @@ TK_MOE_NUM_NODES ?= 2
 DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 DEFS_ring_attention :=
 DEFS_gemm_rs        :=
-# dispatch_gemm_glu_combine (fused MoE, M2): clones dispatch_gemm's RDMA dispatch
-# machinery + a naive FFN compute (gemm1->swiglu->gemm2) + combine. Same
-# compile-time shape knobs as dispatch_gemm; override for fast naive-compute
-# validation, e.g. `make DGC_H=1024 DGC_I=512 build/libdispatch_gemm_glu_combine.so`.
-DGC_H           ?= 7168
-DGC_I           ?= 2048
-DGC_TOP_K       ?= 8
-DGC_NUM_EXPERTS ?= 256
-DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=$(DGC_H) -DTK_MOE_I=$(DGC_I) -DTK_MOE_TOP_K=$(DGC_TOP_K) -DTK_MOE_NUM_EXPERTS=$(DGC_NUM_EXPERTS) -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
+DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 
 # === Build targets ===
 BUILD := build
