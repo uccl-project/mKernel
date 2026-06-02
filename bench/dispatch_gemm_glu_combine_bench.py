@@ -297,34 +297,55 @@ def build_inter_gather_indices(this_global_gpu, total_gpus, num_experts_per_dev,
     gather runs on local GPU d's own inter_comb_buf and writes local pre_tokens[d]
     UPPER, shipped to remote GPU d.
 
-    Returns (inter_owner_offset[L+1] int32, inter_row_to_slot[npad] int32,
-             inter_row_to_owner[npad] int32, inter_comb_slots int).
+    Returns (inter_owner_offset[n_peers*(L+1)] int32 (flat per-peer CSR),
+             inter_row_to_slot[npad] int32, inter_row_to_owner[npad] int32,
+             inter_comb_slots int).
     """
     all_rows = [
         build_pull_rows_cpu(g, num_experts_per_dev, padded_list,
                             expert_to_tokens, world_size_per_node)
         for g in range(total_gpus)
     ]
+    n_peers = NUM_NODES - 1
     node_base = node_idx * world_size_per_node
-    # First pass: count INTER contributions per (owner-staging-dev sd, owner token).
-    inter_count = [
-        [0] * num_local_tokens for _ in range(world_size_per_node)
-    ]
+    L = num_local_tokens
+
+    # Destination peer slot for an owner on remote node `sn`, matching the kernel's
+    # peer_rank_for_slot ring (combine_send ships region p to (node_idx+1+p)%NUM_NODES).
+    def peer_slot_of(sn):
+        return (sn - node_idx - 1) % NUM_NODES
+
+    # First pass: count INTER contributions per (owner-staging-dev sd, dest peer, owner token).
+    inter_count = [[[0] * L for _ in range(n_peers)]
+                   for _ in range(world_size_per_node)]
     for g in range(total_gpus):
         for (sn, sd, st) in all_rows[g]:
             if sn < 0 or sn == node_idx:
                 continue  # padding or INTRA (handled by intra gather)
-            inter_count[sd][st] += 1
+            inter_count[sd][peer_slot_of(sn)][st] += 1
+
+    # Per owner-staging-dev: one flat [n_peers*(L+1)] CSR with ABSOLUTE slots into
+    # that dev's inter_comb_buf. Peer p's slots follow all of peer (p-1)'s, so each
+    # (peer, token) gather range addresses a contiguous block. At N==2 (n_peers==1)
+    # this is a single [L+1] CSR — identical to the legacy single-peer layout.
     inter_off_per_dev = []
+    dev_totals = []
     for d in range(world_size_per_node):
-        off = [0] * (num_local_tokens + 1)
-        for t in range(num_local_tokens):
-            off[t + 1] = off[t] + inter_count[d][t]
+        off = [0] * (n_peers * (L + 1))
+        cum = 0
+        for p in range(n_peers):
+            b = p * (L + 1)
+            off[b] = cum
+            for t in range(L):
+                off[b + t + 1] = off[b + t] + inter_count[d][p][t]
+            cum = off[b + L]
         inter_off_per_dev.append(off)
+        dev_totals.append(cum)
 
     # Second pass: assign ABSOLUTE slots in the SAME global (producer_gpu, row)
     # order so each producer's slot matches the owner's CSR gather range.
-    running = [[0] * num_local_tokens for _ in range(world_size_per_node)]
+    running = [[[0] * L for _ in range(n_peers)]
+               for _ in range(world_size_per_node)]
     npad = len(all_rows[this_global_gpu])
     inter_row_to_slot = [0] * npad
     inter_row_to_owner = [-1] * npad
@@ -333,15 +354,16 @@ def build_inter_gather_indices(this_global_gpu, total_gpus, num_experts_per_dev,
         for r, (sn, sd, st) in enumerate(all_rows[g]):
             if sn < 0 or sn == node_idx:
                 continue
-            k = running[sd][st]
-            running[sd][st] = k + 1
+            p = peer_slot_of(sn)
+            k = running[sd][p][st]
+            running[sd][p][st] = k + 1
             if is_me:
                 inter_row_to_owner[r] = sd
-                inter_row_to_slot[r] = inter_off_per_dev[sd][st] + k  # ABSOLUTE
+                inter_row_to_slot[r] = inter_off_per_dev[sd][p * (L + 1) + st] + k  # ABSOLUTE
 
     this_dev = this_global_gpu - node_base
-    inter_owner_offset = inter_off_per_dev[this_dev]
-    inter_comb_slots = max(1, max(off[-1] for off in inter_off_per_dev))
+    inter_owner_offset = inter_off_per_dev[this_dev]   # flat [n_peers*(L+1)]
+    inter_comb_slots = max(1, max(dev_totals))
 
     inter_owner_offset_t = torch.tensor(inter_owner_offset, dtype=torch.int32, device="cuda")
     inter_row_to_slot_t = torch.tensor(inter_row_to_slot, dtype=torch.int32, device="cuda")
@@ -523,11 +545,13 @@ def main():
                          device="cuda", dtype=torch.bfloat16) * (I ** -0.5)
 
         n_peers = NUM_NODES - 1
-        # 2x buffers: lower half = dispatch region, upper half = inter-node combine
-        # region, in the SAME registered RDMA MR (so combine never touches dispatch
-        # data and needs no cross-node barrier). Combine is in the fused kernel.
+        # (1 + n_peers)x buffer in ONE registered RDMA MR: the first L rows are the
+        # dispatch region (broadcast to all peers), the next n_peers*L rows are the
+        # inter-node combine region (one dense [L,H] send buffer per destination
+        # peer). Combine never touches the dispatch region, so it needs no cross-node
+        # barrier. At N==2 this is the legacy 2x buffer. Combine runs in the kernel.
         pre_tokens = mod.DistBuffer(
-            (2 * num_local_tokens, H), dtype=torch.bfloat16,
+            ((1 + n_peers) * num_local_tokens, H), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=False,
         )
         pre_tokens.data_[:num_local_tokens].copy_(pre_tokens_data)  # dispatch input
@@ -606,18 +630,20 @@ def main():
         while fifo_cap < flag_tiles * 2:
             fifo_cap *= 2
 
-        # ZERO_COPY baked on: peer_tokens IS the RDMA destination. Register the
-        # FULL 2x buffers (dispatch lower + combine upper) and reserve 2x arrival
-        # flags (num_tiles) so dispatch and combine use disjoint flag slots.
+        # ZERO_COPY baked on: peer_tokens IS the RDMA destination. Register the FULL
+        # local pre_tokens MR (dispatch lower + n_peers combine-upper regions) and the
+        # remote peer_tokens MR (n_peers dispatch-recv + n_peers combine-recv), and
+        # reserve 2x arrival flags so dispatch and combine use disjoint flag slots.
+        local_pre_tokens_bytes = (1 + n_peers) * pre_tokens_bytes
         external_recv_buf_ptr = int(peer_tokens.data_.data_ptr())
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
-            int(pre_tokens.data_.data_ptr()), 2 * pre_tokens_bytes,
+            int(pre_tokens.data_.data_ptr()), local_pre_tokens_bytes,
             2 * n_peers * pre_tokens_bytes, flag_tiles, fifo_cap, local_rank,
             external_recv_buf_ptr,
             int(pre_tokens.data_.data_ptr()),
-            2 * pre_tokens_bytes,
+            local_pre_tokens_bytes,
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )

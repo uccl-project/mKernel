@@ -651,19 +651,27 @@ __device__ inline void combine_gather_inter(const fused_globals &G) {
     constexpr int VEC = 8;                 // 8 bf16 (one float4) per group
     const int HV = H / VEC;                // groups per row
     const __nv_bfloat16* cb = &G.inter_comb_buf[G.dev_idx][{0, 0}];   // own inter plane
-    const int base = G.num_local_tokens;   // pre_tokens UPPER (combine staging)
-    __nv_bfloat16* sbase = &G.pre_tokens_flat[G.dev_idx][{base, 0}];  // bf16 send rows
-    const long total = (long)G.num_local_tokens * HV;
+    const int L = G.num_local_tokens;
+    const int n_peers = G.num_nodes - 1;
+    // pre_tokens UPPER holds one dense [L,H] send region per destination peer,
+    // laid out after the L-row dispatch region: peer p -> rows [L + p*L, L + (p+1)*L).
+    // inter_owner_offset_ptr is a flat [n_peers*(L+1)] CSR; peer p uses table p.
+    __nv_bfloat16* ubase = &G.pre_tokens_flat[G.dev_idx][{L, 0}];
+    const long total = (long)n_peers * L * HV;
     for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += (long)gridDim.x * blockDim.x) {
-        const int t = idx / HV, j = idx % HV;     // j-th 8-element group in token t
-        const int off = G.inter_owner_offset_ptr[t];
-        const int kt = G.inter_owner_offset_ptr[t + 1] - off;
+        const long srow = idx / HV;               // dense send row across peers
+        const int j = (int)(idx % HV);            // j-th 8-element group
+        const int p = (int)(srow / L);            // destination peer slot
+        const int t = (int)(srow % L);            // owner token within the peer
+        const int* off_tbl = G.inter_owner_offset_ptr + (long)p * (L + 1);
+        const int off = off_tbl[t];
+        const int kt = off_tbl[t + 1] - off;
         float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f);   // start at 0 (overwrite)
         float4 a1 = make_float4(0.f, 0.f, 0.f, 0.f);
         for (int k = 0; k < kt; ++k) {
-            const __nv_bfloat16* row = cb + (size_t)(off + k) * H + j * VEC;
-            float4 pv = reinterpret_cast<const float4*>(row)[0];
+            const __nv_bfloat16* cbrow = cb + (size_t)(off + k) * H + j * VEC;
+            float4 pv = reinterpret_cast<const float4*>(cbrow)[0];
             const __nv_bfloat162* p2 = reinterpret_cast<const __nv_bfloat162*>(&pv);
             a0.x += __low2float(p2[0]); a0.y += __high2float(p2[0]);
             a0.z += __low2float(p2[1]); a0.w += __high2float(p2[1]);
@@ -671,7 +679,7 @@ __device__ inline void combine_gather_inter(const fused_globals &G) {
             a1.z += __low2float(p2[3]); a1.w += __high2float(p2[3]);
         }
         // Pack fp32 a0/a1 -> 8 bf16 and store one coalesced bf162x4 into send row.
-        __nv_bfloat16* sp = sbase + (size_t)t * H + j * VEC;
+        __nv_bfloat16* sp = ubase + (size_t)srow * H + j * VEC;
         __nv_bfloat162* sp2 = reinterpret_cast<__nv_bfloat162*>(sp);
         sp2[0] = __floats2bfloat162_rn(a0.x, a0.y);
         sp2[1] = __floats2bfloat162_rn(a0.z, a0.w);
@@ -967,7 +975,8 @@ __device__ inline void combine_send(const fused_globals &G) {
             cmd.dst_rank = (uint8_t)peer_rank;
             cmd.tile_id = (uint32_t)(dispatch_flags + sap * single_peer_tiles + chunk_id);
             cmd.bytes = bytes;
-            cmd.local_offset = local_base + off;
+            // local_base is peer-slot 0's region; each peer reads its own dense [L,H].
+            cmd.local_offset = local_base + (uint64_t)peer_slot * (uint32_t)single_peer_bytes + off;
             cmd.remote_offset = remote_base + (uint64_t)sap * (uint32_t)single_peer_bytes + off;
             cmd.lane_id = (uint16_t)chunk_id;
             cmd.reserved0 = (uint8_t)(peer_slot * fused_globals::NUM_DEVICES + G.dev_idx);
