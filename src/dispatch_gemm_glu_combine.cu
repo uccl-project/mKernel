@@ -1,8 +1,9 @@
 /**
- * @file dispatch_gemm.cu
- * @brief Multi-node MoE Dispatch + Group GEMM - single fused kernel.
+ * @file dispatch_gemm_glu_combine.cu
+ * @brief Multi-node fused MoE: dispatch -> gemm1 -> SwiGLU -> gemm2 -> combine,
+ *        in a single persistent kernel.
  *
- * Single kernel launch. CTA roles are split by blockIdx.x:
+ * During the dispatch phase, CTA roles are split by blockIdx.x:
  *
  *   Inter-send CTAs [0, num_send_sms):
  *     Push this node's pre-dispatch token buffer to the peer node through the
@@ -17,11 +18,18 @@
  *     Walk local tokens first, then peer tokens. Each token is TMA-loaded from
  *     its source GPU/node into post_tokens, with peer tokens gated by copy_ready.
  *
- *   GEMM CTAs [..., 132):
- *     Run grouped expert GEMMs after the dispatched row blocks are ready.
+ *   Compute CTAs [..., 132):
+ *     Run gemm1 (post_tokens @ w1 -> h1) once their dispatched row blocks ready.
  *
- * The kernel overlaps RDMA, token dispatch, and expert GEMM, then lets the
- * last CTA clear per-row dispatch barriers before exit.
+ * After a grid barrier the role split dissolves and every CTA runs the rest in
+ * lockstep, separated by grid + cross-GPU barriers:
+ *   SwiGLU (h1 -> act) -> gemm2 (act @ w2 -> y_expert) -> combine.
+ *
+ * Combine has no dedicated CTA role: each CTA stores its weighted expert outputs
+ * into the owner GPU's contribution buffer over IPC, then each owner GPU
+ * gather-reduces its tokens into y_out. The inter-node tail reuses the dispatch
+ * split (combine_phase2): the send CTAs RDMA the staged rows to peers, the rest
+ * reduce the received contributions.
  *
  * Infrastructure (config, globals, helpers, host setup, entrypoint) lives in
  *   include/operators/dispatch_gemm_glu_combine/dispatch_gemm_glu_combine.cuh
