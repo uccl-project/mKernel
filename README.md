@@ -38,6 +38,7 @@ _mKernel is under active development, including optimizing for larger scale, dif
 | **AllGather + GEMM** | AllGather → GEMM | Each rank holds a shard of the activation `A`. While ranks gather peers' shards over NVLink/RDMA, the local GEMM consumes tiles as soon as they arrive — overlapping the gather with `(A_full @ B)` so the matmul starts before the collective finishes. |
 | **GEMM + AllReduce** | GEMM → AllReduce | Computes `C = A @ B` and reduces partial outputs across all 16 ranks in one launch. Output tiles are pushed into the reduction tree the instant they're produced, hiding the AllReduce inside the GEMM tail. |
 | **MoE Dispatch + GEMM** | All-to-All dispatch → grouped GEMM | Routes MoE tokens to their expert ranks (intra-node NVLink + inter-node all-to-all) and runs the per-expert grouped GEMM in the same kernel. Tokens are matmul'd as soon as they land, no staging buffer round-trip. |
+| **MoE Dispatch + FFN + Combine** | All-to-All dispatch → grouped FFN → All-to-All combine | A full expert-parallel MoE layer in one kernel: routes tokens to their expert ranks, runs the per-expert FFN (gemm1 → SwiGLU → gemm2), then combines the weighted expert outputs back to each token's source rank. Dispatch, both GEMMs, and the combine overlap across intra-node NVLink and inter-node RDMA without leaving the kernel. |
 | **Ring Attention** | Ring KV exchange → FlashAttention | Sequence-parallel attention across 16 ranks: each step rotates a KV chunk around the ring while the local FlashAttention consumes the previously-received chunk. Compute and the ring send/recv run concurrently inside a single persistent kernel. |
 | **GEMM + ReduceScatter** | GEMM → ReduceScatter | Computes `C = A @ B` and reduce-scatters the output across ranks. Each output tile is reduced and forwarded to its owning rank as soon as it's produced, so the scatter overlaps the GEMM rather than following it. |
 
@@ -82,6 +83,7 @@ Both backends share the same host-side API and the same on-GPU kernel; only the 
 | AllGather + GEMM | ![ag_gemm](plots/ag_gemm_efa.png) |
 | GEMM + AllReduce | ![gemm_ar](plots/gemm_ar_efa.png) |
 | MoE Dispatch + GEMM | ![dispatch_gemm](plots/dispatch_gemm_efa.png) |
+| MoE Dispatch + FFN + Combine | ![dispatch_gemm_glu_combine](plots/dispatch_gemm_glu_combine_efa.png) |
 | Ring Attention | ![ring_attention](plots/ring_attention_efa.png) |
 | GEMM + ReduceScatter | ![gemm_rs](plots/gemm_rs_efa.png) |
 
