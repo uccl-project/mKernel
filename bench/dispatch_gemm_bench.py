@@ -36,6 +36,9 @@ from common import (  # noqa: E402
     gather_cpu_tensors,
     get_peer_ips,
     get_peer_ports,
+    make_dist_buffer,
+    rdma_backing,
+    rdma_policy_label,
 )
 
 KERNEL_NAME = "dispatch_gemm"
@@ -222,10 +225,14 @@ def main():
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
+    source_backing = rdma_backing()
+    target_backing = source_backing
 
     if is_chief:
         print(f"[dispatch_gemm] world={world_size*NUM_NODES} per_node={world_size} "
               f"shapes={args.shapes}", flush=True)
+        print(rdma_policy_label(
+            KERNEL_NAME, source=source_backing, target=target_backing), flush=True)
 
     shapes = [int(x) for x in args.shapes.split(",") if x.strip()]
     total_gpus = NUM_NODES * world_size
@@ -297,16 +304,20 @@ def main():
             / (H ** 0.25)
         )
 
-        pre_tokens = mod.DistBuffer(
+        pre_tokens = make_dist_buffer(
+            mod,
             (num_local_tokens, H), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=False,
+            backing=source_backing,
         )
         pre_tokens.data_.copy_(pre_tokens_data)
 
         n_peers = NUM_NODES - 1
-        peer_tokens = mod.DistBuffer(
+        peer_tokens = make_dist_buffer(
+            mod,
             (n_peers * num_local_tokens, H), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=False,
+            backing=target_backing,
         )
         peer_tokens.data_.zero_()
 

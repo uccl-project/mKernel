@@ -24,6 +24,58 @@ import load_module  # noqa: E402
 
 
 # ----------------------------------------------------------------------
+# RDMA buffer backing policy
+# ----------------------------------------------------------------------
+
+def rdma_backing(*, default: str = "vmm") -> str:
+    """Resolve the global RDMA buffer backing.
+
+    Precedence, high to low:
+      MKERNEL_RDMA_BUFFER_BACKING
+      default
+    """
+    raw = os.environ.get("MKERNEL_RDMA_BUFFER_BACKING", default)
+    backing = raw.strip().lower()
+    if backing not in ("vmm", "peermem"):
+        raise ValueError(
+            f"Unsupported RDMA backing {raw!r}; expected 'vmm' or 'peermem'")
+    return backing
+
+
+def is_peermem_backing(backing: str) -> bool:
+    return backing == "peermem"
+
+
+def make_dist_buffer(
+    mod,
+    shape,
+    *,
+    dtype,
+    local_rank: int,
+    local_world_size: int,
+    multicast: bool = False,
+    backing: str = "vmm",
+):
+    """Create a DistBuffer from the generic RDMA backing policy."""
+    if backing not in ("vmm", "peermem"):
+        raise ValueError(
+            f"Unsupported RDMA backing {backing!r}; expected 'vmm' or 'peermem'")
+    if multicast and backing == "peermem":
+        raise ValueError("peermem RDMA backing does not support multicast")
+    return mod.DistBuffer(
+        shape, dtype=dtype,
+        local_rank=local_rank, local_world_size=local_world_size,
+        multicast=multicast,
+        backing="cuda_malloc" if backing == "peermem" else "vmm",
+    )
+
+
+def rdma_policy_label(kernel: str, **roles: str) -> str:
+    parts = " ".join(f"{k}={v}" for k, v in roles.items())
+    return f"[{kernel}] rdma_backing {parts}"
+
+
+# ----------------------------------------------------------------------
 # Distributed init / launcher helpers
 # ----------------------------------------------------------------------
 

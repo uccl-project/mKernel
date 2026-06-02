@@ -206,6 +206,7 @@ struct Session {
     // Receive buffer (allocated on GPU, RDMA-registered for remote writes).
     // Registered on every rail's PD; the per-rail MRs live in rails[r].recv_buf_mr.
     gpu_mr::GpuRdmaBuffer recv_buf;
+    bool          recv_buf_aliases_local_data = false;
 
     // D2H command FIFOs (one per proxy thread / FIFO channel).
     D2HFifoPair         fifos[kMaxProxyThreads];
@@ -381,12 +382,18 @@ inline Session* create_session(const SessionConfig& cfg) {
             s->rails[r].pd, cfg.local_gpu_buf, cfg.local_gpu_buf_size);
     }
 
-    // Optional: register the direct-send GPU source buffer (e.g.
-    // output_local) as a DMA-BUF MR on every rail's PD. Skipping the staging
-    // pack + gather on the send critical path. Hard-fails if DMA-BUF export
-    // is unavailable — callers opt in explicitly.
-    if (cfg.direct_dmabuf_enabled && cfg.clocal_gpu_buf != nullptr
-        && cfg.clocal_gpu_buf_size > 0) {
+    // Optional: register the direct-send GPU source buffer (e.g. output_local)
+    // as a DMA-BUF MR on every rail's PD. Skips the staging pack + gather on
+    // the send critical path. EFA keeps this DMA-BUF-only; peermem fallback is
+    // intentionally scoped to the CX7/RoCE backend.
+    if (cfg.direct_dmabuf_enabled) {
+        if (cfg.clocal_gpu_buf == nullptr || cfg.clocal_gpu_buf_size == 0) {
+            fprintf(stderr,
+                "session_efa: direct-DMA-BUF MR requested but clocal_gpu_buf is missing "
+                "(ptr=%p bytes=%zu).\n",
+                cfg.clocal_gpu_buf, cfg.clocal_gpu_buf_size);
+            exit(EXIT_FAILURE);
+        }
         for (int r = 0; r < num_rails; r++) {
             const char* path = nullptr;
             s->rails[r].clocal_data_mr = gpu_mr::register_gpu_buffer_dmabuf_only(
@@ -415,11 +422,20 @@ inline Session* create_session(const SessionConfig& cfg) {
         s->recv_buf.size = cfg.recv_buf_size;
         s->recv_buf.mr = nullptr;  // not owned: free_buffer becomes a no-op
                                    // for the gpu_ptr; per-rail MRs still freed.
-        s->rails[0].recv_buf_mr = gpu_mr::register_gpu_buffer(
-            s->rails[0].pd, s->recv_buf.gpu_ptr, s->recv_buf.size);
-        for (int r = 1; r < num_rails; r++) {
-            s->rails[r].recv_buf_mr = gpu_mr::register_gpu_buffer(
-                s->rails[r].pd, s->recv_buf.gpu_ptr, s->recv_buf.size);
+        s->recv_buf_aliases_local_data =
+            cfg.external_recv_buf == cfg.local_gpu_buf &&
+            cfg.recv_buf_size == cfg.local_gpu_buf_size;
+        if (s->recv_buf_aliases_local_data) {
+            for (int r = 0; r < num_rails; r++) {
+                s->rails[r].recv_buf_mr = s->rails[r].local_data_mr;
+            }
+        } else {
+            s->rails[0].recv_buf_mr = gpu_mr::register_gpu_buffer(
+                s->rails[0].pd, s->recv_buf.gpu_ptr, s->recv_buf.size);
+            for (int r = 1; r < num_rails; r++) {
+                s->rails[r].recv_buf_mr = gpu_mr::register_gpu_buffer(
+                    s->rails[r].pd, s->recv_buf.gpu_ptr, s->recv_buf.size);
+            }
         }
     } else {
         // Use rail 0 for the allocation + primary MR.
@@ -829,7 +845,8 @@ inline void destroy_session(Session* s) {
         if (s->rails[r].clocal_data_mr) rdma::dereg_mr(s->rails[r].clocal_data_mr);
         // owned mode: rail 0's MR is freed by gpu_mr::free_buffer below.
         // external mode: dereg rail 0 too (free_buffer won't touch it).
-        const bool dereg_recv = external_recv_buf || (r > 0);
+        const bool dereg_recv =
+            !s->recv_buf_aliases_local_data && (external_recv_buf || (r > 0));
         if (dereg_recv && s->rails[r].recv_buf_mr) rdma::dereg_mr(s->rails[r].recv_buf_mr);
     }
     // Clear the pointers that gpu_mr::free_buffer and arrival/barrier teardown

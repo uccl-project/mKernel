@@ -6,6 +6,7 @@
 // Session management + pybind module
 // ============================================================================
 #include "comm/internode/session_py.cuh"
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <torch/csrc/utils/pybind.h>
 
@@ -22,6 +23,7 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
                        int64_t k0_buf_size,
                        int64_t v0_buf_ptr,
                        int64_t v0_buf_size,
+                       bool staging_source,
                        std::vector<std::string> peer_ips = {},
                        std::vector<int> peer_tcp_ports = {}) {
     internode::py::destroy_session(g_session);
@@ -32,20 +34,30 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     internode::py::apply_peer_ips(
         cfg, peer_ips, peer_tcp_ports, tcp_port,
         g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
-    // Zero-copy send: K0 (src_view=0) and V0 (src_view=1) registered as
-    // DMA-BUF MRs. Proxy posts single-SGE WRs straight from the VMM tensors
-    // — no pack copy. send_buf_ptr/size are kept in the signature for
-    // backwards compatibility but unused.
-    if (k0_buf_ptr == 0 || v0_buf_ptr == 0) {
+    // Default zero-copy send: K0 (src_view=0) and V0 (src_view=1) are direct
+    // GPU MRs. Peermem-compatible mode keeps K/V as VMM ring buffers and sends
+    // from a cudaMalloc staging buffer instead, because the intra-node TMA ring
+    // relies on the VMM/IPC peer views.
+    if (!staging_source && (k0_buf_ptr == 0 || v0_buf_ptr == 0)) {
         fprintf(stderr, "create_session_py: ring_attention zero-copy send requires k0/v0 ptrs\n");
         std::exit(EXIT_FAILURE);
     }
-    (void)send_buf_ptr; (void)send_buf_size;
-    cfg.local_gpu_buf = reinterpret_cast<void*>(k0_buf_ptr);
-    cfg.local_gpu_buf_size = (size_t)k0_buf_size;
-    cfg.clocal_gpu_buf = reinterpret_cast<void*>(v0_buf_ptr);
-    cfg.clocal_gpu_buf_size = (size_t)v0_buf_size;
-    cfg.direct_dmabuf_enabled = true;
+    if (staging_source) {
+        if (send_buf_ptr == 0 || send_buf_size == 0) {
+            fprintf(stderr, "create_session_py: ring_attention staging source requires send_buf ptr+size\n");
+            std::exit(EXIT_FAILURE);
+        }
+        cfg.local_gpu_buf = reinterpret_cast<void*>(send_buf_ptr);
+        cfg.local_gpu_buf_size = (size_t)send_buf_size;
+        cfg.direct_dmabuf_enabled = false;
+    } else {
+        (void)send_buf_ptr; (void)send_buf_size;
+        cfg.local_gpu_buf = reinterpret_cast<void*>(k0_buf_ptr);
+        cfg.local_gpu_buf_size = (size_t)k0_buf_size;
+        cfg.clocal_gpu_buf = reinterpret_cast<void*>(v0_buf_ptr);
+        cfg.clocal_gpu_buf_size = (size_t)v0_buf_size;
+        cfg.direct_dmabuf_enabled = true;
+    }
     cfg.max_inflight = 32;
     if (const char* env_mi = std::getenv("MKERNEL_MAX_INFLIGHT")) {
         cfg.max_inflight = std::atoi(env_mi);
@@ -81,6 +93,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("fifo_capacity"), pybind11::arg("device_id"),
           pybind11::arg("k0_buf_ptr"), pybind11::arg("k0_buf_size"),
           pybind11::arg("v0_buf_ptr"), pybind11::arg("v0_buf_size"),
+          pybind11::arg("staging_source"),
           pybind11::arg("peer_ips") = std::vector<std::string>{},
           pybind11::arg("peer_tcp_ports") = std::vector<int>{});
     m.def("destroy_session", &destroy_session_py);
@@ -112,5 +125,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_comm_sms"),
           pybind11::arg("num_send_sms"),
           pybind11::arg("num_copy_sms"),
-          pybind11::arg("num_nodes"));
+          pybind11::arg("num_nodes"),
+          pybind11::arg("staging_source"));
 }

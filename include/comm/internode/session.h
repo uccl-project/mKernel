@@ -177,11 +177,11 @@ struct SessionConfig {
     void*       local_gpu_buf;       // existing GPU buffer to register for RDMA reads
     size_t      local_gpu_buf_size;  // size of local_gpu_buf
 
-    // Optional second buffer to register as a DMA-BUF MR (for direct-from-
-    // C_local sends that bypass the staging copy). Required when
-    // direct_dmabuf_enabled is true. Must point to a VMM-backed allocation
-    // (DistBuffer::data_). Registration uses ibv_reg_dmabuf_mr only —
-    // no nvidia_peermem / ibv_reg_mr fallback.
+    // Optional second buffer to register for direct GPU sends that bypass the
+    // staging copy. Required when direct_dmabuf_enabled is true. Registration
+    // uses the common GPU-MR path: DMA-BUF first, then ibv_reg_mr through
+    // nvidia_peermem/nv_peer_mem. VMM allocations still require DMA-BUF
+    // support; cudaMalloc-backed buffers can use the peermem fallback.
     void*       clocal_gpu_buf = nullptr;
     size_t      clocal_gpu_buf_size = 0;
     bool        direct_dmabuf_enabled = false;
@@ -237,14 +237,15 @@ struct Session {
     // Local data buffer MR (registered over caller's existing GPU buffer)
     ibv_mr*       local_data_mr;
 
-    // Optional DMA-BUF MR over the C_local (DistBuffer data_) buffer.
-    // Non-null only when SessionConfig::direct_dmabuf_enabled was set and the
-    // strict DMA-BUF registration succeeded.
+    // Optional direct GPU MR over the C_local (DistBuffer data_) buffer.
+    // Non-null only when SessionConfig::direct_dmabuf_enabled was set and GPU
+    // memory registration succeeded.
     ibv_mr*       clocal_data_mr = nullptr;
 
     // Receive buffer (allocated on GPU, RDMA-registered for remote writes)
     gpu_mr::GpuRdmaBuffer recv_buf;
     bool          recv_buf_external = false;
+    bool          recv_buf_aliases_local_data = false;
 
     // D2H command FIFOs — one per proxy thread / FIFO channel.
     D2HFifoPair   fifos[kMaxProxyThreads];
@@ -387,22 +388,23 @@ inline Session* create_session(const SessionConfig& cfg) {
         exit(EXIT_FAILURE);
     }
 
-    // Optional: DMA-BUF-only registration of C_local (direct-send MR).
+    // Optional direct-send registration of C_local. The registration helper
+    // prefers DMA-BUF and falls back to nvidia_peermem/nv_peer_mem for
+    // cudaMalloc-backed buffers.
     if (cfg.direct_dmabuf_enabled) {
         if (cfg.clocal_gpu_buf == nullptr || cfg.clocal_gpu_buf_size == 0) {
             fprintf(stderr,
                     "session: direct_dmabuf_enabled but clocal_gpu_buf not provided\n");
             exit(EXIT_FAILURE);
         }
-        s->clocal_data_mr = gpu_mr::register_gpu_buffer_dmabuf_only(
+        s->clocal_data_mr = gpu_mr::register_gpu_buffer(
             s->pd, cfg.clocal_gpu_buf, cfg.clocal_gpu_buf_size,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
-            | IBV_ACCESS_RELAXED_ORDERING,
-            nullptr);
+            | IBV_ACCESS_RELAXED_ORDERING);
         if (!s->clocal_data_mr) {
             fprintf(stderr,
-                    "session: DMA-BUF-only registration of C_local failed "
-                    "(ptr=%p bytes=%zu). No peermem fallback permitted — exiting.\n",
+                    "session: direct GPU registration of C_local failed "
+                    "(ptr=%p bytes=%zu).\n",
                     cfg.clocal_gpu_buf, cfg.clocal_gpu_buf_size);
             exit(EXIT_FAILURE);
         }
@@ -412,8 +414,13 @@ inline Session* create_session(const SessionConfig& cfg) {
     if (cfg.external_recv_buf != nullptr) {
         s->recv_buf.gpu_ptr = cfg.external_recv_buf;
         s->recv_buf.size = cfg.recv_buf_size;
-        s->recv_buf.mr = gpu_mr::register_gpu_buffer(
-            s->pd, s->recv_buf.gpu_ptr, s->recv_buf.size);
+        s->recv_buf_aliases_local_data =
+            cfg.external_recv_buf == cfg.local_gpu_buf &&
+            cfg.recv_buf_size == cfg.local_gpu_buf_size;
+        s->recv_buf.mr = s->recv_buf_aliases_local_data
+            ? s->local_data_mr
+            : gpu_mr::register_gpu_buffer(
+                s->pd, s->recv_buf.gpu_ptr, s->recv_buf.size);
         s->recv_buf_external = true;
     } else {
         s->recv_buf = gpu_mr::alloc_and_register(
@@ -739,7 +746,9 @@ inline void destroy_session(Session* s) {
 
     // Free buffers
     if (s->recv_buf_external) {
-        if (s->recv_buf.mr) rdma::dereg_mr(s->recv_buf.mr);
+        if (!s->recv_buf_aliases_local_data && s->recv_buf.mr) {
+            rdma::dereg_mr(s->recv_buf.mr);
+        }
         s->recv_buf = gpu_mr::GpuRdmaBuffer{};
     } else {
         gpu_mr::free_buffer(s->recv_buf);

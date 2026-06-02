@@ -51,7 +51,6 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cstdlib>
 #include <cstdio>
 #include <vector>
 #include <algorithm>
@@ -151,9 +150,9 @@ struct globals {
 // copied peer KV around the local M-GPU ring just like the round-0 local KV.
 
 struct kv_exchange_globals {
-    bf16 *send_buf;          // legacy staging buffer pointer, unused under
+    bf16 *send_buf;          // staging buffer pointer, unused under
                              // zero-copy send (K0/V0 are RDMA-registered
-                             // directly via DMA-BUF; src_view selects between
+                             // directly; src_view selects between
                              // them at the proxy).
     // Base pointer to the receive buffer. At N peers the buffer is laid out
     // as (N-1) consecutive [K | V] slots; the kv_copy kernel takes a peer
@@ -170,6 +169,7 @@ struct kv_exchange_globals {
     int   num_nodes;  // total node count (>= 2).
     int   num_send_sms;
     int   num_copy_sms;
+    int   use_staging_source;
 
     internode::D2HFifoDeviceBundle d2h_fifos;
     volatile uint32_t *arrival_flags;
@@ -247,7 +247,8 @@ inline void entrypoint(
     int num_comm_sms,
     int num_send_sms,
     int num_copy_sms,
-    int num_nodes
+    int num_nodes,
+    bool staging_source
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -298,6 +299,7 @@ inline void entrypoint(
         .num_nodes = num_nodes,
         .num_send_sms = n_send,
         .num_copy_sms = n_copy,
+        .use_staging_source = staging_source ? 1 : 0,
         .d2h_fifos = fifo_bundle,
         .arrival_flags = reinterpret_cast<volatile uint32_t*>(arrival_flags_ptr),
         .epoch = (uint32_t)epoch,

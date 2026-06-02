@@ -43,7 +43,8 @@ struct alignas(128) TileFlag {
 };
 
 /// Send mode — picks the proxy's WQE construction strategy.
-///   DmabufDirect: src_view=1, zero-copy single-SGE from local DMA-BUF MR.
+///   DmabufDirect: src_view=1, zero-copy single-SGE from direct GPU MR.
+///                 Historical name; MR may be DMA-BUF or peermem-backed.
 ///                 Requires session.rails[*].clocal_data_mr non-null.
 ///   Staging     : src_view=0, proxy reads from a caller-provided staging
 ///                 buffer (the kernel packs into staging before put_inter).
@@ -115,9 +116,8 @@ struct Channel {
     /* ----- Send mode (set at attach/bind time) -----
      * Controls the src_view byte the proxy sees on every put_inter from this
      * channel. Zero-copy modes (DmabufDirect, StridedGather) require the
-     * session to have been created with direct_dmabuf_enabled=true and a
-     * non-null clocal_data_mr per rail; Staging mode tolerates a session
-     * without DMA-BUF support.
+     * session to have a non-null direct GPU clocal_data_mr per rail; Staging
+     * mode tolerates a session without direct GPU source registration.
      */
     SendMode  mode;
 };

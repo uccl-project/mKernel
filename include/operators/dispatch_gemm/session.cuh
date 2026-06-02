@@ -30,9 +30,9 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
     internode::py::apply_peer_ips(
         cfg, peer_ips, peer_tcp_ports, tcp_port,
         g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
-    // Zero-copy send: register pre_tokens (DistBuffer, VMM) as the
-    // session's only data MR via register_gpu_buffer(), which transparently
-    // uses cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr on VMM ranges.
+    // Zero-copy send: register pre_tokens as the session's data MR via
+    // register_gpu_buffer(). VMM buffers use DMA-BUF when supported;
+    // cudaMalloc-backed buffers can fall back to peermem/ibv_reg_mr.
     // The kernel emits cmd.src_view=0; only the source address changes.
     // send_buf_ptr/size are kept in the signature for compatibility but unused.
     if (pre_tokens_buf_ptr == 0 || pre_tokens_buf_size == 0) {

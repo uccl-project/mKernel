@@ -259,7 +259,7 @@ def load_series(kernel: str):
     """Returns (shapes, fused_tf, nccl_tf, cx7_tf or None)."""
     fused = json.load(open(RESULTS / f"{kernel}_efa.json"))
     nccl = json.load(open(RESULTS / f"{kernel}_nccl.json"))
-    cx7 = json.load(open(CX7_PATH))
+    cx7 = json.load(open(CX7_PATH)) if CX7_PATH.exists() else {}
 
     shapes = [_parse_shape(s) for s in fused["sizes"]]
     # ring_attention release JSON stores per-rank seq_per_dev; align to
@@ -274,6 +274,8 @@ def load_series(kernel: str):
     # NCCL JSON may have nccl_ms keyed differently
     nccl_ms = nccl.get("nccl_ms", nccl.get("fused_ms", []))
     nccl_shapes = [_parse_shape(s) for s in nccl["sizes"]]
+    if kernel == "ring_attention":
+        nccl_shapes = [s * WORLD for s in nccl_shapes]
     # Align NCCL shapes to fused shapes
     nccl_by_shape = {sh: ms for sh, ms in zip(nccl_shapes, nccl_ms)}
     nccl_tf = [KERNELS[kernel]["tflops_fn"](s, nccl_by_shape.get(s))

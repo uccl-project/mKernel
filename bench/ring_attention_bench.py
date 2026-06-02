@@ -23,6 +23,10 @@ from common import (  # noqa: E402
     gather_cpu_tensors,
     get_peer_ips,
     get_peer_ports,
+    is_peermem_backing,
+    make_dist_buffer,
+    rdma_backing,
+    rdma_policy_label,
 )
 
 KERNEL_NAME = "ring_attention"
@@ -86,9 +90,15 @@ def main():
     tcp_port = int(os.environ.get("TCP_PORT", "18560")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
+    source_backing = rdma_backing()
+    rdma_source_staging = is_peermem_backing(source_backing)
+    ring_buffer_backing = "vmm" if rdma_source_staging else source_backing
     if is_chief:
         print(f"[ring_attn] world={world_size} per_node={local_world_size} "
               f"shapes={args.shapes}", flush=True)
+        print(rdma_policy_label(
+            KERNEL_NAME, source=source_backing, target="cuda_malloc",
+            ring=ring_buffer_backing), flush=True)
 
     seqs = [int(x) for x in args.shapes.split(",") if x.strip()]
     global_gpu = node_idx * local_world_size + local_rank
@@ -124,10 +134,11 @@ def main():
                               dtype=torch.bfloat16) * scale
 
         def dbuf(shape):
-            return mod.DistBuffer(
+            return make_dist_buffer(
+                mod,
                 shape, dtype=torch.bfloat16,
                 local_rank=local_rank, local_world_size=local_world_size,
-                multicast=False)
+                multicast=False, backing=ring_buffer_backing)
 
         K0 = dbuf((BATCH, HEADS, seq_per_dev, D))
         K1 = dbuf((BATCH, HEADS, seq_per_dev, D))
@@ -147,7 +158,15 @@ def main():
         k_bytes = K_local.numel() * 2
         v_bytes = V_local.numel() * 2
         kv_buf_bytes = k_bytes + v_bytes
-        send_buf = torch.empty(kv_buf_bytes // 2, device="cuda", dtype=torch.bfloat16)
+        send_staging = None
+        if rdma_source_staging:
+            send_staging = make_dist_buffer(
+                mod, (kv_buf_bytes // 2,), dtype=torch.bfloat16,
+                local_rank=local_rank, local_world_size=local_world_size,
+                multicast=False, backing=source_backing)
+            send_buf = send_staging.data_
+        else:
+            send_buf = torch.empty(kv_buf_bytes // 2, device="cuda", dtype=torch.bfloat16)
         send_buf_ptr = send_buf.data_ptr()
         total_chunks = (kv_buf_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
 
@@ -160,8 +179,8 @@ def main():
         fifo_cap = 2048
         while fifo_cap < recv_buf_chunks * 2: fifo_cap *= 2
 
-        # Zero-copy send: K0 and V0 are registered as DMA-BUF MRs. Proxy
-        # posts single-SGE WRs straight from the VMM tensors — no pack.
+        # Default zero-copy send registers K0/V0 directly. Peermem mode keeps
+        # those as VMM ring buffers and registers send_staging instead.
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
@@ -169,6 +188,7 @@ def main():
             recv_buf_chunks, fifo_cap, local_rank,
             int(K0.data_.data_ptr()), k_bytes,
             int(V0.data_.data_ptr()), v_bytes,
+            rdma_source_staging,
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
@@ -176,8 +196,15 @@ def main():
         arrival_ptr = mod.get_arrival_flags_ptr()
         recv_ptr = mod.get_recv_buf_ptr()
 
+        def pack_send_staging():
+            if send_staging is None:
+                return
+            send_buf[:k_bytes // 2].copy_(K_local.reshape(-1))
+            send_buf[k_bytes // 2:].copy_(V_local.reshape(-1))
+
         K0.data_.copy_(K_local); V0.data_.copy_(V_local)
         K1.data_.zero_(); V1.data_.zero_()
+        pack_send_staging()
         barrier.data_.zero_()
 
         epoch = 1
@@ -187,6 +214,7 @@ def main():
         def reset_and_run(ep):
             K0.data_.copy_(K_local); V0.data_.copy_(V_local)
             K1.data_.zero_(); V1.data_.zero_()
+            pack_send_staging()
             barrier.data_.zero_()
             L.zero_(); L_block.zero_()
             O.zero_(); O_block.zero_()
@@ -199,6 +227,7 @@ def main():
                 arrival_ptr, ep,
                 node_idx, args.num_comm_sms,
                 args.num_send_sms, args.num_copy_sms, NUM_NODES,
+                rdma_source_staging,
             )
 
         for _ in range(args.warmup + 1):
@@ -216,6 +245,8 @@ def main():
         legacy_sync = os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1"
         if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
             legacy_sync = True
+        if rdma_source_staging:
+            legacy_sync = True
         if not legacy_sync:
             # Pick N so total ≥ ~100 ms at smaller shapes but bounded ≤ ~2s at
             # the largest. For ring_attn, expected per-iter ms ≈ shape-dependent
@@ -230,6 +261,7 @@ def main():
             epoch += 1
             K0.data_.copy_(K_local); V0.data_.copy_(V_local)
             K1.data_.zero_(); V1.data_.zero_()
+            pack_send_staging()
             barrier.data_.zero_()
             L.zero_(); L_block.zero_(); O.zero_(); O_block.zero_()
             mod.set_epoch(epoch)
@@ -246,6 +278,7 @@ def main():
                     arrival_ptr, epoch,
                     node_idx, args.num_comm_sms,
                     args.num_send_sms, args.num_copy_sms, NUM_NODES,
+                    rdma_source_staging,
                 )
             e.record()
             torch.cuda.synchronize()
@@ -260,6 +293,7 @@ def main():
                 epoch += 1
                 K0.data_.copy_(K_local); V0.data_.copy_(V_local)
                 K1.data_.zero_(); V1.data_.zero_()
+                pack_send_staging()
                 barrier.data_.zero_()
                 L.zero_(); L_block.zero_(); O.zero_(); O_block.zero_()
                 mod.set_epoch(epoch)
@@ -274,6 +308,7 @@ def main():
                     arrival_ptr, epoch,
                     node_idx, args.num_comm_sms,
                     args.num_send_sms, args.num_copy_sms, NUM_NODES,
+                    rdma_source_staging,
                 )
                 e.record(); torch.cuda.synchronize()
                 samples.append(s.elapsed_time(e))

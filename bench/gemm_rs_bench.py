@@ -24,6 +24,9 @@ from common import (  # noqa: E402
     compare_named_results,
     get_peer_ips,
     get_peer_ports,
+    make_dist_buffer,
+    rdma_backing,
+    rdma_policy_label,
 )
 
 KERNEL_NAME = "gemm_rs"
@@ -221,13 +224,18 @@ def main():
         )
         ready_chunk.data_.zero_()
 
-        # GEMM_RS_INTRA_RS_DIRECT_STAGING=1: staging is a DistBuffer.
-        staging_dbuf = mod.DistBuffer(
+        # The staging buffer is the RDMA source for GEMM_RS.
+        staging_backing = rdma_backing()
+        staging_dbuf = make_dist_buffer(
+            mod,
             (m_local, n), dtype=torch.bfloat16,
-            local_rank=local_rank, local_world_size=world_size, multicast=False,
+            local_rank=local_rank, local_world_size=world_size,
+            multicast=False, backing=staging_backing,
         )
         staging_dbuf.data_.zero_()
         staging_buf = staging_dbuf.data_
+        if is_chief:
+            print(rdma_policy_label(KERNEL_NAME, source=staging_backing), flush=True)
 
         os.environ["GEMM_RS_RDMA_CHUNK_TILES_RT"] = str(chunk_tiles)
 
