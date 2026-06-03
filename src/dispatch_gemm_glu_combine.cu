@@ -37,7 +37,6 @@
  *   include/operators/dispatch_gemm_glu_combine/session.cuh
  */
 #include "operators/dispatch_gemm_glu_combine/dispatch_gemm_glu_combine.cuh"
-#include "operators/dispatch_gemm_glu_combine/gemm.cuh"
 
 namespace moe_dispatch_gemm_glu_combine_multinode {
 
@@ -435,99 +434,14 @@ __device__ inline void grouped_gemm(const fused_globals &G, const int sm_idx,
     }
 }
 
-// ---- Gen-15 modular-rewrite glue (env-gated, default OFF / byte-identical) --
-// Load this rank's per-expert padded-token + local-rb layout into SMEM, exactly
-// as grouped_gemm does, so the modular gemm_sm90::run reads it from SMEM.
-__device__ inline void dgc_load_expert_layout(const fused_globals &G,
-                                              int* ptpe, int* lrb) {
-    const int global_gpu_idx = G.node_idx * fused_globals::NUM_DEVICES + G.dev_idx;
-    const int expert_offset = global_gpu_idx * fused_globals::NUM_EXPERTS_PER_DEV;
-    if (threadIdx.x < fused_globals::NUM_EXPERTS_PER_DEV) {
-        ptpe[threadIdx.x] = G.padded_tokens_per_expert[{expert_offset + (int)threadIdx.x}];
-        lrb[threadIdx.x]  = G.local_rb_per_expert[{(int)threadIdx.x}];
-    }
-}
-
-// gemm1's Gate: poll the per-row-block dispatch barrier until ROW_BLOCK tokens
-// are accounted for (verbatim semantics of the original WAIT_BARRIER branch).
-struct DgcBarrierGate {
-    int* barrier;   // &G.barrier[G.dev_idx][{0}]
-    __device__ inline bool wait(int row_idx, int /*lane*/) const {
-        int v = comm::atomic_u32::acquire_load_s32_gpu(&barrier[row_idx]);
-        while (v != fused_globals::ROW_BLOCK) {
-            __nanosleep(64);
-            v = comm::atomic_u32::acquire_load_s32_gpu(&barrier[row_idx]);
-        }
-        return true;
-    }
-};
-
-// Config typedefs. GEMM*_CFG_BASE = byte-identical legacy union epilogue
-// (STAGES_A==STAGES_B==PIPELINE_STAGES, union C). GEMM*_CFG_PERF = the perf
-// gamble (decoupled register epilogue, asymmetric A/B staging, MMA_INFLIGHT).
-using GEMM1_CFG_BASE = gemm_sm90::Config<
-    fused_globals::ROW_BLOCK, fused_globals::COL_BLOCK, fused_globals::RED_BLOCK,
-    fused_globals::PIPELINE_STAGES, fused_globals::PIPELINE_STAGES,
-    1, /*REG*/false, DYNAMIC_SHARED_MEMORY>;
-using GEMM2_CFG_BASE = GEMM1_CFG_BASE;
-// Perf gamble: decoupled epilogue with deeper cheap-A staging. The reg epilogue
-// needs TWO transient C tiles (one per math warpgroup half), so the only
-// in-budget decoupled fit that keeps A deep is SA=4/SB=3 = 229376 B (2048
-// under). SB cannot stay 4 in the decoupled path (SA*16384 + SB*32768 + 65536).
-// MMA_INFLIGHT=1 (depth-2 viable per ptxas, no WGMMA-loop spill).
-#ifndef DGC_REWRITE_SA
-#define DGC_REWRITE_SA 4
-#endif
-#ifndef DGC_REWRITE_SB
-#define DGC_REWRITE_SB 3
-#endif
-#ifndef DGC_REWRITE_INFLIGHT
-#define DGC_REWRITE_INFLIGHT 1
-#endif
-using GEMM1_CFG_PERF = gemm_sm90::Config<
-    fused_globals::ROW_BLOCK, fused_globals::COL_BLOCK, fused_globals::RED_BLOCK,
-    DGC_REWRITE_SB, DGC_REWRITE_SA, DGC_REWRITE_INFLIGHT, /*REG*/true, DYNAMIC_SHARED_MEMORY>;
-using GEMM2_CFG_PERF = GEMM1_CFG_PERF;
-
 // gemm1 (post_tokens @ w1 -> h1, waits dispatch barrier) and gemm2
 // (act @ w2 -> y_expert, no wait). Compile-time K/N from the operator dims.
 __device__ inline void ffn_gemm1(const fused_globals &G, int sm_idx, int num_sms) {
-#ifdef DGC_GEMM_REWRITE_BUILD
-    if (G.gemm_rewrite) {
-        extern __shared__ int __shm[];
-        __shared__ int ptpe[fused_globals::NUM_EXPERTS_PER_DEV];
-        __shared__ int lrb[fused_globals::NUM_EXPERTS_PER_DEV];
-        dgc_load_expert_layout(G, ptpe, lrb);
-        __syncthreads();
-        gemm_sm90::GroupLayout L{ ptpe, lrb, fused_globals::NUM_EXPERTS_PER_DEV,
-                                  fused_globals::I2 / fused_globals::COL_BLOCK,
-                                  fused_globals::H  / fused_globals::RED_BLOCK, G.super_m };
-        DgcBarrierGate gate{ &G.barrier[G.dev_idx][{0}] };
-        gemm_sm90::run<GEMM1_CFG_PERF>(&__shm[0], sm_idx, num_sms,
-                                       G.post_tokens, G.w1, G.h1, L, gate);
-        return;
-    }
-#endif
     grouped_gemm<fused_globals::H / fused_globals::RED_BLOCK,
                  fused_globals::I2 / fused_globals::COL_BLOCK, true>(
         G, sm_idx, num_sms, G.post_tokens, G.w1, G.h1);
 }
 __device__ inline void ffn_gemm2(const fused_globals &G, int sm_idx, int num_sms) {
-#ifdef DGC_GEMM_REWRITE_BUILD
-    if (G.gemm_rewrite) {
-        extern __shared__ int __shm[];
-        __shared__ int ptpe[fused_globals::NUM_EXPERTS_PER_DEV];
-        __shared__ int lrb[fused_globals::NUM_EXPERTS_PER_DEV];
-        dgc_load_expert_layout(G, ptpe, lrb);
-        __syncthreads();
-        gemm_sm90::GroupLayout L{ ptpe, lrb, fused_globals::NUM_EXPERTS_PER_DEV,
-                                  fused_globals::H / fused_globals::COL_BLOCK,
-                                  fused_globals::I / fused_globals::RED_BLOCK, G.super_m };
-        gemm_sm90::run<GEMM2_CFG_PERF>(&__shm[0], sm_idx, num_sms,
-                                       G.act, G.w2, G.y_expert, L);
-        return;
-    }
-#endif
     grouped_gemm<fused_globals::I / fused_globals::RED_BLOCK,
                  fused_globals::H / fused_globals::COL_BLOCK, false>(
         G, sm_idx, num_sms, G.act, G.w2, G.y_expert);
@@ -1083,12 +997,8 @@ __device__ inline void combine_reduce(const fused_globals &G) {
     // Wait for every peer slot's chunks to arrive before reducing.
     if (threadIdx.x == 0) {
         for (int f = 0; f < n_peers * G.total_chunks; ++f) {
-            // Monotonic >= wait (was != G.epoch). A peer that is AHEAD stamps a
-            // larger epoch which must SATISFY (not reject) the wait; a reset-to-0
-            // is < epoch so it correctly keeps waiting for the real arrival.
-            // Mirrors gemm_ar.cuh:476-481. The exact-match `!=` deadlocked under
-            // cross-node epoch drift; the iter-end in-kernel flag reset (below)
-            // plus the per-invocation handshake make this monotonic wait safe.
+            // Monotonic >= (not ==): a peer that has advanced stamps a higher
+            // epoch (still valid), and a freshly-reset flag (0) stays < epoch.
             while (comm::atomic_u32::acquire_load_sys(
                        &G.arrival_flags[dispatch_flags + f]) < G.epoch)
                 __nanosleep(100);
@@ -1122,15 +1032,11 @@ __device__ inline void combine_reduce(const fused_globals &G) {
     }
 }
 
-// Iter-end in-kernel reset of the COMBINE arrival flags (UPPER half of the flag
-// array: [dispatch_flags, dispatch_flags + n_peers*total_chunks)). Cooperative
-// across ALL CTAs in combine_phase2. Replaces the racy host-side
-// reset_arrival_flags in commit_epoch (which memsets the WHOLE flag array and
-// clobbers a peer's already-delivered next-iter combine flag). Must run AFTER
-// combine_reduce has consumed the flags and BEFORE the cross-node BARRIER_NOTIFY
-// push: the peer's next-iter combine RDMA writes are gated on receiving our
-// NOTIFY, so they cannot collide with this clear. Mirrors
-// gemm_ar_iter_end_reset_arrival_flags (gemm_ar.cuh:427-448).
+// In-kernel reset of this node's combine arrival flags (upper half of the flag
+// array). Runs after combine_reduce has consumed them and before the cross-node
+// barrier push, so the peer's next-iteration RDMA writes cannot clobber the
+// clear. Replaces the host-side reset_arrival_flags in commit_epoch, which
+// races in-flight RDMA from a peer that has already advanced.
 __device__ inline void combine_iter_end_reset_arrival_flags(const fused_globals &G) {
     const int n_peers = G.num_nodes - 1;
     const int dispatch_flags = n_peers * G.total_chunks;   // combine flags start here
@@ -1144,19 +1050,12 @@ __device__ inline void combine_iter_end_reset_arrival_flags(const fused_globals 
     __threadfence_system();
 }
 
-// Per-invocation cross-node completion handshake. After send+reduce+flag-reset,
-// guarantees the kernel does NOT exit until BOTH nodes have finished combine for
-// THIS epoch: (a) the reduce waited for this epoch's RDMA into y_out, and
-// (b) the kernel only exits once the peer's combine RDMA into y_out has landed,
-// so a downstream same-stream kernel can safely consume y_out.
-//
-// Mechanism (clone of gemm_ar_hierarchical_xnode_barrier + HBM-mirror fan-out,
-// gemm_ar.cuh:481-564): one driver thread (block driver_block_id, tid 0) pushes
-// CmdType::BARRIER_NOTIFY; the proxy drains its in-flight WRITEs (so our combine
-// data is PCIe-committed at the peer) then RDMA-writes cfg_.epoch into the peer's
-// stage_barrier slot. The driver spins the PCIe flag (monotonic >=, never
-// cleared) and publishes to the HBM mirror; all other participating CTAs spin on
-// the fast HBM mirror to avoid PCIe-spin saturation.
+// Cross-node completion handshake: the kernel does not exit until both nodes
+// have finished combine for this epoch, so y_out is complete and visible to a
+// downstream kernel on the same stream. One driver CTA pushes BARRIER_NOTIFY
+// (the proxy drains its in-flight writes, then RDMA-writes its epoch into the
+// peer's barrier slot) and spins the host-mapped flag; the other CTAs spin an
+// HBM mirror to keep the PCIe flag down to a single reader.
 __device__ inline void combine_xnode_barrier(const fused_globals &G, int driver_block_id) {
     if (G.cross_node_barrier == nullptr) return;
 
@@ -1167,8 +1066,8 @@ __device__ inline void combine_xnode_barrier(const fused_globals &G, int driver_
             cmd.enqueue_device_ns = comm::globaltimer();
             internode::gemm_ar_select_fifo_for_lane(G.d2h_fifos, 0).push(cmd);
 
-            // Monotonic >=: peer RDMA-writes its cfg_.epoch; a peer that is ahead
-            // satisfies immediately, a flag at 0 keeps us waiting. Never cleared.
+            // Monotonic >= (flag is never cleared): a peer ahead satisfies
+            // immediately, a flag still at 0 keeps us waiting.
             while (comm::atomic_u32::acquire_load_sys(
                        const_cast<uint32_t*>(G.cross_node_barrier)) < G.epoch) {
                 __nanosleep(100);
@@ -1196,18 +1095,14 @@ __device__ inline void combine_xnode_barrier(const fused_globals &G, int driver_
     __syncthreads();
 }
 
-// Phase 2 driver: barrier -> send + reduce -> iter-end flag reset -> cross-node
-// completion handshake. The zero-fill is hoisted before gemm2 (folded into
-// bar(3)) and the stage scatter is fused into combine_scatter_fused, so only
-// bar(1) -> send/reduce remains. No-op for single node.
-//
-// Self-containment: with the monotonic reduce wait (5.1), the in-kernel iter-end
-// flag reset (5.2), and the per-invocation handshake (5.3), a single launch
-// (a) waits for THIS epoch's combine RDMA arrivals, (b) leaves y_out complete +
-// visible at kernel exit, and (c) needs no surrounding Python dist.barrier for
-// combine correctness. Correct across back-to-back epoch-advancing invocations
-// with changing inputs; no host-side arrival-flag reset (set
-// MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1). Still ONE persistent fused kernel.
+// Phase 2 (inter-node combine), no-op for single node:
+//   barrier -> send + reduce -> converge -> reset flags -> cross-node barrier.
+// The zero-fill is hoisted before gemm2 (folded into bar(3)) and the stage
+// scatter is fused into combine_scatter_fused, so only bar(1) -> send/reduce
+// remains here. On return y_out is complete and visible cross-node, so no host
+// dist.barrier is needed between back-to-back epoch-advancing launches (the host
+// must set MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET=1 so it does not race the
+// in-kernel flag reset).
 __device__ inline void combine_phase2(const fused_globals &G) {
     if (G.num_nodes <= 1) return;
     // zero + stage already done (zero hoisted before gemm2; stage fused into
@@ -1216,20 +1111,15 @@ __device__ inline void combine_phase2(const fused_globals &G) {
     if (blockIdx.x < G.num_send_sms) combine_send(G);
     else                             combine_reduce(G);
 
-    // Converge ALL CTAs: every CTA's combine_send/combine_reduce work is done.
-    // bar(0) is unused elsewhere in steady state, so reuse it as the post-combine
-    // convergence barrier (ensures the reduce's y_out writes + the send's RDMA
-    // pushes are all issued before we reset flags / push NOTIFY).
+    // Converge all CTAs (reuse the otherwise-idle bar(0)) so every reduce's
+    // y_out write and every send's RDMA push is issued before we reset/notify.
     combine_global_barrier(G, 0);
 
-    // (5.2) Reset THIS node's combine arrival flags in-kernel, before the NOTIFY
-    // push (peer next-iter writes are gated on our NOTIFY).
+    // Reset this node's combine flags before the notify push; the peer's
+    // next-iteration writes are gated on the notify, so they can't race it.
     combine_iter_end_reset_arrival_flags(G);
 
-    // (5.3) Per-invocation cross-node completion handshake. Driver = first reduce
-    // CTA (it owns the reduce). All CTAs spin the HBM mirror; only the driver
-    // touches PCIe. Kernel exits only after BOTH nodes' combine for THIS epoch
-    // landed in y_out.
+    // Cross-node completion handshake; driver = first reduce CTA.
     combine_xnode_barrier(G, G.num_send_sms);
 }
 

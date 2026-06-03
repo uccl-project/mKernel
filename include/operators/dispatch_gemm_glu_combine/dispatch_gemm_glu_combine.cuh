@@ -252,18 +252,14 @@ struct fused_globals {
     // Super-M L2-rasterization tile-decode factor (DGC_SUPER_M env). 1 = byte-identical
     // row-major rollback; >1 = rasterize that many row-blocks per col for weight L2 reuse.
     int super_m;
-    // Gen-15 modular GEMM rewrite gate (DGC_GEMM_REWRITE env). 0 = original
-    // grouped_gemm (byte-identical 1.5763); 1 = gemm_sm90::run decoupled epilogue.
-    int gemm_rewrite;
 
     internode::D2HFifoDeviceBundle d2h_fifos;
     volatile uint32_t *arrival_flags;
     uint32_t epoch;
-    // Per-invocation cross-node combine completion handshake (real-MoE fix).
-    // cross_node_barrier: host-pinned, RDMA-writable stage_barrier slot; the
-    //   peer's proxy RDMA-writes its cfg_.epoch here on BARRIER_NOTIFY.
-    // xnode_ready_device: HBM mirror so only one thread polls PCIe; the rest of
-    //   the participating CTAs spin on this fast device-memory flag.
+    // Cross-node combine completion handshake (see combine_xnode_barrier).
+    // cross_node_barrier: host-pinned, RDMA-writable stage_barrier slot the peer
+    //   writes its epoch into on BARRIER_NOTIFY.
+    // xnode_ready_device: HBM mirror so only one CTA polls the PCIe flag.
     // Both null on single-node / when unwired -> handshake is a no-op.
     volatile uint32_t *cross_node_barrier = nullptr;
     uint32_t *xnode_ready_device = nullptr;
@@ -456,12 +452,6 @@ void fused(
         int v = std::atoi(e);
         if (v >= 1) super_m_val = v;
     }
-    // Gen-15 modular GEMM rewrite gate. Default 0 = byte-identical grouped_gemm.
-    int gemm_rewrite_val = 0;
-    if (const char* e = std::getenv("DGC_GEMM_REWRITE")) {
-        int v = std::atoi(e);
-        if (v == 1) gemm_rewrite_val = 1;
-    }
 
     fused_globals GF{
         .pre_tokens = ::dist::distributed_tensor_from_buffer<fused_globals::pre_tokens_distributed_tensor>(pre_tokens),
@@ -513,7 +503,6 @@ void fused(
         .num_dispatch_sms = n_dispatch,
         .num_comp_sms = n_comp,
         .super_m = super_m_val,
-        .gemm_rewrite = gemm_rewrite_val,
         .d2h_fifos = fifo_bundle,
         .arrival_flags = reinterpret_cast<volatile uint32_t*>(arrival_flags_ptr),
         .epoch = (uint32_t)epoch,

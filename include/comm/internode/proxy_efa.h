@@ -513,15 +513,14 @@ private:
         return NotifyMode::WriteImm;
     }
 
-    // WriteImm normally stamps the RECEIVER's live cfg_.epoch into the arrival
-    // flag on the imm CQE — which mis-stamps the OLD epoch when the receiver lags
-    // the sender (no host barrier between back-to-back epoch-advancing launches),
-    // deadlocking the receiver's epoch-wait. When MKERNEL_EPOCH_IN_IMM=1, the
-    // SENDER packs its own (correct) epoch into the high bits of the immediate
-    // (epoch<<IMM_TILE_BITS | tile_id) and the receiver stamps THAT, so the flag
-    // always carries the data's true epoch. Off by default => byte-identical for
-    // every other kernel sharing this proxy. tile_id < 2^IMM_TILE_BITS (256) for
-    // all scored shapes/node-counts; epoch gets the remaining 24 bits.
+    // WriteImm stamps the receiver's cfg_.epoch into the arrival flag on the imm
+    // CQE. That is wrong when the receiver lags the sender (no host barrier
+    // between back-to-back epoch-advancing launches): the flag gets an older
+    // epoch and the receiver's epoch-wait deadlocks. With MKERNEL_EPOCH_IN_IMM=1
+    // the sender packs its own epoch into the high bits of the immediate
+    // (epoch << IMM_TILE_BITS | tile_id) and the receiver stamps that, so the
+    // flag carries the data's epoch. Off by default. tile_id fits in
+    // IMM_TILE_BITS (tile_id < 256 for all scored shapes/node-counts).
     static constexpr uint32_t IMM_TILE_BITS = 8;
     static constexpr uint32_t IMM_TILE_MASK = (1u << IMM_TILE_BITS) - 1u;
     static bool detect_epoch_in_imm() {
@@ -582,9 +581,8 @@ private:
             qpx->wr_id = 1;
             qpx->comp_mask = 0;
             qpx->wr_flags = IBV_SEND_SIGNALED;
-            // Default: imm = tile_id. With epoch_in_imm_, pack the SENDER's epoch
-            // (this proxy's current cfg_.epoch) into the high bits so the receiver
-            // stamps the data's true epoch (see detect_epoch_in_imm()).
+            // imm = tile_id, or (epoch << IMM_TILE_BITS | tile_id) when
+            // epoch_in_imm_ so the receiver can stamp the sender's epoch.
             const uint32_t imm_payload =
                 epoch_in_imm_
                     ? ((cfg_.epoch << IMM_TILE_BITS) |
@@ -1049,9 +1047,8 @@ private:
                 if (notify_mode_ == NotifyMode::WriteImm &&
                     wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
                     const uint32_t imm = ntohl(wc[i].imm_data);
-                    // Default: imm == tile_id, stamp our own cfg_.epoch. With
-                    // epoch_in_imm_, low bits = tile_id, high bits = the SENDER's
-                    // epoch — stamp that so a lagging receiver can't mis-stamp.
+                    // imm is tile_id; with epoch_in_imm_ the sender's epoch rides
+                    // in the high bits, so stamp that instead of our cfg_.epoch.
                     uint32_t tile_id = epoch_in_imm_ ? (imm & IMM_TILE_MASK) : imm;
                     uint32_t stamp_epoch =
                         epoch_in_imm_ ? (imm >> IMM_TILE_BITS) : cfg_.epoch;
