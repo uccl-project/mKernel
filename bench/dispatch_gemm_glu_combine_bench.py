@@ -22,6 +22,19 @@ from pathlib import Path
 # Required for multicast bind on this hardware/setup. Must be set BEFORE
 # importing the prebuilt module since the bind logic reads getenv at C++ time.
 os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
+# Real-MoE combine-sync fix: the kernel now owns its per-invocation cross-node
+# combine completion (in-kernel iter-end arrival-flag reset + BARRIER_NOTIFY
+# handshake), so the host MUST NOT racily memset the arrival flags in
+# commit_epoch (it would clobber a peer's already-delivered next-iter flag).
+os.environ.setdefault("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
+# Real-MoE combine-sync fix (part 2): in write_imm mode the RECEIVER proxy
+# normally stamps its OWN live cfg_.epoch into the arrival flag — which mis-stamps
+# the OLD epoch when the receiver lags the sender across back-to-back
+# epoch-advancing launches (no host barrier), deadlocking the receiver's
+# epoch-wait on the 2nd+ invocation. MKERNEL_EPOCH_IN_IMM=1 makes the SENDER pack
+# its own (correct) epoch into the immediate so the flag carries the data's true
+# epoch. Keeps write_imm's data-before-flag ordering (unlike remote_flag).
+os.environ.setdefault("MKERNEL_EPOCH_IN_IMM", "1")
 # Optional debug: DGC_DEBUG=1 makes CUDA errors synchronous at the faulting launch.
 if os.environ.get("DGC_DEBUG", "0") == "1":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -650,6 +663,10 @@ def main():
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
         recv_ptr = mod.get_recv_buf_ptr()
+        # Per-invocation cross-node combine completion handshake (real-MoE fix).
+        barrier_device_ptr = (
+            mod.get_barrier_device_ptr() if hasattr(mod, "get_barrier_device_ptr") else 0
+        )
 
         epoch = 1
         mod.set_epoch(epoch)
@@ -675,6 +692,7 @@ def main():
                 n_send, n_copy, n_comm,
                 int(use_gather),
                 num_nodes=NUM_NODES,
+                cross_node_barrier_ptr=barrier_device_ptr,
             )
 
         def reset_state():
@@ -682,6 +700,76 @@ def main():
             sync_barrier.data_.zero_()
             copy_ready.data_.zero_()
             y_out.data_.zero_()   # combine accumulates with atomicAdd
+
+        # ------------------------------------------------------------------
+        # DGC_REALMOE_TEST: epoch-ADVANCING, CHANGING-input, back-to-back loop.
+        # Validates the real-MoE combine-sync fix: each iter advances the epoch
+        # and rewrites pre_tokens, runs the kernel, and (watchdog-bounded)
+        # torch.cuda.synchronize() must RETURN (no hang) with y_out matching the
+        # per-iter fp32 combine reference. NO per-iter dist.barrier between
+        # kernels on the data plane — the kernel self-synchronizes cross-node.
+        # ------------------------------------------------------------------
+        if os.environ.get("DGC_REALMOE_TEST", "0") == "1":
+            realmoe_N = int(os.environ.get("DGC_REALMOE_N", "8"))
+
+            def _all_gather_var_rt(t):
+                objs = [None] * dist.get_world_size()
+                dist.all_gather_object(objs, t.detach().cpu())
+                return objs
+
+            def _combine_ref():
+                # Same construction as the canonical COMBINE check below.
+                g_ye = _all_gather_var_rt(y_expert)
+                g_pull = _all_gather_var_rt(pull_idx)
+                g_w = _all_gather_var_rt(topk_weights)
+                ref = torch.zeros((num_local_tokens, H), dtype=torch.float32)
+                for sr in range(len(g_ye)):
+                    pull = g_pull[sr]; ye = g_ye[sr].float(); wt = g_w[sr].float()
+                    m = (pull[:, 0] == node_idx) & (pull[:, 1] == local_rank)
+                    for r in m.nonzero(as_tuple=True)[0].tolist():
+                        t = int(pull[r, 2])
+                        if t >= 0:
+                            ref[t] += wt[r].item() * ye[r]
+                return ref.to("cuda")
+
+            rt_ok = True
+            # One settled barrier before the loop; thereafter NO per-iter barrier.
+            dist.barrier(); time.sleep(0.1)
+            for it in range(realmoe_N):
+                # CHANGING input each iter: deterministic per-(iter,rank) tokens.
+                torch.manual_seed(1234 + 17 * it + global_gpu_idx)
+                torch.cuda.manual_seed(1234 + 17 * it + global_gpu_idx)
+                new_tok = (torch.randn((num_local_tokens, H), device="cuda",
+                                       dtype=torch.bfloat16) / (H ** 0.25))
+                pre_tokens_data.copy_(new_tok)                    # for the gather/ref path
+                pre_tokens.data_[:num_local_tokens].copy_(new_tok)  # dispatch input (RDMA MR)
+                pre_tokens.data_[num_local_tokens:].zero_()      # combine staging upper
+                reset_state(); epoch += 1; mod.set_epoch(epoch)   # ADVANCING epoch
+                ev_s = torch.cuda.Event(enable_timing=True)
+                ev_e = torch.cuda.Event(enable_timing=True)
+                ev_s.record(); run_once(); ev_e.record()
+                torch.cuda.synchronize()                          # must return (watchdog-bounded)
+                ref = _combine_ref()
+                ok = check_close(
+                    f"REALMOE tokens={num_tokens_global} iter={it}",
+                    y_out.data_, ref, atol=0.1, rtol=0.05)
+                rt_ok = rt_ok and ok
+                if is_chief:
+                    print(f"[REALMOE] tokens={num_tokens_global} iter={it} "
+                          f"ms={ev_s.elapsed_time(ev_e):.4f} close={ok}", flush=True)
+            if is_chief:
+                print(f"[REALMOE] tokens={num_tokens_global} ALL_OK={rt_ok}", flush=True)
+            correctness_ok = rt_ok and correctness_ok
+            # Restore canonical input for the rest of the (skipped) bench path.
+            torch.manual_seed(42 + global_gpu_idx)
+            torch.cuda.manual_seed(42 + global_gpu_idx)
+            pre_tokens_data.copy_(
+                torch.randn((num_local_tokens, H), device="cuda",
+                            dtype=torch.bfloat16) / (H ** 0.25))
+            result_sizes.append(f"tokens={num_tokens_global}")
+            result_fused.append(0.0)
+            dist.barrier()
+            continue   # skip timed loop + canonical checks; this is the realmoe gate
 
         epoch += 1; mod.set_epoch(epoch); reset_state()
         dist.barrier(); time.sleep(0.05)

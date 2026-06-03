@@ -189,7 +189,8 @@ public:
 
     explicit Proxy(const ProxyConfig& cfg)
         : cfg_(cfg), running_(false), paused_(false), ack_paused_(false),
-          inflight_(0), notify_mode_(detect_notify_mode()) {
+          inflight_(0), notify_mode_(detect_notify_mode()),
+          epoch_in_imm_(detect_epoch_in_imm()) {
         // Mirror the session-level pipeline flag into the proxy.
         use_adaptive_batch_  = cfg_.pipeline_enabled;
         batch_size_current_  = BATCH_SIZE_MAX;
@@ -416,6 +417,10 @@ private:
     int inflight_;
     ProxyTimestamps ts_;
     NotifyMode notify_mode_;
+    // When true (MKERNEL_EPOCH_IN_IMM=1), WriteImm carries the sender's epoch in
+    // the high bits of the immediate so the receiver stamps the data's true epoch
+    // instead of its own (possibly-stale) cfg_.epoch. See detect_epoch_in_imm().
+    bool epoch_in_imm_;
     int effective_max_inflight_;
     ibv_qp_ex* qpx_[kMaxExchangeQPs] = {};       // cached ibv_qp_ex per local QP
 
@@ -508,6 +513,22 @@ private:
         return NotifyMode::WriteImm;
     }
 
+    // WriteImm normally stamps the RECEIVER's live cfg_.epoch into the arrival
+    // flag on the imm CQE — which mis-stamps the OLD epoch when the receiver lags
+    // the sender (no host barrier between back-to-back epoch-advancing launches),
+    // deadlocking the receiver's epoch-wait. When MKERNEL_EPOCH_IN_IMM=1, the
+    // SENDER packs its own (correct) epoch into the high bits of the immediate
+    // (epoch<<IMM_TILE_BITS | tile_id) and the receiver stamps THAT, so the flag
+    // always carries the data's true epoch. Off by default => byte-identical for
+    // every other kernel sharing this proxy. tile_id < 2^IMM_TILE_BITS (256) for
+    // all scored shapes/node-counts; epoch gets the remaining 24 bits.
+    static constexpr uint32_t IMM_TILE_BITS = 8;
+    static constexpr uint32_t IMM_TILE_MASK = (1u << IMM_TILE_BITS) - 1u;
+    static bool detect_epoch_in_imm() {
+        const char* env = std::getenv("MKERNEL_EPOCH_IN_IMM");
+        return env && env[0] == '1';
+    }
+
     /**
      * Pin this thread to the NUMA node of the given CUDA device. Best-effort:
      * ignores errors silently so benchmarks still run on machines without
@@ -561,10 +582,18 @@ private:
             qpx->wr_id = 1;
             qpx->comp_mask = 0;
             qpx->wr_flags = IBV_SEND_SIGNALED;
+            // Default: imm = tile_id. With epoch_in_imm_, pack the SENDER's epoch
+            // (this proxy's current cfg_.epoch) into the high bits so the receiver
+            // stamps the data's true epoch (see detect_epoch_in_imm()).
+            const uint32_t imm_payload =
+                epoch_in_imm_
+                    ? ((cfg_.epoch << IMM_TILE_BITS) |
+                       (static_cast<uint32_t>(cmd.tile_id) & IMM_TILE_MASK))
+                    : static_cast<uint32_t>(cmd.tile_id);
             ibv_wr_rdma_write_imm(qpx,
                 peer.remote_data_rkey,
                 peer.remote_data_addr + cmd.remote_offset,
-                htonl(static_cast<uint32_t>(cmd.tile_id)));
+                htonl(imm_payload));
             ibv_wr_set_ud_addr(qpx, peer.dst_ah, dst_qpn, rdma::QKEY);
             // Src MR selection: direct-DMA-BUF (src_view=1) sources from the
             // caller-owned output buffer; default (src_view=0) sources from
@@ -1019,9 +1048,15 @@ private:
                 }
                 if (notify_mode_ == NotifyMode::WriteImm &&
                     wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-                    uint32_t tile_id = ntohl(wc[i].imm_data);
+                    const uint32_t imm = ntohl(wc[i].imm_data);
+                    // Default: imm == tile_id, stamp our own cfg_.epoch. With
+                    // epoch_in_imm_, low bits = tile_id, high bits = the SENDER's
+                    // epoch — stamp that so a lagging receiver can't mis-stamp.
+                    uint32_t tile_id = epoch_in_imm_ ? (imm & IMM_TILE_MASK) : imm;
+                    uint32_t stamp_epoch =
+                        epoch_in_imm_ ? (imm >> IMM_TILE_BITS) : cfg_.epoch;
                     if (cfg_.local_arrival_host_ptr && tile_id < (uint32_t)cfg_.local_arrival_count) {
-                        cfg_.local_arrival_host_ptr[tile_id] = cfg_.epoch;
+                        cfg_.local_arrival_host_ptr[tile_id] = stamp_epoch;
                         std::atomic_thread_fence(std::memory_order_release);
                     } else {
                         fprintf(stderr, "proxy_efa: bad tile id from imm=%u (count=%d)\n",
