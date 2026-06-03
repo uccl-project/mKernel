@@ -412,3 +412,68 @@ def make_argparser(default_shapes: list[int], kernel_name: str):
 
 def parse_shapes(s: str) -> list[int]:
     return [int(x) for x in s.split(",") if x.strip()]
+
+
+def check_cross_rank_identical(
+    label: str,
+    local_tensor: torch.Tensor,
+    is_chief: bool,
+) -> bool:
+    """Assert `local_tensor` is byte-identical across every rank in the
+    default process group. Returns True on PASS. Only the chief prints."""
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return True
+
+    flat = local_tensor.detach().contiguous()
+    gathered = [torch.empty_like(flat) for _ in range(world_size)]
+    dist.all_gather(gathered, flat)
+
+    if not is_chief:
+        return True
+
+    ref = gathered[0]
+    diffs = []
+    for k in range(1, world_size):
+        d = int((gathered[k] != ref).sum().item())
+        if d > 0:
+            diffs.append((k, d))
+    if diffs:
+        total = ref.numel()
+        msg = ", ".join(f"rank={k}:{d}/{total}" for k, d in diffs)
+        print(f"[invariant {label}/bit-identical] FAIL {msg}", flush=True)
+        return False
+    print(f"[invariant {label}/bit-identical] PASS world={world_size}",
+          flush=True)
+    return True
+
+
+def check_deterministic_rerun(
+    label: str,
+    out_a: torch.Tensor,
+    out_b: torch.Tensor,
+    is_chief: bool,
+) -> bool:
+    """Two outputs from independent kernel invocations on the same inputs
+    must be byte-identical. Catches data races on shared flags, uninitialized
+    scratch, and reduce-ordering nondeterminism. Both snapshots should be
+    taken AFTER the timed perf loop so the extra runs do not perturb the
+    benchmark numbers."""
+    if not is_chief:
+        return True
+    if out_a.shape != out_b.shape or out_a.dtype != out_b.dtype:
+        print(f"[invariant {label}/deterministic] FAIL shape/dtype mismatch "
+              f"({tuple(out_a.shape)}/{out_a.dtype} vs "
+              f"{tuple(out_b.shape)}/{out_b.dtype})", flush=True)
+        return False
+    diff = int((out_a != out_b).sum().item())
+    if diff > 0:
+        total = out_a.numel()
+        max_abs = float((out_a.float() - out_b.float()).abs().max().item())
+        ref_mag = float(out_a.float().abs().mean().item())
+        print(f"[invariant {label}/deterministic] FAIL diff={diff}/{total} "
+              f"max_abs={max_abs:.6g} ref_mean={ref_mag:.6g}",
+              flush=True)
+        return False
+    print(f"[invariant {label}/deterministic] PASS", flush=True)
+    return True

@@ -104,6 +104,8 @@ run_one() {
         "GEMM_AR_K_DIV=global_world"
         "MKERNEL_BIND_RETAINED_HANDLE=1"
         "MKERNEL_EFA_NUM_QPS=${MKERNEL_EFA_NUM_QPS:-4}"
+        "MKERNEL_INVARIANT_DETERMINISTIC=${MKERNEL_INVARIANT_DETERMINISTIC:-0}"
+        "MKERNEL_BENCH_DUMP_RANK_MS=${MKERNEL_BENCH_DUMP_RANK_MS:-0}"
         "MKERNEL_BENCH_BEST_OF_N=0"
         "TORCH_CUDA_ARCH_LIST=9.0a"
         "NUM_NODES=4"
@@ -116,7 +118,7 @@ run_one() {
     )
     local env_str="${COMMON_ENV[*]}"
 
-    local extra_args="--mode check"
+    local extra_args="--mode ${MODE:-check}"
     if [[ -n "${SHAPES:-}" ]]; then extra_args="$extra_args --shapes $SHAPES"; fi
     if [[ -n "${WARMUP:-}" ]]; then extra_args="$extra_args --warmup $WARMUP"; fi
     if [[ -n "${ITERS:-}" ]]; then extra_args="$extra_args --iters $ITERS"; fi

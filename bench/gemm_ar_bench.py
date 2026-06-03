@@ -27,7 +27,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
-from common import check_close, compare_named_results, get_peer_ips, get_peer_ports  # noqa: E402
+from common import (  # noqa: E402
+    check_close,
+    check_cross_rank_identical,
+    compare_named_results,
+    get_peer_ips,
+    get_peer_ports,
+)
 
 KERNEL_NAME = "gemm_ar"
 from common import get_num_nodes  # noqa: E402
@@ -36,8 +42,10 @@ ROW_BLOCK = 128
 COL_BLOCK = 256
 
 DEFAULT_SHAPES = (
-    # H200 release sweep: use the largest verified natural multiples.
-    [8192, 12288, 16384, 20480, 22528]
+    # 4-node: M=131072 would hit the u32 overflow boundary but its 32 GiB
+    # multicast output buffer exceeds VMM single-binding capacity at the
+    # 4-rank-per-node emulated layout. Capped at M=65536 here.
+    [8192, 16384, 32768, 49152, 65536]
     if NUM_NODES == 4 else
     [2048, 4096, 8192, 16384, 32768]
 )
@@ -505,6 +513,10 @@ def main():
         correctness_ok = check_close(
             f"gemm_ar M={M}", C_final.data_, C_ref_cpu, atol=0.55, rtol=0.12
         ) and correctness_ok
+        if NUM_NODES <= 2:
+            correctness_ok = check_cross_rank_identical(
+                f"gemm_ar M={M}", C_final.data_, is_chief
+            ) and correctness_ok
         result_sizes.append(f"M={M}")
         result_fused.append(wall_ms)
 

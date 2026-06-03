@@ -83,6 +83,11 @@ std::tuple<int64_t, int64_t, int64_t, int64_t, int> get_fifo_handles_py() {
 }
 int64_t get_arrival_flags_ptr_py() { return internode::py::get_arrival_flags_ptr(g_session); }
 int64_t get_recv_buf_ptr_py() { return internode::py::get_recv_buf_ptr(g_session); }
+// Device-readable, RDMA-writable stage_barrier slot — backs the per-invocation
+// cross-node combine completion handshake (cross_node_barrier in fused_globals).
+int64_t get_barrier_device_ptr_py() {
+    return reinterpret_cast<int64_t>(internode::get_stage_barrier_device_ptr(g_session));
+}
 
 #include <torch/csrc/utils/pybind.h>
 
@@ -103,6 +108,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_fifo_handles", &get_fifo_handles_py);
     m.def("get_arrival_flags_ptr", &get_arrival_flags_ptr_py);
     m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);
+    m.def("get_barrier_device_ptr", &get_barrier_device_ptr_py);
     m.def("moe_dispatch_gemm_glu_combine_fused", &moe_dispatch_gemm_glu_combine_multinode::fused,
           pybind11::arg("pre_tokens"),
           pybind11::arg("peer_tokens"),
@@ -145,5 +151,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_copy_sms"),
           pybind11::arg("num_comm_sms_intra"),
           pybind11::arg("use_gather"),
-          pybind11::arg("num_nodes"));
+          pybind11::arg("num_nodes"),
+          pybind11::arg("cross_node_barrier_ptr") = 0);
 }

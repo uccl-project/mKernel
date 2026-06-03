@@ -256,6 +256,13 @@ struct fused_globals {
     internode::D2HFifoDeviceBundle d2h_fifos;
     volatile uint32_t *arrival_flags;
     uint32_t epoch;
+    // Cross-node combine completion handshake (see combine_xnode_barrier).
+    // cross_node_barrier: host-pinned, RDMA-writable stage_barrier slot the peer
+    //   writes its epoch into on BARRIER_NOTIFY.
+    // xnode_ready_device: HBM mirror so only one CTA polls the PCIe flag.
+    // Both null on single-node / when unwired -> handshake is a no-op.
+    volatile uint32_t *cross_node_barrier = nullptr;
+    uint32_t *xnode_ready_device = nullptr;
     unsigned int *copy_phase_done;
     // In-kernel cleanup counter. The last CTA zeroes per-row-block barriers.
     unsigned int *cleanup_done;
@@ -291,6 +298,10 @@ static unsigned int *g_fused_cleanup_done[globals::NUM_DEVICES] = {nullptr};
 // Inter-node combine in-kernel barriers: 2 (count, ready) ints per device.
 static unsigned int *g_combine_bar_count[globals::NUM_DEVICES] = {nullptr};
 static unsigned int *g_combine_bar_ready[globals::NUM_DEVICES] = {nullptr};
+// HBM mirror for the cross-node combine handshake (xnode_ready_device). One u32
+// per device; written monotonically with the current epoch, never needs reset
+// (monotonic >= compare). Allocated once, persists across launches.
+static uint32_t *g_combine_xnode_ready[globals::NUM_DEVICES] = {nullptr};
 
 void fused(
     dist::ParallelBuffer &pre_tokens,
@@ -331,7 +342,8 @@ void fused(
     int num_copy_sms,
     int num_comm_sms_intra,
     int use_gather,
-    int num_nodes
+    int num_nodes,
+    int64_t cross_node_barrier_ptr = 0
 ) {
     const int dev_idx = barrier.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -425,6 +437,13 @@ void fused(
     cudaMemsetAsync(g_combine_bar_count[dev_idx], 0, 6 * sizeof(unsigned int), stream);
     cudaMemsetAsync(g_combine_bar_ready[dev_idx], 0, 6 * sizeof(unsigned int), stream);
 
+    // Cross-node combine handshake HBM mirror. Monotonic (>= epoch) — no per-iter
+    // reset needed; allocate-and-zero once.
+    if (g_combine_xnode_ready[dev_idx] == nullptr) {
+        cudaMalloc(&g_combine_xnode_ready[dev_idx], sizeof(uint32_t));
+        cudaMemsetAsync(g_combine_xnode_ready[dev_idx], 0, sizeof(uint32_t), stream);
+    }
+
     // Super-M L2-rasterization decode factor. 8 gives the best weight-reuse
     // locality here; bit-identical to plain row-major decode for any value.
     // Env DGC_SUPER_M overrides (set =1 for plain row-major decode).
@@ -487,6 +506,10 @@ void fused(
         .d2h_fifos = fifo_bundle,
         .arrival_flags = reinterpret_cast<volatile uint32_t*>(arrival_flags_ptr),
         .epoch = (uint32_t)epoch,
+        .cross_node_barrier = (num_nodes > 1 && cross_node_barrier_ptr)
+            ? reinterpret_cast<volatile uint32_t*>(cross_node_barrier_ptr) : nullptr,
+        .xnode_ready_device = (num_nodes > 1 && cross_node_barrier_ptr)
+            ? g_combine_xnode_ready[dev_idx] : nullptr,
         .copy_phase_done = g_fused_copy_phase_done[dev_idx],
         .cleanup_done = g_fused_cleanup_done[dev_idx],
         .combine_bar_count = g_combine_bar_count[dev_idx],

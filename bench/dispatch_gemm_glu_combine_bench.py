@@ -22,6 +22,14 @@ from pathlib import Path
 # Required for multicast bind on this hardware/setup. Must be set BEFORE
 # importing the prebuilt module since the bind logic reads getenv at C++ time.
 os.environ["MKERNEL_BIND_RETAINED_HANDLE"] = "1"
+# The kernel resets the arrival flags in-kernel each iteration, so the host must
+# not also memset them in commit_epoch (that would clobber a peer's already
+# delivered next-iteration flag).
+os.environ.setdefault("MKERNEL_COMMIT_EPOCH_SKIP_ARRIVAL_RESET", "1")
+# In write_imm mode have the sender pack its epoch into the immediate so the
+# receiver stamps the data's epoch, not its own (possibly stale) one. Needed for
+# correct back-to-back epoch-advancing launches without a host barrier.
+os.environ.setdefault("MKERNEL_EPOCH_IN_IMM", "1")
 # Optional debug: DGC_DEBUG=1 makes CUDA errors synchronous at the faulting launch.
 if os.environ.get("DGC_DEBUG", "0") == "1":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -297,34 +305,55 @@ def build_inter_gather_indices(this_global_gpu, total_gpus, num_experts_per_dev,
     gather runs on local GPU d's own inter_comb_buf and writes local pre_tokens[d]
     UPPER, shipped to remote GPU d.
 
-    Returns (inter_owner_offset[L+1] int32, inter_row_to_slot[npad] int32,
-             inter_row_to_owner[npad] int32, inter_comb_slots int).
+    Returns (inter_owner_offset[n_peers*(L+1)] int32 (flat per-peer CSR),
+             inter_row_to_slot[npad] int32, inter_row_to_owner[npad] int32,
+             inter_comb_slots int).
     """
     all_rows = [
         build_pull_rows_cpu(g, num_experts_per_dev, padded_list,
                             expert_to_tokens, world_size_per_node)
         for g in range(total_gpus)
     ]
+    n_peers = NUM_NODES - 1
     node_base = node_idx * world_size_per_node
-    # First pass: count INTER contributions per (owner-staging-dev sd, owner token).
-    inter_count = [
-        [0] * num_local_tokens for _ in range(world_size_per_node)
-    ]
+    L = num_local_tokens
+
+    # Destination peer slot for an owner on remote node `sn`, matching the kernel's
+    # peer_rank_for_slot ring (combine_send ships region p to (node_idx+1+p)%NUM_NODES).
+    def peer_slot_of(sn):
+        return (sn - node_idx - 1) % NUM_NODES
+
+    # First pass: count INTER contributions per (owner-staging-dev sd, dest peer, owner token).
+    inter_count = [[[0] * L for _ in range(n_peers)]
+                   for _ in range(world_size_per_node)]
     for g in range(total_gpus):
         for (sn, sd, st) in all_rows[g]:
             if sn < 0 or sn == node_idx:
                 continue  # padding or INTRA (handled by intra gather)
-            inter_count[sd][st] += 1
+            inter_count[sd][peer_slot_of(sn)][st] += 1
+
+    # Per owner-staging-dev: one flat [n_peers*(L+1)] CSR with ABSOLUTE slots into
+    # that dev's inter_comb_buf. Peer p's slots follow all of peer (p-1)'s, so each
+    # (peer, token) gather range addresses a contiguous block. At N==2 (n_peers==1)
+    # this is a single [L+1] CSR — identical to the legacy single-peer layout.
     inter_off_per_dev = []
+    dev_totals = []
     for d in range(world_size_per_node):
-        off = [0] * (num_local_tokens + 1)
-        for t in range(num_local_tokens):
-            off[t + 1] = off[t] + inter_count[d][t]
+        off = [0] * (n_peers * (L + 1))
+        cum = 0
+        for p in range(n_peers):
+            b = p * (L + 1)
+            off[b] = cum
+            for t in range(L):
+                off[b + t + 1] = off[b + t] + inter_count[d][p][t]
+            cum = off[b + L]
         inter_off_per_dev.append(off)
+        dev_totals.append(cum)
 
     # Second pass: assign ABSOLUTE slots in the SAME global (producer_gpu, row)
     # order so each producer's slot matches the owner's CSR gather range.
-    running = [[0] * num_local_tokens for _ in range(world_size_per_node)]
+    running = [[[0] * L for _ in range(n_peers)]
+               for _ in range(world_size_per_node)]
     npad = len(all_rows[this_global_gpu])
     inter_row_to_slot = [0] * npad
     inter_row_to_owner = [-1] * npad
@@ -333,15 +362,16 @@ def build_inter_gather_indices(this_global_gpu, total_gpus, num_experts_per_dev,
         for r, (sn, sd, st) in enumerate(all_rows[g]):
             if sn < 0 or sn == node_idx:
                 continue
-            k = running[sd][st]
-            running[sd][st] = k + 1
+            p = peer_slot_of(sn)
+            k = running[sd][p][st]
+            running[sd][p][st] = k + 1
             if is_me:
                 inter_row_to_owner[r] = sd
-                inter_row_to_slot[r] = inter_off_per_dev[sd][st] + k  # ABSOLUTE
+                inter_row_to_slot[r] = inter_off_per_dev[sd][p * (L + 1) + st] + k  # ABSOLUTE
 
     this_dev = this_global_gpu - node_base
-    inter_owner_offset = inter_off_per_dev[this_dev]
-    inter_comb_slots = max(1, max(off[-1] for off in inter_off_per_dev))
+    inter_owner_offset = inter_off_per_dev[this_dev]   # flat [n_peers*(L+1)]
+    inter_comb_slots = max(1, max(dev_totals))
 
     inter_owner_offset_t = torch.tensor(inter_owner_offset, dtype=torch.int32, device="cuda")
     inter_row_to_slot_t = torch.tensor(inter_row_to_slot, dtype=torch.int32, device="cuda")
@@ -523,11 +553,13 @@ def main():
                          device="cuda", dtype=torch.bfloat16) * (I ** -0.5)
 
         n_peers = NUM_NODES - 1
-        # 2x buffers: lower half = dispatch region, upper half = inter-node combine
-        # region, in the SAME registered RDMA MR (so combine never touches dispatch
-        # data and needs no cross-node barrier). Combine is in the fused kernel.
+        # (1 + n_peers)x buffer in ONE registered RDMA MR: the first L rows are the
+        # dispatch region (broadcast to all peers), the next n_peers*L rows are the
+        # inter-node combine region (one dense [L,H] send buffer per destination
+        # peer). Combine never touches the dispatch region, so it needs no cross-node
+        # barrier. At N==2 this is the legacy 2x buffer. Combine runs in the kernel.
         pre_tokens = mod.DistBuffer(
-            (2 * num_local_tokens, H), dtype=torch.bfloat16,
+            ((1 + n_peers) * num_local_tokens, H), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=False,
         )
         pre_tokens.data_[:num_local_tokens].copy_(pre_tokens_data)  # dispatch input
@@ -606,24 +638,30 @@ def main():
         while fifo_cap < flag_tiles * 2:
             fifo_cap *= 2
 
-        # ZERO_COPY baked on: peer_tokens IS the RDMA destination. Register the
-        # FULL 2x buffers (dispatch lower + combine upper) and reserve 2x arrival
-        # flags (num_tiles) so dispatch and combine use disjoint flag slots.
+        # ZERO_COPY baked on: peer_tokens IS the RDMA destination. Register the FULL
+        # local pre_tokens MR (dispatch lower + n_peers combine-upper regions) and the
+        # remote peer_tokens MR (n_peers dispatch-recv + n_peers combine-recv), and
+        # reserve 2x arrival flags so dispatch and combine use disjoint flag slots.
+        local_pre_tokens_bytes = (1 + n_peers) * pre_tokens_bytes
         external_recv_buf_ptr = int(peer_tokens.data_.data_ptr())
         peer_ips = get_peer_ips(node_idx, NUM_NODES)
         mod.create_session(
             node_idx, peer_ip, tcp_port,
-            int(pre_tokens.data_.data_ptr()), 2 * pre_tokens_bytes,
+            int(pre_tokens.data_.data_ptr()), local_pre_tokens_bytes,
             2 * n_peers * pre_tokens_bytes, flag_tiles, fifo_cap, local_rank,
             external_recv_buf_ptr,
             int(pre_tokens.data_.data_ptr()),
-            2 * pre_tokens_bytes,
+            local_pre_tokens_bytes,
             peer_ips=peer_ips,
             peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
         )
         fifo = mod.get_fifo_handles()
         arrival_ptr = mod.get_arrival_flags_ptr()
         recv_ptr = mod.get_recv_buf_ptr()
+        # Device pointer for the cross-node combine completion handshake.
+        barrier_device_ptr = (
+            mod.get_barrier_device_ptr() if hasattr(mod, "get_barrier_device_ptr") else 0
+        )
 
         epoch = 1
         mod.set_epoch(epoch)
@@ -649,6 +687,7 @@ def main():
                 n_send, n_copy, n_comm,
                 int(use_gather),
                 num_nodes=NUM_NODES,
+                cross_node_barrier_ptr=barrier_device_ptr,
             )
 
         def reset_state():
@@ -656,6 +695,72 @@ def main():
             sync_barrier.data_.zero_()
             copy_ready.data_.zero_()
             y_out.data_.zero_()   # combine accumulates with atomicAdd
+
+        # DGC_REALMOE_TEST: back-to-back loop that advances the epoch and rewrites
+        # pre_tokens each iteration, with no per-iter dist.barrier on the data
+        # plane (the kernel synchronizes cross-node itself). Each iteration's
+        # cuda.synchronize() must return and y_out must match the fp32 reference.
+        if os.environ.get("DGC_REALMOE_TEST", "0") == "1":
+            realmoe_N = int(os.environ.get("DGC_REALMOE_N", "8"))
+
+            def _all_gather_var_rt(t):
+                objs = [None] * dist.get_world_size()
+                dist.all_gather_object(objs, t.detach().cpu())
+                return objs
+
+            def _combine_ref():
+                # Same construction as the combine correctness check below.
+                g_ye = _all_gather_var_rt(y_expert)
+                g_pull = _all_gather_var_rt(pull_idx)
+                g_w = _all_gather_var_rt(topk_weights)
+                ref = torch.zeros((num_local_tokens, H), dtype=torch.float32)
+                for sr in range(len(g_ye)):
+                    pull = g_pull[sr]; ye = g_ye[sr].float(); wt = g_w[sr].float()
+                    m = (pull[:, 0] == node_idx) & (pull[:, 1] == local_rank)
+                    for r in m.nonzero(as_tuple=True)[0].tolist():
+                        t = int(pull[r, 2])
+                        if t >= 0:
+                            ref[t] += wt[r].item() * ye[r]
+                return ref.to("cuda")
+
+            rt_ok = True
+            # One barrier before the loop; none between iterations after that.
+            dist.barrier(); time.sleep(0.1)
+            for it in range(realmoe_N):
+                # New input each iteration: deterministic per-(iter, rank) tokens.
+                torch.manual_seed(1234 + 17 * it + global_gpu_idx)
+                torch.cuda.manual_seed(1234 + 17 * it + global_gpu_idx)
+                new_tok = (torch.randn((num_local_tokens, H), device="cuda",
+                                       dtype=torch.bfloat16) / (H ** 0.25))
+                pre_tokens_data.copy_(new_tok)                    # for the gather/ref path
+                pre_tokens.data_[:num_local_tokens].copy_(new_tok)  # dispatch input (RDMA MR)
+                pre_tokens.data_[num_local_tokens:].zero_()      # combine staging upper
+                reset_state(); epoch += 1; mod.set_epoch(epoch)   # advance epoch
+                ev_s = torch.cuda.Event(enable_timing=True)
+                ev_e = torch.cuda.Event(enable_timing=True)
+                ev_s.record(); run_once(); ev_e.record()
+                torch.cuda.synchronize()
+                ref = _combine_ref()
+                ok = check_close(
+                    f"REALMOE tokens={num_tokens_global} iter={it}",
+                    y_out.data_, ref, atol=0.1, rtol=0.05)
+                rt_ok = rt_ok and ok
+                if is_chief:
+                    print(f"[REALMOE] tokens={num_tokens_global} iter={it} "
+                          f"ms={ev_s.elapsed_time(ev_e):.4f} close={ok}", flush=True)
+            if is_chief:
+                print(f"[REALMOE] tokens={num_tokens_global} ALL_OK={rt_ok}", flush=True)
+            correctness_ok = rt_ok and correctness_ok
+            # Restore the default input for the rest of the (skipped) bench path.
+            torch.manual_seed(42 + global_gpu_idx)
+            torch.cuda.manual_seed(42 + global_gpu_idx)
+            pre_tokens_data.copy_(
+                torch.randn((num_local_tokens, H), device="cuda",
+                            dtype=torch.bfloat16) / (H ** 0.25))
+            result_sizes.append(f"tokens={num_tokens_global}")
+            result_fused.append(0.0)
+            dist.barrier()
+            continue   # skip the timed loop and the standard checks
 
         epoch += 1; mod.set_epoch(epoch); reset_state()
         dist.barrier(); time.sleep(0.05)

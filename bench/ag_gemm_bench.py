@@ -18,6 +18,7 @@ sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
 from common import (  # noqa: E402
     check_close,
+    check_deterministic_rerun,
     compare_named_results,
     gather_cpu_tensors,
     get_peer_ips,
@@ -34,7 +35,11 @@ CHUNK_BYTES = 64 * 1024  # baked from AG_CHUNK_BYTES=65536
 
 DEFAULT_SHAPES = (
     # M=57344 hangs during default-warmup 4-node sweeps on H200x.
-    [8192, 16384, 32768, 49152, 65536]
+    # 4-node M=65536 sits at the u32 overflow boundary for the per-peer
+    # offset fix (a_half_bytes = M²/2 = 2 GiB; sap=2 * 2 GiB = 4 GiB).
+    # M=98304 pushes past the boundary to confirm the u64 path is correct
+    # at payloads above 4 GiB.
+    [8192, 16384, 32768, 49152, 65536, 98304]
     if NUM_NODES == 4 else
     [6144, 12288, 24576, 49152, 73728]
     if NUM_NODES == 3 else
@@ -318,6 +323,20 @@ def main():
         correctness_ok = check_close(
             f"ag_gemm M={M}", C, C_ref, atol=0.45, rtol=0.10
         ) and correctness_ok
+
+        if os.environ.get("MKERNEL_INVARIANT_DETERMINISTIC", "0") == "1":
+            torch.cuda.synchronize(); dist.barrier(); time.sleep(0.1)
+            reset_state(); epoch += 1; mod.set_epoch(epoch)
+            dist.barrier(); time.sleep(0.05)
+            run_once(); torch.cuda.synchronize()
+            det_out_a = C.detach().clone()
+            reset_state(); epoch += 1; mod.set_epoch(epoch)
+            dist.barrier(); time.sleep(0.05)
+            run_once(); torch.cuda.synchronize()
+            det_out_b = C.detach().clone()
+            correctness_ok = check_deterministic_rerun(
+                f"ag_gemm M={M}", det_out_a, det_out_b, is_chief
+            ) and correctness_ok
 
         result_sizes.append(f"M={M}")
         result_fused.append(wall_ms)

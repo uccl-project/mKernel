@@ -32,6 +32,7 @@ sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
 from common import (  # noqa: E402
     check_close,
+    check_deterministic_rerun,
     compare_named_results,
     gather_cpu_tensors,
     get_peer_ips,
@@ -473,6 +474,20 @@ def main():
             f"dispatch_gemm tokens={num_tokens_global}",
             outputs, out_ref, atol=0.55, rtol=0.12
         ) and correctness_ok
+        if os.environ.get("MKERNEL_INVARIANT_DETERMINISTIC", "0") == "1":
+            torch.cuda.synchronize(); dist.barrier(); time.sleep(0.1)
+            epoch += 1; mod.set_epoch(epoch); reset_state()
+            dist.barrier(); time.sleep(0.05)
+            run_once(); torch.cuda.synchronize()
+            det_out_a = outputs.detach().clone()
+            epoch += 1; mod.set_epoch(epoch); reset_state()
+            dist.barrier(); time.sleep(0.05)
+            run_once(); torch.cuda.synchronize()
+            det_out_b = outputs.detach().clone()
+            correctness_ok = check_deterministic_rerun(
+                f"dispatch_gemm tokens={num_tokens_global}",
+                det_out_a, det_out_b, is_chief
+            ) and correctness_ok
         result_sizes.append(f"tokens={num_tokens_global}")
         result_fused.append(wall_ms)
         # Don't call destroy_session — re-creating per shape is fine and
