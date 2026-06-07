@@ -148,10 +148,10 @@ distributed_tensor<GL, LOCAL_SIZE, MULTICAST, NUM_CHANNELS, NUM_NODES, TMA_Types
  * send strategy:
  *
  *   - `SendMode::DmabufDirect` (zero-copy, default): asserts that every rail
- *     has a non-null `clocal_data_mr` — i.e., the session was created with
- *     `direct_dmabuf_enabled=true` and `local_gpu_buf` set to the dbuf's
- *     data. `put_inter` will produce `cmd.src_view=1` (single-SGE direct
- *     read from the local DMA-BUF MR).
+ *     has a non-null `clocal_data_mr` — i.e., the session registered the
+ *     dbuf's data as a direct GPU MR. `put_inter` will produce `cmd.src_view=1`
+ *     (single-SGE direct read from that MR). The historical enum name includes
+ *     "Dmabuf", but the MR can also come from peermem for cudaMalloc buffers.
  *   - `SendMode::Staging`: no MR check; proxy reads from a caller-provided
  *     staging buffer. The kernel must pack data into staging before
  *     `put_inter`. Compatible with kernels that don't have working DMA-BUF.
@@ -176,17 +176,17 @@ __host__ inline void attach_channels_proxy(
     if (session.fifo_bundle.num_fifos <= 0)
         throw std::runtime_error("dist::attach_channels_proxy: empty D2HFifoDeviceBundle");
 
-    // Zero-copy modes require DMA-BUF MR on every rail. Staging mode skips
-    // this check — its proxy reads from a separately-registered buffer.
+    // Zero-copy modes require a direct GPU MR on every rail. Staging mode
+    // skips this check — its proxy reads from a separately-registered buffer.
     if (mode == SendMode::DmabufDirect || mode == SendMode::StridedGather) {
         for (int r = 0; r < session.num_rails; ++r) {
             if (!session.rails[r].clocal_data_mr) {
                 throw std::runtime_error(
                     "dist::attach_channels_proxy: rail " + std::to_string(r) +
-                    " has no clocal_data_mr — zero-copy mode requires session "
-                    "created with direct_dmabuf_enabled=true and local_gpu_buf "
-                    "set to the dbuf's data. Pass SendMode::Staging if your "
-                    "kernel packs into a staging buffer instead.");
+                    " has no clocal_data_mr — zero-copy mode requires the "
+                    "session to register the dbuf's data as a direct GPU MR. "
+                    "Pass SendMode::Staging if your kernel packs into a "
+                    "staging buffer instead.");
             }
         }
     }
@@ -221,7 +221,8 @@ __host__ inline void attach_channels_proxy(
 /**
  * @brief Create an internode session for zero-copy dbuf sends.
  *
- * Requires DMA-BUF registration for the dbuf data buffer. `dbuf.put_inter()`
+ * Requires direct GPU MR registration for the dbuf data buffer. DMA-BUF is
+ * preferred; cudaMalloc-backed buffers can use peermem. `dbuf.put_inter()`
  * sends with `src_view = 1`, so the proxy reads directly from the local MR.
  */
 template<typename DBUF>
@@ -239,9 +240,10 @@ __host__ inline internode::Session* bind_inter_proxy(
                   "bind_inter_proxy requires NUM_CHANNELS > 0");
 
     // Zero-copy modes (DmabufDirect, StridedGather) force the session to
-    // register the dbuf's data buffer as a DMA-BUF MR on every rail. Staging
-    // mode leaves direct_dmabuf_enabled at the caller's setting (typically
-    // false) — the proxy will read from a separately-managed staging buffer.
+    // register the dbuf's data buffer as a direct GPU MR on every rail.
+    // Staging mode leaves direct_dmabuf_enabled at the caller's setting
+    // (typically false) — the proxy will read from a separately-managed
+    // staging buffer.
     if (mode == SendMode::DmabufDirect || mode == SendMode::StridedGather) {
         cfg.direct_dmabuf_enabled = true;
         cfg.local_gpu_buf         = dbuf_data_ptr;
@@ -257,7 +259,7 @@ __host__ inline internode::Session* bind_inter_proxy(
             if (!session->rails[r].clocal_data_mr) {
                 internode::destroy_session(session);
                 throw std::runtime_error(
-                    "bind_inter_proxy: DMA-BUF MR registration failed on rail "
+                    "bind_inter_proxy: direct GPU MR registration failed on rail "
                     + std::to_string(r) + " — zero-copy contract violated");
             }
         }

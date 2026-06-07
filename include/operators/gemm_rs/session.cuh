@@ -32,10 +32,8 @@ void create_session_py(int rank, const std::string& peer_ip, int tcp_port,
         cfg, peer_ips, peer_tcp_ports, tcp_port,
         g_peer_ips_storage, g_peer_ips_cstr, g_peer_ports_storage);
 
-    // GEMM_RS_DIRECT_DMABUF_SEND: register output_local as a DMA-BUF MR on every
-    // rail's PD so the send path can skip the pack + gather step. Session
-    // creation hard-fails if the buffer can't be DMA-BUF-exported (no peermem
-    // fallback — we want the direct path or nothing).
+    // Direct GPU-send sessions register their source buffer through the common
+    // GPU-MR path: DMA-BUF first, then peermem for cudaMalloc-backed buffers.
     cfg.max_inflight = 256;
     // Default to 4 QPs per endpoint; multi-NIC striping is controlled by the
     // internode session configuration.

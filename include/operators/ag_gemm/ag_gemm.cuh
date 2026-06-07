@@ -289,10 +289,11 @@ __device__ inline void post_merge_wrs_for_intra_row(
     }
 }
 
-// Forward a fully published A row-block from A_recv (registered as local_data_mr
-// in ring mode) to the next node. `source_slot` is the physical peer slot in
-// this node's A_recv multicast buffer that contains `origin_rank`'s shard.
-// `dst_bank` selects the destination bank on the next rank (1..n_peers-1).
+// Forward a fully received A row-block to the next node. `source_slot` is the
+// physical peer slot for `origin_rank` on this node; `dst_bank` selects the
+// destination recv bank on the next rank (1..n_peers-1). The matching source
+// bank is `dst_bank - 1`: step 0 forwards from bank 0 into peer bank 1, step 1
+// forwards from bank 1 into peer bank 2, and so on.
 __device__ inline void post_ring_forward_wrs_for_intra_row(
     const globals& G, int source_slot, int origin_rank,
     int global_row_idx, int chunks_per_rb, int dst_bank) {
@@ -301,8 +302,10 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
     const int dst_slot = internode::slot_at_peer(origin_rank, next_rank, G.num_nodes);
     const int n_peers = G.num_nodes - 1;
     const int dst_virtual = dst_slot + n_peers * dst_bank;
+    const int src_bank = max(0, dst_bank - 1);
+    const int src_virtual = source_slot + n_peers * src_bank;
     const uint64_t src_slot_base =
-        (uint64_t)source_slot * (uint64_t)G.a_half_bytes;
+        (uint64_t)src_virtual * (uint64_t)G.a_half_bytes;
     const uint64_t dst_slot_base =
         (uint64_t)dst_virtual * (uint64_t)G.a_half_bytes;
 #pragma unroll

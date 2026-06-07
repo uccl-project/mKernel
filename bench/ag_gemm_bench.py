@@ -23,6 +23,10 @@ from common import (  # noqa: E402
     gather_cpu_tensors,
     get_peer_ips,
     get_peer_ports,
+    is_peermem_backing,
+    make_dist_buffer,
+    rdma_backing,
+    rdma_policy_label,
 )
 
 KERNEL_NAME = "ag_gemm"
@@ -113,8 +117,12 @@ def main():
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
+    source_backing = rdma_backing()
+    target_backing = source_backing
     if is_chief:
         print(f"[ag_gemm] world={world_size*NUM_NODES} shapes={args.shapes}", flush=True)
+        print(rdma_policy_label(
+            KERNEL_NAME, source=source_backing, target=target_backing), flush=True)
 
     shapes = [int(x) for x in args.shapes.split(",") if x.strip()]
     global_world = NUM_NODES * world_size
@@ -198,9 +206,27 @@ def main():
         start_row = local_rank * M_local
         a_tk.data_[start_row:start_row + M_local].copy_(A_local)
 
+        a_rdma_src = None
+        if is_peermem_backing(source_backing):
+            a_rdma_src = make_dist_buffer(
+                mod, (M_node, K), dtype=torch.bfloat16,
+                local_rank=local_rank, local_world_size=world_size,
+                multicast=False, backing=source_backing)
+            a_rdma_src.data_.zero_()
+            a_rdma_src.data_[start_row:start_row + M_local].copy_(A_local)
+
         a_recv_tk = mod.DistBuffer((M_node * n_peers * ring_recv_banks, K), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         a_recv_tk.data_.zero_()
+
+        a_recv_rdma = None
+        if is_peermem_backing(target_backing):
+            a_recv_rdma = make_dist_buffer(
+                mod, (M_node * n_peers * ring_recv_banks, K),
+                dtype=torch.bfloat16,
+                local_rank=local_rank, local_world_size=world_size,
+                multicast=False, backing=target_backing)
+            a_recv_rdma.data_.zero_()
 
         barrier = mod.DistBuffer((3, 1024, 1024), dtype=torch.int,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
@@ -219,8 +245,8 @@ def main():
         dist.barrier()
         fifo_cap = 2048
         while fifo_cap < recv_buf_chunks * 2: fifo_cap *= 2
-        a_tk_ptr = int(a_tk.data_.data_ptr())
-        send_buf_ptr = int(a_recv_tk.data_.data_ptr())
+        a_tk_ptr = int((a_rdma_src if a_rdma_src is not None else a_tk).data_.data_ptr())
+        send_buf_ptr = int((a_recv_rdma if a_recv_rdma is not None else a_recv_tk).data_.data_ptr())
         send_buf_size = recv_buf_bytes
         # A_recv is registered as MR0 (src_view=0) so received shards can be
         # forwarded to the next node after phase-2 republishes them.
@@ -244,11 +270,17 @@ def main():
         def reset_state():
             barrier.data_.zero_()
             a_tk.data_[start_row:start_row + M_local].copy_(A_local)
+            if a_rdma_src is not None:
+                a_rdma_src.data_.zero_()
+                a_rdma_src.data_[start_row:start_row + M_local].copy_(A_local)
             a_recv_tk.data_.zero_()
+            if a_recv_rdma is not None:
+                a_recv_rdma.data_.zero_()
             C.zero_()
 
         def run_once():
-            active_sms = int(os.environ.get("AG_GEMM_ACTIVE_SMS", "132"))
+            default_active_sms = torch.cuda.get_device_properties(local_rank).multi_processor_count
+            active_sms = int(os.environ.get("AG_GEMM_ACTIVE_SMS", str(default_active_sms)))
             mod.ag_gemm_multinode(
                 a_tk, B, C, barrier,
                 recv_ptr,

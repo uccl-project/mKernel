@@ -106,7 +106,7 @@ COMMON_ENV=(
     "INTERNODE_BACKEND=$BACKEND"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
     "NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
-    "NCCL_P2P_DISABLE=0"
+    "NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}"
     "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp71s0}"
     "NCCL_SOCKET_FAMILY=${NCCL_SOCKET_FAMILY:-AF_INET}"
     "NCCL_IB_ADDR_FAMILY=${NCCL_IB_ADDR_FAMILY:-AF_INET}"
@@ -125,6 +125,11 @@ COMMON_ENV=(
     "NUM_NODES=$NUM_NODES"
     "MKERNEL_H200=${MKERNEL_H200:-0}"
 )
+for var in NCCL_SHM_DISABLE NCCL_CUMEM_HOST_ENABLE NCCL_CUMEM_ENABLE; do
+    if [[ -n "${!var:-}" ]]; then
+        COMMON_ENV+=("${var}=${!var}")
+    fi
+done
 for ((i=0; i<NUM_NODES; i++)); do
     ip_var="NODE${i}_IP"
     COMMON_ENV+=("${ip_var}=${!ip_var}")
@@ -297,6 +302,10 @@ run_one_2node() {
     if [[ -n "${MKERNEL_BENCH_LEGACY_SYNC:-}" ]]; then
         env_str="$env_str MKERNEL_BENCH_LEGACY_SYNC=$MKERNEL_BENCH_LEGACY_SYNC"
     fi
+    # Generic RDMA buffer backing policy, e.g. MKERNEL_RDMA_BUFFER_BACKING=peermem.
+    for var in $(compgen -e | grep -E '^MKERNEL_RDMA_BUFFER_BACKING$' || true); do
+        env_str="$env_str ${var}=${!var}"
+    done
     if [[ "$allow_profiler_logging" == "1" && -n "${MKERNEL_BENCH_DUMP_RANK_MS:-}" ]]; then
         env_str="$env_str MKERNEL_BENCH_DUMP_RANK_MS=$MKERNEL_BENCH_DUMP_RANK_MS"
     fi

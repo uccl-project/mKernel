@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ATen/ops/from_blob.h>
@@ -88,7 +89,8 @@ struct ParallelBuffer {
         const at::ScalarType dtype,
         int local_rank,
         int local_world_size,
-        bool multicast
+        bool multicast,
+        const std::string &backing = "vmm"
     ) : shape_(shape),
         dtype_(dtype),
         raw_ptrs_(local_world_size, nullptr),
@@ -112,12 +114,28 @@ struct ParallelBuffer {
         if (brokers_.size() > 1)
             std::cerr << "WARNING: 2 LocalBroker instances created in the same process. This is not safe." << std::endl;
 
-        c10::cuda::CUDAGuard device_guard(local_rank_);
-        create_shareable_cuda_tensor();
-        exchange_ipc_handles<comm::ipc::Flavor::kVmmFd>();
+        TORCH_CHECK(backing == "vmm" || backing == "cuda_malloc",
+            "Unsupported ParallelBuffer backing '", backing,
+            "'. Expected 'vmm' or 'cuda_malloc'.");
 
-        if (multicast_)
-            initialize_multicast();
+        c10::cuda::CUDAGuard device_guard(local_rank_);
+        if (backing == "vmm") {
+            ipc_flavor_ = comm::ipc::Flavor::kVmmFd;
+            create_shareable_cuda_tensor();
+            exchange_ipc_handles<comm::ipc::Flavor::kVmmFd>();
+
+            if (multicast_)
+                initialize_multicast();
+        } else if (backing == "cuda_malloc") {
+            TORCH_CHECK(!multicast_,
+                "ParallelBuffer backing='cuda_malloc' uses legacy CUDA IPC and "
+                "does not support CUDA multicast. Use backing='vmm' for multicast buffers.");
+            ipc_flavor_ = comm::ipc::Flavor::kLegacy;
+            create_cuda_malloc_tensor();
+            exchange_ipc_handles<comm::ipc::Flavor::kLegacy>();
+        } else {
+            TORCH_CHECK(false, "Unreachable ParallelBuffer backing: ", backing);
+        }
     }
 
     ParallelBuffer(const ParallelBuffer&) = delete;
@@ -136,11 +154,13 @@ struct ParallelBuffer {
         multicast_ptr_(other.multicast_ptr_),
         multicast_allocated_size_(other.multicast_allocated_size_),
         ipc_flavor_(other.ipc_flavor_) {
+        local_vmm_handle_ = std::move(other.local_vmm_handle_);
         other.data_ = at::Tensor();
         other.shape_.clear();
         other.dtype_ = at::ScalarType::Undefined;
         other.raw_ptrs_.clear();
         other.allocated_size_ = 0;
+        other.local_vmm_handle_.reset();
         other.local_rank_ = -1;
         other.local_world_size_ = -1;
         other.multicast_ = false;
@@ -183,8 +203,37 @@ struct ParallelBuffer {
             if (!p) return;
             c10::cuda::CUDAGuard device_guard(local_rank);
             auto stream = c10::cuda::getCurrentCUDAStream().stream();
-            CUDACHECK(cudaStreamSynchronize(stream));
+            MKERNEL_CUDACHECK(cudaStreamSynchronize(stream));
             comm::vmm::unmap(raw_ptr, allocated_size);
+        };
+
+        at::TensorOptions options = at::TensorOptions()
+            .dtype(dtype_)
+            .device(at::kCUDA, local_rank_);
+
+        data_ = at::from_blob(raw_ptr, shape_, std::move(deleter), options);
+    }
+
+    __host__ inline void create_cuda_malloc_tensor() {
+        c10::cuda::CUDAGuard device_guard(local_rank_);
+
+        TORCH_CHECK(!shape_.empty(), "Shape must be non-empty");
+        TORCH_CHECK(shape_.size() <= 4, "Shape must have at most 4 dimensions for ParallelBuffer");
+        size_t size = c10::elementSize(dtype_);
+        for (auto dim : shape_) {
+            TORCH_CHECK(dim > 0, "Size dimensions must be positive");
+            size *= static_cast<size_t>(dim);
+        }
+
+        void *raw_ptr = nullptr;
+        MKERNEL_CUDACHECK(cudaMalloc(&raw_ptr, size));
+        allocated_size_ = size;
+
+        int local_rank = local_rank_;
+        auto deleter = [local_rank](void* p) mutable {
+            if (!p) return;
+            c10::cuda::CUDAGuard device_guard(local_rank);
+            MKERNEL_CUDACHECK(cudaFree(p));
         };
 
         at::TensorOptions options = at::TensorOptions()
@@ -289,6 +338,10 @@ struct ParallelBuffer {
     }
 
     __host__ inline void destroy() {
+        if (local_rank_ < 0 || local_world_size_ <= 0) {
+            return;
+        }
+
         if (multicast_ && multicast_ptr_) {
             brokers_.at({local_rank_, local_world_size_}).sync();
             comm::vmm::Handle multicast_handle;
@@ -342,12 +395,13 @@ struct ParallelBuffer {
              pybind11::arg("local_rank"), \
              pybind11::arg("local_world_size"), \
              pybind11::arg("multicast") = false) \
-        .def(pybind11::init<const std::vector<int64_t>&, const at::ScalarType&, int, int, bool>(), \
+        .def(pybind11::init<const std::vector<int64_t>&, const at::ScalarType&, int, int, bool, const std::string&>(), \
              pybind11::arg("shape"), \
              pybind11::arg("dtype"), \
              pybind11::arg("local_rank"), \
              pybind11::arg("local_world_size"), \
-             pybind11::arg("multicast") = false) \
+             pybind11::arg("multicast") = false, \
+             pybind11::arg("backing") = "vmm") \
         .def("data", &dist::ParallelBuffer::data) \
         .def_readonly("data_", &dist::ParallelBuffer::data_) \
         .def_property_readonly("multicast_ptr_u64", [](const dist::ParallelBuffer &t) { \

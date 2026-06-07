@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 
 namespace internode {
 namespace gpu_mr {
@@ -30,6 +31,42 @@ namespace gpu_mr {
 static constexpr int kDefaultAccess =
     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
     | IBV_ACCESS_RELAXED_ORDERING;
+
+inline ibv_mr* reg_dmabuf_mr_with_retry(
+    ibv_pd* pd, uint64_t offset, size_t bytes, uint64_t iova, int fd, int access) {
+    errno = 0;
+    ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, bytes, iova, fd, access);
+    if (mr != nullptr) return mr;
+
+    const int first_errno = errno;
+    if ((access & IBV_ACCESS_RELAXED_ORDERING) != 0) {
+        const int fallback_access = access & ~IBV_ACCESS_RELAXED_ORDERING;
+        errno = 0;
+        mr = ibv_reg_dmabuf_mr(pd, offset, bytes, iova, fd, fallback_access);
+        if (mr != nullptr) return mr;
+        const int retry_errno = errno;
+        errno = retry_errno != 0 ? retry_errno : first_errno;
+    }
+    return nullptr;
+}
+
+inline ibv_mr* reg_mr_with_retry(
+    ibv_pd* pd, void* addr, size_t bytes, int access) {
+    errno = 0;
+    ibv_mr* mr = ibv_reg_mr(pd, addr, bytes, access);
+    if (mr != nullptr) return mr;
+
+    const int first_errno = errno;
+    if ((access & IBV_ACCESS_RELAXED_ORDERING) != 0) {
+        const int fallback_access = access & ~IBV_ACCESS_RELAXED_ORDERING;
+        errno = 0;
+        mr = ibv_reg_mr(pd, addr, bytes, fallback_access);
+        if (mr != nullptr) return mr;
+        const int retry_errno = errno;
+        errno = retry_errno != 0 ? retry_errno : first_errno;
+    }
+    return nullptr;
+}
 
 /**
  * Register an existing GPU buffer for RDMA.
@@ -56,7 +93,8 @@ inline ibv_mr* register_gpu_buffer(ibv_pd* pd, void* gpu_ptr, size_t bytes,
             &fd, (CUdeviceptr)gpu_ptr, bytes,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (cu_err == CUDA_SUCCESS && fd >= 0) {
-            mr = ibv_reg_dmabuf_mr(pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
+            mr = reg_dmabuf_mr_with_retry(
+                pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
             close(fd);
             if (mr) {
                 return mr;
@@ -75,7 +113,8 @@ inline ibv_mr* register_gpu_buffer(ibv_pd* pd, void* gpu_ptr, size_t bytes,
             cu_err = cuMemExportToShareableHandle(&fd, alloc_handle,
                          CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
             if (cu_err == CUDA_SUCCESS && fd >= 0) {
-                mr = ibv_reg_dmabuf_mr(pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
+                mr = reg_dmabuf_mr_with_retry(
+                    pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
                 close(fd);
                 if (mr) {
                     return mr;
@@ -87,10 +126,11 @@ inline ibv_mr* register_gpu_buffer(ibv_pd* pd, void* gpu_ptr, size_t bytes,
     }
 
     // --- Path 2: nvidia_peermem fallback ---
-    mr = ibv_reg_mr(pd, gpu_ptr, bytes, access);
+    mr = reg_mr_with_retry(pd, gpu_ptr, bytes, access);
     if (!mr) {
         fprintf(stderr, "rdma_gpu_mr: ibv_reg_mr(gpu) failed: %s\n"
-                "Is nvidia_peermem loaded? (lsmod | grep nvidia_peermem)\n",
+                "Is nvidia_peermem or nv_peer_mem loaded? "
+                "(lsmod | grep -E 'nvidia_peermem|nv_peer_mem')\n",
                 strerror(errno));
         exit(EXIT_FAILURE);
     }
@@ -121,7 +161,8 @@ inline ibv_mr* register_gpu_buffer_dmabuf_only(
             &fd, (CUdeviceptr)gpu_ptr, bytes,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (cu_err == CUDA_SUCCESS && fd >= 0) {
-            ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
+            ibv_mr* mr = reg_dmabuf_mr_with_retry(
+                pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
             close(fd);
             if (mr) {
                 if (path_out) *path_out = "addr_range";
@@ -149,7 +190,8 @@ inline ibv_mr* register_gpu_buffer_dmabuf_only(
                 &fd, alloc_handle,
                 CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
             if (cu_err == CUDA_SUCCESS && fd >= 0) {
-                ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
+                ibv_mr* mr = reg_dmabuf_mr_with_retry(
+                    pd, 0, bytes, (uint64_t)gpu_ptr, fd, access);
                 close(fd);
                 if (mr) {
                     if (path_out) *path_out = "retain";

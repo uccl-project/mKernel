@@ -433,10 +433,10 @@ __device__ inline void attn_comm(const globals &G, const int block_idx, const in
 // ============================================================================
 //
 // Zero-copy KV send: skips the K0/V0 → send_buf pack. K0 is registered as
-// the session's local_gpu_buf (src_view=0), V0 as clocal_gpu_buf (src_view=1),
-// both via DMA-BUF (`direct_dmabuf_enabled=true`). The proxy posts a single-SGE
-// RDMA write straight from the registered VMM tensor, so no GPU-memory copy
-// is required on the sender side.
+// the session's local_gpu_buf (src_view=0), V0 as clocal_gpu_buf (src_view=1).
+// The MR may be DMA-BUF-backed for VMM or peermem-backed for cudaMalloc. The
+// proxy posts a single-SGE RDMA write straight from the registered tensor, so
+// no GPU-memory copy is required on the sender side.
 //
 // Layout invariants:
 //   - K0/V0 are row-major contiguous DistBuffers of size K_bytes/V_bytes.
@@ -658,7 +658,11 @@ void kv_send_kernel(
     const __grid_constant__ kv_exchange_globals KE
 ) {
     if ((int)blockIdx.x < KE.num_send_sms) {
-        kv_stage_and_send_sm(KE);
+        if (KE.use_staging_source != 0) {
+            kv_send_sm(KE);
+        } else {
+            kv_stage_and_send_sm(KE);
+        }
     }
 }
 
