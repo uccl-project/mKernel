@@ -155,11 +155,22 @@ struct fused_globals {
 
     static constexpr int I2 = 2 * I;   // gemm1 output width (gate | up)
 
+    // gemm1 SwiGLU-fusion: gemm1 uses a HALF-width col tile (COL_BLOCK_1=128) so
+    // that one task can hold BOTH a gate (col c) and an up (col c+I/COL_BLOCK_1)
+    // accumulator simultaneously in registers (2x rt_fl<16,128> = 128 fp32
+    // regs/thread, fits the 232 budget) and fuse SwiGLU at store time, writing
+    // `act` directly and skipping the h1[M,2I] HBM round-trip + the separate
+    // swiglu_phase + bar(2). gemm2 keeps COL_BLOCK=256 unchanged.
+    static constexpr int COL_BLOCK_1 = 128;
+
     using token_vec = sv_bf<H>;
     using act_vec   = sv_bf<I>;
     using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
+    // gemm1-fusion tiles (128-wide): B1 = w1 col tile, ACT1 = fused act store tile.
+    using B1_tile  = st_bf<RED_BLOCK, COL_BLOCK_1>;
+    using ACT1_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK_1>;
 
     using pre_tokens_distributed_tensor  = dist::distributed_tensor<dist::local_tensor<bf16, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
     using peer_tokens_distributed_tensor = dist::distributed_tensor<dist::local_tensor<bf16, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
@@ -169,9 +180,12 @@ struct fused_globals {
     // gemm1: post_tokens[M,H] @ w1[e][H,2I] -> h1[M,2I]
     // gemm2: act[M,I]         @ w2[e][I,H]  -> y_expert[M,H]
     using post_tokens_local_tensor = dist::local_tensor<bf16, 1, 1, -1, H, token_vec, A_tile>;
-    using w1_local_tensor   = dist::local_tensor<bf16, 1, NUM_EXPERTS_PER_DEV, H, I2, B_tile>;
+    // w1 gets the 128-wide B1_tile descriptor (gemm1 fusion) in addition to B_tile.
+    using w1_local_tensor   = dist::local_tensor<bf16, 1, NUM_EXPERTS_PER_DEV, H, I2, B_tile, B1_tile>;
     using h1_local_tensor   = dist::local_tensor<bf16, 1, 1, -1, I2, C_tile>;
-    using act_local_tensor  = dist::local_tensor<bf16, 1, 1, -1, I, act_vec, A_tile>;
+    // act gets the 128-wide ACT1_tile store descriptor (gemm1 fusion) plus its
+    // A_tile gemm2-load descriptor.
+    using act_local_tensor  = dist::local_tensor<bf16, 1, 1, -1, I, act_vec, A_tile, ACT1_tile>;
     using w2_local_tensor   = dist::local_tensor<bf16, 1, NUM_EXPERTS_PER_DEV, I, H, B_tile>;
     using y_expert_local_tensor = dist::local_tensor<bf16, 1, 1, -1, H, token_vec, C_tile>;
     using padded_tokens_per_expert_local_tensor = dist::local_tensor<int, 1, 1, 1, NUM_EXPERTS>;
@@ -273,6 +287,12 @@ struct fused_globals {
 
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
     struct pipeline_outputs { C_tile C[2]; };
+    // gemm1 SwiGLU-fusion pipeline: A[2] (two row-halves, shared by gate+up) +
+    // Bg (gate col tile) + Bu (up col tile), all 128-wide. Same 49152 B/stage as
+    // pipeline_inputs (A[2]=16384 + Bg=16384 + Bu=16384). Outputs hold the fused
+    // act tiles (st_bf<64,128> x2 = 32768, half of pipeline_outputs).
+    struct pipeline_inputs1  { A_tile A[2]; B1_tile Bg; B1_tile Bu; };
+    struct pipeline_outputs1 { ACT1_tile C[2]; };
 
 };
 
@@ -358,28 +378,51 @@ void fused(
     // freed CTAs are assigned to compute. Environment variables below keep
     // these split points tunable without recompilation.
     if (num_local_tokens >= 8192) {
-        int nc_131k = 40;
+        int nc_131k = 28;
         if (const char* e = std::getenv("MKERNEL_Q3_NC_131K")) {
             int v = std::atoi(e);
             if (v > 0) nc_131k = v;
         }
+        if (const char* e = std::getenv("DGC_NC_131K")) {
+            int v = std::atoi(e);
+            if (v > 0) nc_131k = v;
+        }
         n_dispatch_req = nc_131k;
+        // gen3-H2: the copy CTAs only poll arrival flags + set copy_ready (zero-copy
+        // peer_tokens path = no data move) and the send CTAs push the combine chunks
+        // which are RDMA-overlapped here; both are over-provisioned at this
+        // compute-bound shape. Trim 4->2 each, freeing 4 SMs to GEMM.
+        int nsc_131k = 2;
+        if (const char* e = std::getenv("DGC_NSC_131K")) { int v = std::atoi(e); if (v > 0) nsc_131k = v; }
+        n_send = nsc_131k; n_copy = nsc_131k;
     } else if (num_local_tokens == 2048) {
         // 32K global-token case.
-        int nc_32k = 44;
+        int nc_32k = 28;
         if (const char* e = std::getenv("MKERNEL_Q3_NC_32K")) {
+            int v = std::atoi(e);
+            if (v > 0) nc_32k = v;
+        }
+        if (const char* e = std::getenv("DGC_NC_32K")) {
             int v = std::atoi(e);
             if (v > 0) nc_32k = v;
         }
         n_dispatch_req = nc_32k;
     } else if (num_local_tokens == 4096) {
         // 64K global-token case.
-        int nc_64k = 44;
+        int nc_64k = 28;
         if (const char* e = std::getenv("MKERNEL_Q3_NC_64K")) {
             int v = std::atoi(e);
             if (v > 0) nc_64k = v;
         }
+        if (const char* e = std::getenv("DGC_NC_64K")) {
+            int v = std::atoi(e);
+            if (v > 0) nc_64k = v;
+        }
         n_dispatch_req = nc_64k;
+        // gen3-H2: trim send/copy 4->2 (see 131K branch). Measured -3% at 65536.
+        int nsc_64k = 2;
+        if (const char* e = std::getenv("DGC_NSC_64K")) { int v = std::atoi(e); if (v > 0) nsc_64k = v; }
+        n_send = nsc_64k; n_copy = nsc_64k;
     } else if (num_local_tokens == 512) {
         // 8K global-token overlap case.
         int nc_8k = 32;
@@ -396,8 +439,12 @@ void fused(
         n_send = std::max(1, nsend_8k);
     } else if (num_local_tokens == 1024) {
         // 16K global-token overlap case.
-        int nc_16k = 44;
+        int nc_16k = 28;
         if (const char* e = std::getenv("MKERNEL_Q3_NC_16K")) {
+            int v = std::atoi(e);
+            if (v > 0) nc_16k = v;
+        }
+        if (const char* e = std::getenv("DGC_NC_16K")) {
             int v = std::atoi(e);
             if (v > 0) nc_16k = v;
         }
