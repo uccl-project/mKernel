@@ -26,7 +26,7 @@ H, I, TOPK, WORLD = 7168, 2048, 8, 16
 TITLE = "Fused MoE: Dispatch+GEMM+SwiGLU+GEMM+Combine, 2 nodes x 8 H200 EFA (world=16)"
 # Same-functionality baseline (NCCL all-to-all over EFA + cuBLAS), measured by
 # bench/baseline_glu_combine.py at H=7168 I=2048 TOPK=8 (TFLOPS/GPU).
-BASELINE_TF = {8192: 150.1, 16384: 159.7, 32768: 182.7, 65536: 192.6, 131072: 196.4}
+BASELINE_TF = {8192: 157.6, 16384: 161.3, 32768: 181.2, 65536: 193.0, 131072: 196.7}
 MIN_TOK = 8192   # real-dim runs only (the json also holds stale tiny-dim entries)
 
 
@@ -36,13 +36,11 @@ def tflops(num_tokens, ms):
     return (6.0 * num_tokens * TOPK * H * I / WORLD) / (ms * 1e-3) / 1e12
 
 
-# Full-kernel TFLOPS/GPU (dispatch+gemm1+swiglu+gemm2+combine). bf16x2 IPC
-# atomics + atomic-free structured reduce + CHUNK_BYTES=16 MB (the exposed,
-# bidirectional combine RDMA saturates the EFA rails at ~20 GB/s with large
-# chunks; 512 KB left it at ~7 GB/s). 2-node EFA sweep wall =
-# {8192:2.142, 16384:3.952, 32768:7.477, 65536:14.476, 131072:27.010} ms.
-# Now beats the CuBLAS+NCCL baseline at every shape.
-FULL_TF = {8192: 168.5, 16384: 182.6, 32768: 193.0, 65536: 199.4, 131072: 213.7}
+# Full-kernel TFLOPS/GPU (dispatch+gemm1+swiglu+gemm2+combine), atomic-free
+# structured combine, CHUNK_BYTES=16 MB. Best-of-2 2-node EFA sweep wall (ms) =
+# {8192:1.973, 16384:3.530, 32768:6.354, 65536:12.070, 131072:19.934}.
+# Beats the CuBLAS+NCCL baseline at every shape.
+FULL_TF = {8192: 182.9, 16384: 204.4, 32768: 227.1, 65536: 239.1, 131072: 289.6}
 # Arena: if the agent team has a recorded best, use its per-shape TFLOPS.
 try:
     _bt = json.loads((HERE.parent / "agent_arena" / "best_tflops.json").read_text())

@@ -434,6 +434,220 @@ __device__ inline void grouped_gemm(const fused_globals &G, const int sm_idx,
     }
 }
 
+// ============================================================================
+// gemm1 + SwiGLU FUSED. Same warpgroup-MMA pipeline as grouped_gemm, but each
+// task computes BOTH the gate col tile (col c) and the up col tile (col c+CB1)
+// for the same rows, fuses silu(gate)*up in registers, and TMA-stores the
+// resulting `act` tile directly — eliminating the h1[M,2I] HBM write+read, the
+// standalone swiglu_phase, and bar(2). gemm2 is unchanged (reads `act`).
+//
+// COL_BLOCK_1 = 128 keeps two fp32 accumulators (gate+up) within the register
+// budget; col_blocks = I/COL_BLOCK_1 = 16. B is loaded twice per K step (gate
+// col_idx=c, up col_idx=c+col_blocks). Waits the dispatch barrier (gemm1 input).
+__device__ inline void gemm1_swiglu_fused(const fused_globals &G, const int sm_idx,
+                                          const int num_sms) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator allocator((int*)&__shm[0]);
+    fused_globals::pipeline_inputs1 (&inputs)[fused_globals::PIPELINE_STAGES] =
+        allocator.allocate<fused_globals::pipeline_inputs1, fused_globals::PIPELINE_STAGES>();
+    fused_globals::pipeline_outputs1 &outputs =
+        *reinterpret_cast<fused_globals::pipeline_outputs1 *>(&inputs[fused_globals::PIPELINE_STAGES - 1]);
+
+    const int global_gpu_idx = G.node_idx * fused_globals::NUM_DEVICES + G.dev_idx;
+    const int expert_offset = global_gpu_idx * fused_globals::NUM_EXPERTS_PER_DEV;
+    __shared__ int padded_tokens_per_expert[fused_globals::NUM_EXPERTS_PER_DEV];
+    if (threadIdx.x < fused_globals::NUM_EXPERTS_PER_DEV)
+        padded_tokens_per_expert[threadIdx.x] =
+            G.padded_tokens_per_expert[{expert_offset + (int)threadIdx.x}];
+    __shared__ int local_rb_per_expert[fused_globals::NUM_EXPERTS_PER_DEV];
+    if (threadIdx.x < fused_globals::NUM_EXPERTS_PER_DEV)
+        local_rb_per_expert[threadIdx.x] = G.local_rb_per_expert[{(int)threadIdx.x}];
+
+    __shared__ semaphore inputs_arrived[fused_globals::PIPELINE_STAGES];
+    __shared__ semaphore inputs_finished[fused_globals::PIPELINE_STAGES];
+    __shared__ semaphore outputs_arrived;
+    __shared__ semaphore outputs_finished;
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int i = 0; i < fused_globals::PIPELINE_STAGES; ++i) {
+            init_semaphore(inputs_arrived[i], 0, 1);
+            init_semaphore(inputs_finished[i], 0, 8);
+        }
+        init_semaphore(outputs_arrived, 0, 2);
+        init_semaphore(outputs_finished, 0, 1);
+    }
+    __syncthreads();
+
+    const int wg_id = warpgroup::groupid();
+    const int w_id  = warpgroup::warpid();
+    const int l_id  = warp::laneid();
+    int stage = 0;
+    uint32_t phasebits = 0xFFFF0000;
+    constexpr int num_iters  = fused_globals::H / fused_globals::RED_BLOCK;
+    constexpr int col_blocks = fused_globals::I / fused_globals::COL_BLOCK_1;  // 16
+    constexpr int NUM_PASSES = 2;
+
+    if (wg_id == 2) {
+        warpgroup::decrease_registers<40>();
+        if (w_id == 0) {
+            // Producer: load A[2] + gate-B + up-B per K step.
+            #pragma unroll 1
+            for (int pass = 0; pass < NUM_PASSES; ++pass) {
+                int task_id = sm_idx;
+                int cum = 0;
+                #pragma unroll
+                for (int expert_id = 0;
+                     expert_id < fused_globals::NUM_EXPERTS_PER_DEV; expert_id++) {
+                    const int rb_start_e = cum / fused_globals::ROW_BLOCK;
+                    cum += padded_tokens_per_expert[expert_id];
+                    const int rb_end_e = (cum + fused_globals::ROW_BLOCK - 1) / fused_globals::ROW_BLOCK;
+                    const int total_rb = rb_end_e - rb_start_e;
+                    const int local_rb_e = local_rb_per_expert[expert_id];
+                    const int row_offset = (pass == 0) ? rb_start_e : (rb_start_e + local_rb_e);
+                    const int row_blocks = (pass == 0) ? local_rb_e : (total_rb - local_rb_e);
+                    const int num_blocks = row_blocks * col_blocks;
+                    for (; task_id < num_blocks; task_id += num_sms) {
+                        int _row_in_grid, _col_idx;
+                        dispatch_super_m_decode(task_id, row_blocks, col_blocks, G.super_m, _row_in_grid, _col_idx);
+                        const int row_idx = _row_in_grid + row_offset;
+                        const int col_idx = _col_idx;             // gate col (0..15)
+                        if (l_id == 0) {
+                            int bar_val = comm::atomic_u32::acquire_load_s32_gpu(
+                                &G.barrier[G.dev_idx][{row_idx}]);
+                            while (bar_val != fused_globals::ROW_BLOCK) {
+                                __nanosleep(64);
+                                bar_val = comm::atomic_u32::acquire_load_s32_gpu(
+                                    &G.barrier[G.dev_idx][{row_idx}]);
+                            }
+                        }
+                        __syncwarp();
+                        for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                            if (l_id == 0) {
+                                wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                                update_phasebit<1>(phasebits, stage);
+                                if (red_idx == fused_globals::PIPELINE_STAGES - 1) {
+                                    wait(outputs_finished, get_phasebit<1>(phasebits, fused_globals::PIPELINE_STAGES));
+                                    update_phasebit<1>(phasebits, fused_globals::PIPELINE_STAGES);
+                                }
+                            }
+                            __syncwarp();
+                            if (l_id == 0) {
+                                ::dist::tma::expect_bytes(inputs_arrived[stage], sizeof(fused_globals::pipeline_inputs1));
+                                #pragma unroll
+                                for (int i = 0; i < 2; i++)
+                                    ::dist::tma::load_async(inputs[stage].A[i], G.post_tokens,
+                                                    {row_idx * 2 + i, red_idx}, inputs_arrived[stage]);
+                                ::dist::tma::load_async(inputs[stage].Bg, G.w1,
+                                                {expert_id, red_idx, col_idx}, inputs_arrived[stage]);
+                                ::dist::tma::load_async(inputs[stage].Bu, G.w1,
+                                                {expert_id, red_idx, col_idx + col_blocks}, inputs_arrived[stage]);
+                            }
+                            __syncwarp();
+                            stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
+                        }
+                    }
+                    task_id -= num_blocks;
+                }
+            }
+        } else if (w_id == 1 && l_id == 0) {
+            // Store warp: TMA-store the fused act tiles.
+            #pragma unroll 1
+            for (int pass = 0; pass < NUM_PASSES; ++pass) {
+                int task_id = sm_idx;
+                int cum = 0;
+                #pragma unroll
+                for (int expert_id = 0;
+                     expert_id < fused_globals::NUM_EXPERTS_PER_DEV; expert_id++) {
+                    const int rb_start_e = cum / fused_globals::ROW_BLOCK;
+                    cum += padded_tokens_per_expert[expert_id];
+                    const int rb_end_e = (cum + fused_globals::ROW_BLOCK - 1) / fused_globals::ROW_BLOCK;
+                    const int total_rb = rb_end_e - rb_start_e;
+                    const int local_rb_e = local_rb_per_expert[expert_id];
+                    const int row_offset = (pass == 0) ? rb_start_e : (rb_start_e + local_rb_e);
+                    const int row_blocks = (pass == 0) ? local_rb_e : (total_rb - local_rb_e);
+                    const int num_blocks = row_blocks * col_blocks;
+                    for (; task_id < num_blocks; task_id += num_sms) {
+                        int _row_in_grid, _col_idx;
+                        dispatch_super_m_decode(task_id, row_blocks, col_blocks, G.super_m, _row_in_grid, _col_idx);
+                        const int row_idx = _row_in_grid + row_offset;
+                        const int col_idx = _col_idx;
+                        wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+                        update_phasebit<0>(phasebits, 0);
+                        #pragma unroll
+                        for (int i = 0; i < 2; i++)
+                            ::dist::tma::store_async(G.act, outputs.C[i], {row_idx * 2 + i, col_idx});
+                        ::dist::tma::store_async_read_wait();
+                        arrive(outputs_finished);
+                    }
+                    task_id -= num_blocks;
+                }
+            }
+        }
+    } else {
+        warpgroup::increase_registers<232>();
+        #pragma unroll 1
+        for (int pass = 0; pass < NUM_PASSES; ++pass) {
+            int task_id = sm_idx;
+            int cum = 0;
+            #pragma unroll
+            for (int expert_id = 0;
+                 expert_id < fused_globals::NUM_EXPERTS_PER_DEV; expert_id++) {
+                const int rb_start_e = cum / fused_globals::ROW_BLOCK;
+                cum += padded_tokens_per_expert[expert_id];
+                const int rb_end_e = (cum + fused_globals::ROW_BLOCK - 1) / fused_globals::ROW_BLOCK;
+                const int total_rb = rb_end_e - rb_start_e;
+                const int local_rb_e = local_rb_per_expert[expert_id];
+                const int row_blocks = (pass == 0) ? local_rb_e : (total_rb - local_rb_e);
+                const int num_blocks = row_blocks * col_blocks;
+                for (; task_id < num_blocks; task_id += num_sms) {
+                    rt_fl<fused_globals::ROW_BLOCK / 8, fused_globals::COL_BLOCK_1> acc_g;
+                    rt_fl<fused_globals::ROW_BLOCK / 8, fused_globals::COL_BLOCK_1> acc_u;
+                    warp::zero(acc_g);
+                    warp::zero(acc_u);
+                    int prev_stage = -1;
+                    for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                        wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                        update_phasebit<0>(phasebits, stage);
+                        warpgroup::mma_AB(acc_g, inputs[stage].A[wg_id], inputs[stage].Bg);
+                        warpgroup::mma_AB(acc_u, inputs[stage].A[wg_id], inputs[stage].Bu);
+                        if (prev_stage >= 0) {
+                            warpgroup::mma_async_wait<1>();
+                            warp::arrive(inputs_finished[prev_stage]);
+                        }
+                        prev_stage = stage;
+                        stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
+                    }
+                    warpgroup::mma_async_wait<0>();
+                    warp::arrive(inputs_finished[prev_stage]);
+                    // SwiGLU fuse in registers: acc_g <- silu(gate) * up. acc_g and
+                    // acc_u share the identical rt layout, so element-wise indices
+                    // correspond. data[k] is a float2 (packed fp32 pair).
+                    #pragma unroll
+                    for (int i = 0; i < decltype(acc_g)::height; i++) {
+                        #pragma unroll
+                        for (int j = 0; j < decltype(acc_g)::width; j++) {
+                            #pragma unroll
+                            for (int k = 0; k < acc_g.packed_per_tile; k++) {
+                                float gx = acc_g.tiles[i][j].data[k].x;
+                                float gy = acc_g.tiles[i][j].data[k].y;
+                                float ux = acc_u.tiles[i][j].data[k].x;
+                                float uy = acc_u.tiles[i][j].data[k].y;
+                                acc_g.tiles[i][j].data[k].x = (gx / (1.0f + __expf(-gx))) * ux;
+                                acc_g.tiles[i][j].data[k].y = (gy / (1.0f + __expf(-gy))) * uy;
+                            }
+                        }
+                    }
+                    group<8>::sync(3);
+                    warpgroup::store(outputs.C[wg_id], acc_g);
+                    warpgroup::sync(wg_id + 1);
+                    warpgroup::arrive(outputs_arrived);
+                }
+                task_id -= num_blocks;
+            }
+        }
+    }
+}
+
 // gemm1 (post_tokens @ w1 -> h1, waits dispatch barrier) and gemm2
 // (act @ w2 -> y_expert, no wait). Compile-time K/N from the operator dims.
 __device__ inline void ffn_gemm1(const fused_globals &G, int sm_idx, int num_sms) {
@@ -762,26 +976,34 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
         dispatch_two_pass_walk(G, dispatch_id, dispatch_stride);
     } else {
         int comp_idx = block - copy_phase_blocks - G.num_dispatch_sms;
-        ffn_gemm1(G, comp_idx, G.num_comp_sms);   // gemm1: post @ w1 -> h1 (waits dispatch barrier)
+        // Fused gemm1+SwiGLU: post @ w1 -> silu(gate)*up -> act (waits dispatch
+        // barrier). Writes `act` directly, skipping the h1[M,2I] HBM round-trip,
+        // the standalone swiglu_phase, and bar(2).
+        gemm1_swiglu_fused(G, comp_idx, G.num_comp_sms);
     }
 
     // FFN tail (all CTAs, separated by grid + cross-GPU barriers):
-    // gemm1 done -> SwiGLU -> gemm2 -> fused intra+stage combine.
-    combine_global_barrier(G, 2);                 // h1 ready
-    swiglu_phase(G);                              // h1 -> act
+    // gemm1+SwiGLU done (act written) -> gemm2 -> fused intra+stage combine.
+    // bar(2) (h1-ready) and swiglu_phase are ELIMINATED by the fusion: act is the
+    // gemm1 output, read only by this GPU's gemm2 (local producer->consumer). The
+    // grid-local bar(3) below already orders gemm1's act store before gemm2.
     // hoist the pre_tokens-UPPER zero before gemm2 (gemm2 never touches
-    // pre upper). bar(3) is cross-GPU + __threadfence_system, so after it every
-    // GPU's pre-upper is zero AND peer-visible (Invariant Z) — folding the role
-    // of the old combine_zero_staging + barrier(0) into the existing bar(3).
-    // when use_inter_gather, combine_gather_inter OVERWRITES every send row
-    // (start acc 0), so the pre-upper zero-fill is no longer needed.
-    if (G.num_nodes > 1 && !G.use_inter_gather) combine_zero_staging(G);
-    combine_global_barrier(G, 3);                 // act ready + pre-upper zeroed cross-GPU
+    // pre upper). When the zero-fill is needed (!use_inter_gather), bar(3) must
+    // be cross-GPU + __threadfence_system so every GPU's pre-upper is peer-visible
+    // (Invariant Z) before the stage scatter. In the default path
+    // (use_inter_gather=1) combine_gather_inter OVERWRITES every send row, so the
+    // zero-fill is skipped and bar(3) only needs to guarantee THIS GPU's act
+    // (gemm2 input, local) is ready -> a grid-LOCAL barrier suffices.
+    if (G.num_nodes > 1 && !G.use_inter_gather) {
+        combine_zero_staging(G);
+        combine_global_barrier(G, 3);             // act ready + pre-upper zeroed cross-GPU
+    } else {
+        combine_grid_barrier(G, 3);               // act ready (grid-local)
+    }
     ffn_gemm2(G, block, gridDim.x);               // gemm2: act @ w2 -> y_expert (all CTAs)
-    // bar(4) only needs to fence THIS GPU's gemm2 output (local
-    // y_expert) before THIS GPU's producers read it; the producers' peer writes
-    // are fenced cross-GPU by bar(5). A grid-local barrier suffices (drops one
-    // dist::barrier_all + __threadfence_system).
+    // bar(4) fences THIS GPU's gemm2 output (local y_expert) before its producers
+    // read it; the producers' peer writes are fenced cross-GPU by bar(5), so a
+    // grid-local barrier suffices.
     combine_grid_barrier(G, 4);                   // y_expert ready (grid-local)
     // in the default build (use_gather=1 && use_inter_gather=1)
     // combine_scatter_fused continue's on every row (intra gated by use_gather,
@@ -796,7 +1018,7 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
         if (G.use_inter_gather) combine_producer_fused(G);
         else                    combine_producer_intra(G);
         combine_global_barrier(G, 5);             // producer comb_buf writes visible
-        combine_gather_owner(G);
+        combine_gather_owner(G);                  // intra: all CTAs write y_out
         // atomic-free inter gather: same phase as intra gather, writes the
         // dense pre_tokens UPPER send row (overwrite). bar(1) below fences it
         // before combine_send reads it, exactly as it fenced the atomic scatter.
@@ -826,7 +1048,6 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
         for (int i = threadIdx.x; i < num_row_blocks; i += blockDim.x)
             G.barrier[G.dev_idx][{i}] = 0;
     }
-
 }
 
 __global__ void fused_cleanup_kernel(__grid_constant__ const fused_cleanup_globals G) {
@@ -1107,13 +1328,25 @@ __device__ inline void combine_phase2(const fused_globals &G) {
     if (G.num_nodes <= 1) return;
     // zero + stage already done (zero hoisted before gemm2; stage fused into
     // combine_scatter_fused).
-    combine_global_barrier(G, 1);   // all staging atomics drained cross-GPU
+    // bar(1): ensure the inter gather's local writes to pre_tokens UPPER are
+    // complete before combine_send RDMA-reads them. In the default gather path
+    // send reads only THIS GPU's pre_tokens UPPER (the gather wrote them locally;
+    // the gather's own __threadfence_system already made them NIC-visible), so a
+    // grid-LOCAL barrier suffices — no peer buffer is read here. (In the legacy
+    // !use_inter_gather scatter path the staging atomics target PEER pre-upper,
+    // which DOES need cross-GPU visibility, so keep the global barrier there.)
+    if (G.use_inter_gather) combine_grid_barrier(G, 1);
+    else                    combine_global_barrier(G, 1);
     if (blockIdx.x < G.num_send_sms) combine_send(G);
     else                             combine_reduce(G);
 
     // Converge all CTAs (reuse the otherwise-idle bar(0)) so every reduce's
     // y_out write and every send's RDMA push is issued before we reset/notify.
-    combine_global_barrier(G, 0);
+    // Grid-LOCAL: between here and the notify nothing reads a PEER buffer — the
+    // reset clears THIS node's local arrival_flags and reduce wrote local y_out —
+    // so the NVLink barrier_all is unnecessary. The flag reset's own
+    // __threadfence_system still orders it before the driver's notify push.
+    combine_grid_barrier(G, 0);
 
     // Reset this node's combine flags before the notify push; the peer's
     // next-iteration writes are gated on the notify, so they can't race it.
