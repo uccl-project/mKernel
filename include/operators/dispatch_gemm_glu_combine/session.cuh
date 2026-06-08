@@ -116,7 +116,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("post_tokens"),
           pybind11::arg("w1"),
           pybind11::arg("w2"),
-          pybind11::arg("h1"),
           pybind11::arg("act"),
           pybind11::arg("y_expert"),
           pybind11::arg("row_expert"),

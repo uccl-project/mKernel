@@ -19,11 +19,13 @@
  *     its source GPU/node into post_tokens, with peer tokens gated by copy_ready.
  *
  *   Compute CTAs [..., 132):
- *     Run gemm1 (post_tokens @ w1 -> h1) once their dispatched row blocks ready.
+ *     Run the fused gemm1+SwiGLU (post_tokens @ w1 -> silu(gate)*up -> act) once
+ *     their dispatched row blocks are ready. SwiGLU is applied in the gemm1
+ *     epilogue, so `act` is written directly with no h1[M,2I] HBM round-trip.
  *
  * After a grid barrier the role split dissolves and every CTA runs the rest in
  * lockstep, separated by grid + cross-GPU barriers:
- *   SwiGLU (h1 -> act) -> gemm2 (act @ w2 -> y_expert) -> combine.
+ *   gemm2 (act @ w2 -> y_expert) -> combine.
  *
  * Combine has no dedicated CTA role: each CTA stores its weighted expert outputs
  * into the owner GPU's contribution buffer over IPC, then each owner GPU
@@ -236,14 +238,6 @@ __device__ inline void dispatch_super_m_decode(int task_id, int row_blocks, int 
     row_in_grid = super_rows + (tail_idx % tail_rows);
 }
 
-// Naive per-row FFN compute (replaces dispatch_gemm's TK warpgroup grouped GEMM).
-// Each compute CTA strides over dispatched rows. For row r (after waiting on its
-// dispatch barrier) it runs gemm1 -> SwiGLU -> gemm2 with fp32 accumulation:
-// h1[2I]      = post_tokens[r] @ W1[e]^T   (W1[e] = [2I, H], gate | up)
-// act[I]      = silu(h1[:I]) * h1[I:]      (staged in dynamic shared)
-// y_expert[r] = act @ W2[e]^T              (W2[e] = [H, I])
-// Slow but obviously correct; the point of M2 is fusing it under the same
-// single-kernel RDMA dispatch, not GEMM throughput.
 // ============================================================================
 // Tensor-core grouped GEMM (warpgroup MMA), parameterized to run as gemm1 then
 // gemm2. Body is identical to dispatch_gemm.cu's group_gemm_fused; only the
@@ -648,49 +642,12 @@ __device__ inline void gemm1_swiglu_fused(const fused_globals &G, const int sm_i
     }
 }
 
-// gemm1 (post_tokens @ w1 -> h1, waits dispatch barrier) and gemm2
-// (act @ w2 -> y_expert, no wait). Compile-time K/N from the operator dims.
-__device__ inline void ffn_gemm1(const fused_globals &G, int sm_idx, int num_sms) {
-    grouped_gemm<fused_globals::H / fused_globals::RED_BLOCK,
-                 fused_globals::I2 / fused_globals::COL_BLOCK, true>(
-        G, sm_idx, num_sms, G.post_tokens, G.w1, G.h1);
-}
+// gemm2 (act @ w2 -> y_expert, no dispatch-barrier wait). Compile-time K/N from
+// the operator dims. gemm1 is handled by the fused gemm1_swiglu_fused above.
 __device__ inline void ffn_gemm2(const fused_globals &G, int sm_idx, int num_sms) {
     grouped_gemm<fused_globals::I / fused_globals::RED_BLOCK,
                  fused_globals::H / fused_globals::COL_BLOCK, false>(
         G, sm_idx, num_sms, G.act, G.w2, G.y_expert);
-}
-
-// SwiGLU: act[r,i] = silu(h1[r,i]) * h1[r,I+i], element-wise over all rows.
-// Vectorized: each thread handles 2 adjacent i-values (gate[i],gate[i+1] and
-// up[i],up[i+1] are each contiguous bf16 pairs -> one 32-bit load each), halving
-// loop trips, address math, and using 128-bit-friendly access patterns.
-__device__ inline void swiglu_phase(const fused_globals &G) {
-    constexpr int I = fused_globals::I, I2 = fused_globals::I2;
-    constexpr int VEC = 8;          // bf16 elements per thread (128-bit access)
-    constexpr int IV = I / VEC;     // 8-wide groups per row
-    const long total = (long)G.num_padded_local_tokens * IV;
-    for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
-         idx += (long)gridDim.x * blockDim.x) {
-        const int r = idx / IV, j = idx % IV;   // j-th 8-element group
-        const __nv_bfloat16* h1r = G.h1_ptr + (size_t)r * I2;
-        // 128-bit (float4) loads of the gate and up halves.
-        float4 gv = reinterpret_cast<const float4*>(h1r)[j];
-        float4 uv = reinterpret_cast<const float4*>(h1r + I)[j];
-        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gv);
-        const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(&uv);
-        float4 out;
-        __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(&out);
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            float g0 = __low2float(g2[k]),  g1 = __high2float(g2[k]);
-            float u0 = __low2float(u2[k]),  u1 = __high2float(u2[k]);
-            float a0 = (g0 / (1.0f + __expf(-g0))) * u0;
-            float a1 = (g1 / (1.0f + __expf(-g1))) * u1;
-            o2[k] = __floats2bfloat162_rn(a0, a1);
-        }
-        reinterpret_cast<float4*>(G.act_ptr + (size_t)r * I)[j] = out;
-    }
 }
 
 // Intra-node combine: scatter-add weight*y_expert into the token-owner GPU's

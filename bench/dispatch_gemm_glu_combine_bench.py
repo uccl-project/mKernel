@@ -588,8 +588,7 @@ def main():
                                    device="cuda", dtype=torch.bfloat16)
         y_expert = torch.zeros((num_padded_local, H),
                                device="cuda", dtype=torch.bfloat16)
-        # GEMM intermediates (HBM): gemm1 output / gemm2 input.
-        h1 = torch.zeros((num_padded_local, 2 * I), device="cuda", dtype=torch.bfloat16)
+        # GEMM intermediate (HBM): gemm1+SwiGLU output / gemm2 input.
         act = torch.zeros((num_padded_local, I), device="cuda", dtype=torch.bfloat16)
 
         # Combine output: per-GPU [num_local_tokens, H] fp32, IPC-shared across
@@ -674,7 +673,7 @@ def main():
         def run_once():
             mod.moe_dispatch_gemm_glu_combine_fused(
                 pre_tokens, peer_tokens, copy_ready,
-                post_tokens, w1, w2, h1, act, y_expert, row_expert, topk_weights,
+                post_tokens, w1, w2, act, y_expert, row_expert, topk_weights,
                 padded_ppe, pull_idx,
                 local_rb_per_expert, barrier, sync_barrier, y_out,
                 comb_buf, owner_offset_t, row_to_slot_t, row_to_owner_t,
@@ -861,7 +860,7 @@ def main():
             for local_e in range(num_experts_per_dev):
                 rows = padded_list[expert_start + local_e]
                 if rows > 0:
-                    # NB: distinct names so we don't shadow the kernel's h1/act buffers.
+                    # Reference SwiGLU FFN (underscored locals; the kernel fuses this).
                     _h1 = post_g_all[row_off2:row_off2 + rows] @ w1f[local_e]
                     _act = torch.nn.functional.silu(_h1[:, :I]) * _h1[:, I:]
                     _ = _act @ w2f[local_e]
