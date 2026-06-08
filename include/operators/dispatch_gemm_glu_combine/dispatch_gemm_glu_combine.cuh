@@ -1,42 +1,28 @@
 #pragma once
 
 /**
- * @file dispatch_gemm.cuh
- * @brief Multi-node MoE Dispatch + Group GEMM.
+ * @file dispatch_gemm_glu_combine.cuh
+ * @brief Multi-node fused MoE FFN: dispatch -> gemm1+SwiGLU -> gemm2 -> combine,
+ *        in a single persistent kernel. Config, globals, host setup, entrypoint.
  *
- * Uses the intra-node dispatch pattern (pre_tokens_distributed_tensor +
- * pull-based dispatch + per-row-block barrier counter + per-expert GEMM
- * with NUM_EXPERTS_PER_DEV experts per GPU) plus an inter-node phase that
- * exchanges pre_tokens with every remote node so each node can dispatch
- * from the full N*M-GPU token set.
+ * Builds on the intra-node dispatch pattern (pre_tokens_distributed_tensor +
+ * pull-based dispatch + per-row-block barrier counter + per-expert GEMM with
+ * NUM_EXPERTS_PER_DEV experts per GPU) and adds the full MoE FFN plus the
+ * all-to-all combine back to the token owners. Let M = INTRA_NUM_DEVICES,
+ * N = num_nodes: N*M GPUs total, M per node, NUM_EXPERTS_PER_DEV = NUM_EXPERTS/(N*M).
  *
- * Let M = INTRA_NUM_DEVICES, N = num_nodes:
- *   - N*M GPUs total, M per node.
- *   - NUM_EXPERTS_PER_DEV = NUM_EXPERTS / (N*M).
- *   - Each GPU has its own num_local_tokens tokens in pre_tokens DistBuffer.
- *   - After inter-node exchange, each GPU has access to:
- *       (a) Local node's M pre_tokens slots via pre_tokens_distributed_tensor.
- *       (b) Every remote node's M pre_tokens slots via
- *           peer_tokens_distributed_tensor[peer_slot] — populated by RDMA
- *           writes from each peer node plus a local D2D copy into the
- *           IPC-shared DistBuffer.
- *
- * Three logical phases:
- *   Phase 1 (inter-node exchange):
- *     RDMA send pre_tokens to the same-index GPU on every remote node.
- *     Each peer lands in its own slot of recv_buf (RDMA-registered).
- *   Phase 2 (intra-node copy + dispatch):
- *     Each GPU copies its recv_buf slots into peer_tokens_distributed_tensor
- *     (IPC-shared across the M local GPUs). Dispatch SMs then pull tokens
- *     from either pre_tokens_distributed_tensor or
- *     peer_tokens_distributed_tensor[peer_slot] based on
- *     pull_dispatch_indices (columns: src_node, src_dev, src_token).
- *   Phase 3 (group GEMM):
- *     Each GPU computes GEMMs for its assigned experts.
- *
- * Hot path is a single fused kernel launch (`fused()`) that overlaps the
- * inter-node RDMA exchange, intra-node D2D copy, dispatch, and per-expert
- * GEMM in one grid.
+ * The hot path is one launch (`fused()`); the kernel body (dispatch_gemm_glu_combine.cu)
+ * runs as:
+ *   Dispatch: RDMA-exchange pre_tokens with every remote node (same-index GPU),
+ *     land peers via IPC-shared peer_tokens, and pull each expert's rows into
+ *     post_tokens (src_node/src_dev/src_token from pull_dispatch_indices). CTA
+ *     roles (send / copy / dispatch / compute) overlap this with the GEMMs.
+ *   gemm1+SwiGLU (fused): post_tokens @ w1 -> silu(gate)*up -> act, with SwiGLU
+ *     applied in the gemm1 epilogue (no h1[M,2I] HBM round-trip).
+ *   gemm2: act @ w2 -> y_expert.
+ *   Combine: scatter weighted expert outputs to each token owner over IPC, gather
+ *     -reduce into y_out, and RDMA the cross-node contributions back; an in-kernel
+ *     cross-node handshake makes the combine self-contained (done before exit).
  */
 
 #include "common/types.cuh"
@@ -175,14 +161,12 @@ struct fused_globals {
     using pre_tokens_distributed_tensor  = dist::distributed_tensor<dist::local_tensor<bf16, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
     using peer_tokens_distributed_tensor = dist::distributed_tensor<dist::local_tensor<bf16, 1, 1, -1, H, token_vec>, NUM_DEVICES, false>;
     using copy_ready_distributed_tensor  = dist::distributed_tensor<dist::local_tensor<int, -1, -1, -1, -1>, NUM_DEVICES, false>;
-    // Tensor-core grouped GEMM tensors (same warpgroup-MMA pipeline as
-    // dispatch_gemm, instantiated for gemm1 then gemm2):
-    // gemm1: post_tokens[M,H] @ w1[e][H,2I] -> h1[M,2I]
-    // gemm2: act[M,I]         @ w2[e][I,H]  -> y_expert[M,H]
+    // Tensor-core grouped GEMM tensors (warpgroup-MMA pipeline):
+    // gemm1+SwiGLU: post_tokens[M,H] @ w1[e][H,2I] -> silu(gate)*up -> act[M,I]
+    // gemm2:        act[M,I]         @ w2[e][I,H]  -> y_expert[M,H]
     using post_tokens_local_tensor = dist::local_tensor<bf16, 1, 1, -1, H, token_vec, A_tile>;
     // w1 gets the 128-wide B1_tile descriptor (gemm1 fusion) in addition to B_tile.
     using w1_local_tensor   = dist::local_tensor<bf16, 1, NUM_EXPERTS_PER_DEV, H, I2, B_tile, B1_tile>;
-    using h1_local_tensor   = dist::local_tensor<bf16, 1, 1, -1, I2, C_tile>;
     // act gets the 128-wide ACT1_tile store descriptor (gemm1 fusion) plus its
     // A_tile gemm2-load descriptor.
     using act_local_tensor  = dist::local_tensor<bf16, 1, 1, -1, I, act_vec, A_tile, ACT1_tile>;
@@ -216,12 +200,9 @@ struct fused_globals {
     copy_ready_distributed_tensor copy_ready;
     post_tokens_local_tensor post_tokens;   // gemm1 A  [num_padded, H]
     w1_local_tensor          w1;            // gemm1 B  [E, H, 2I]
-    h1_local_tensor          h1;            // gemm1 C / swiglu in  [num_padded, 2I]
-    act_local_tensor         act;           // swiglu out / gemm2 A [num_padded, I]
+    act_local_tensor         act;           // gemm1+SwiGLU out / gemm2 A [num_padded, I]
     w2_local_tensor          w2;            // gemm2 B  [E, I, H]
     y_expert_local_tensor    y_expert;      // gemm2 C  [num_padded, H]
-    __nv_bfloat16*       h1_ptr;            // [num_padded, 2I] (SwiGLU read)
-    __nv_bfloat16*       act_ptr;           // [num_padded, I]  (SwiGLU write)
     const __nv_bfloat16* y_expert_ptr;      // [num_padded, H]  (combine read)
     const int*   row_expert_ptr;            // [num_padded] local expert id, -1 = padding
     const float* topk_weights_ptr;          // [num_padded] combine weight per dispatched row
@@ -330,7 +311,6 @@ void fused(
     at::Tensor &post_tokens,
     at::Tensor &w1,
     at::Tensor &w2,
-    at::Tensor &h1,
     at::Tensor &act,
     at::Tensor &y_expert,
     at::Tensor &row_expert,
@@ -506,12 +486,9 @@ void fused(
         .copy_ready = ::dist::distributed_tensor_from_buffer<fused_globals::copy_ready_distributed_tensor>(copy_ready),
         .post_tokens = ::dist::local_tensor_from_tensor<fused_globals::post_tokens_local_tensor>(post_tokens),
         .w1 = ::dist::local_tensor_from_tensor<fused_globals::w1_local_tensor>(w1),
-        .h1 = ::dist::local_tensor_from_tensor<fused_globals::h1_local_tensor>(h1),
         .act = ::dist::local_tensor_from_tensor<fused_globals::act_local_tensor>(act),
         .w2 = ::dist::local_tensor_from_tensor<fused_globals::w2_local_tensor>(w2),
         .y_expert = ::dist::local_tensor_from_tensor<fused_globals::y_expert_local_tensor>(y_expert),
-        .h1_ptr = reinterpret_cast<__nv_bfloat16*>(h1.data_ptr()),
-        .act_ptr = reinterpret_cast<__nv_bfloat16*>(act.data_ptr()),
         .y_expert_ptr = reinterpret_cast<const __nv_bfloat16*>(y_expert.data_ptr()),
         .row_expert_ptr = row_expert.data_ptr<int>(),
         .topk_weights_ptr = topk_weights.data_ptr<float>(),
