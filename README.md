@@ -98,7 +98,19 @@ Both backends share the same host-side API and the same on-GPU kernel; only the 
 
 ## Acknowledgements
 
-The MMA / compute code is adapted from [ThunderKittens](https://github.com/HazyResearch/ThunderKittens) (HazyResearch). Many thanks to the TK authors.
+The MMA code is adapted from [ThunderKittens](https://github.com/HazyResearch/ThunderKittens) (HazyResearch). Many thanks to the TK authors.
+
+## Citation
+
+```bibtex
+@misc{mao2026mkernel,
+  title        = {mKernel: Fast Multi-GPU, Multi-Node Fused Kernels},
+  author       = {Mao, Ziming and Raiciu, Costin and Zhou, Yang and Shenker, Scott and Stoica, Ion},
+  year         = {2026},
+  month        = may,
+  url          = {https://uccl-project.github.io/posts/mkernel/},
+}
+```
 
 ## License
 
