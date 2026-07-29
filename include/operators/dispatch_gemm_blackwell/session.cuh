@@ -8,6 +8,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("pre_tokens"),
           pybind11::arg("post_tokens"),
           pybind11::arg("pull_dispatch_indices"),
+          pybind11::arg("row_ready"),
           pybind11::arg("num_dispatch_sms"));
     m.def("dummy_weight_load", &moe_dispatch_gemm_blackwell::dummy_weight_load,
           pybind11::arg("weights"),
@@ -15,4 +16,3 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("row_tile"),
           pybind11::arg("col_tile"));
 }
-

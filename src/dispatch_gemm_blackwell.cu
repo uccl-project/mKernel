@@ -19,27 +19,58 @@ __device__ inline void dispatch_slice(const dispatch_globals &G, int slice) {
     __shared__ semaphore arrived[dispatch_globals::TOKENS_PER_BLOCK];
 
     const int lane = threadIdx.x;
-    if (lane >= dispatch_globals::TOKENS_PER_BLOCK)
-        return;
-
     const int dst_token = slice * dispatch_globals::TOKENS_PER_BLOCK + lane;
-    if (dst_token >= G.num_output_tokens)
-        return;
+    const bool valid_dst =
+        lane < dispatch_globals::TOKENS_PER_BLOCK &&
+        dst_token < G.num_output_tokens;
 
-    const int src_gpu = G.pull_dispatch_indices[{dst_token, 0}];
-    const int src_token = G.pull_dispatch_indices[{dst_token, 1}];
-    if (src_gpu < 0 || src_token < 0)
-        return;  // padded row; caller initializes post_tokens to zero.
+    if (valid_dst) {
+        const int src_gpu = G.pull_dispatch_indices[{dst_token, 0}];
+        const int src_token = G.pull_dispatch_indices[{dst_token, 1}];
 
-    init_semaphore(arrived[lane], 0, 1);
-    ::dist::tma::expect_bytes(arrived[lane],
-                              sizeof(dispatch_globals::token_vec));
-    ::dist::tma::load_async(tokens[lane], G.pre_tokens[src_gpu],
-                            {src_token, 0}, arrived[lane]);
-    wait(arrived[lane], 0);
+        // Negative source coordinates represent a padded row. post_tokens is
+        // initialized to zero by the caller, but the row still counts toward
+        // readiness because GEMM consumes the padded row block as a whole.
+        if (src_gpu >= 0 && src_token >= 0) {
+            init_semaphore(arrived[lane], 0, 1);
+            ::dist::tma::expect_bytes(arrived[lane],
+                                      sizeof(dispatch_globals::token_vec));
+            ::dist::tma::load_async(tokens[lane], G.pre_tokens[src_gpu],
+                                    {src_token, 0}, arrived[lane]);
+            wait(arrived[lane], 0);
 
-    ::dist::tma::store_async(G.post_tokens, tokens[lane], {dst_token, 0});
-    ::dist::tma::store_async_wait();
+            ::dist::tma::store_async(G.post_tokens, tokens[lane],
+                                     {dst_token, 0});
+            ::dist::tma::store_async_wait();
+        }
+    }
+
+    // All lanes, including inactive lanes 16..31, reach this point. Therefore
+    // lane 0 publishes readiness only after every valid lane has completed its
+    // post_tokens TMA store.
+    const unsigned valid_mask = __ballot_sync(0xffffffffu, valid_dst);
+    __syncwarp();
+    if (lane == 0 && valid_mask != 0u) {
+        constexpr int SLICES_PER_ROW_BLOCK =
+            dispatch_globals::ROW_BLOCK / dispatch_globals::TOKENS_PER_BLOCK;
+        const int row_block = slice / SLICES_PER_ROW_BLOCK;
+        comm::atomic_u32::release_add_gpu(
+            &G.row_ready[{row_block}], __popc(valid_mask));
+    }
+}
+
+// Consumer-side half of the dispatch/GEMM handoff. The future tcgen05 loader
+// calls this before TMA-loading an A tile from the corresponding row block.
+__device__ inline void wait_row_ready(const dispatch_globals &G,
+                                      int row_block,
+                                      int expected_rows) {
+    int ready = comm::atomic_u32::acquire_load_s32_gpu(
+        &G.row_ready[{row_block}]);
+    while (ready != expected_rows) {
+        __nanosleep(64);
+        ready = comm::atomic_u32::acquire_load_s32_gpu(
+            &G.row_ready[{row_block}]);
+    }
 }
 
 __global__ __launch_bounds__(NUM_DISPATCH_THREADS, 1)
@@ -87,4 +118,3 @@ void launch_dummy_weight_load(const weight_load_globals& G,
 
 
 // [TODO:yihan] replace with tcgen05
-

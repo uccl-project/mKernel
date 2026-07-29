@@ -17,6 +17,7 @@
 #include "memory/tk_ops_thread_memory_vec_tma.cuh"
 #include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "dist/tma.cuh"
+#include "comm/comm.cuh"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -38,6 +39,7 @@ struct dispatch_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int H = TK_MOE_H;
     static constexpr int TOKENS_PER_BLOCK = 16;
+    static constexpr int ROW_BLOCK = 128;
 
     using token_vec = sv_bf<H>;
     using pre_tokens_distributed_tensor = dist::distributed_tensor<
@@ -47,10 +49,13 @@ struct dispatch_globals {
         dist::local_tensor<bf16, 1, 1, -1, H, token_vec>;
     using pull_dispatch_indices_local_tensor =
         dist::local_tensor<int, 1, 1, -1, 2>;
+    using row_ready_local_tensor =
+        dist::local_tensor<int, 1, 1, 1, -1>;
 
     pre_tokens_distributed_tensor pre_tokens;
     post_tokens_local_tensor post_tokens;
     pull_dispatch_indices_local_tensor pull_dispatch_indices;
+    row_ready_local_tensor row_ready;
     int num_output_tokens;
     int num_dispatch_sms;
 };
@@ -75,6 +80,7 @@ inline void dispatch(
     dist::ParallelBuffer &pre_tokens,
     at::Tensor &post_tokens,
     at::Tensor &pull_dispatch_indices,
+    at::Tensor &row_ready,
     int num_dispatch_sms
 ) {
     const int dev_idx = pre_tokens.local_rank_;
@@ -90,6 +96,14 @@ inline void dispatch(
                 pull_dispatch_indices.size(0) == post_tokens.size(0) &&
                 pull_dispatch_indices.size(1) == 2,
                 "pull_dispatch_indices must have shape [N, 2]");
+    const int num_row_blocks =
+        (static_cast<int>(post_tokens.size(0)) + dispatch_globals::ROW_BLOCK - 1) /
+        dispatch_globals::ROW_BLOCK;
+    TORCH_CHECK(row_ready.dim() == 1 &&
+                row_ready.size(0) == num_row_blocks &&
+                row_ready.scalar_type() == at::kInt &&
+                row_ready.is_contiguous(),
+                "row_ready must be contiguous int32 [ceil(N / 128)]");
     TORCH_CHECK(num_dispatch_sms > 0, "num_dispatch_sms must be positive");
 
     dispatch_globals G{
@@ -100,6 +114,8 @@ inline void dispatch(
         .pull_dispatch_indices = ::dist::local_tensor_from_tensor<
             dispatch_globals::pull_dispatch_indices_local_tensor>(
                 pull_dispatch_indices),
+        .row_ready = ::dist::local_tensor_from_tensor<
+            dispatch_globals::row_ready_local_tensor>(row_ready),
         .num_output_tokens = static_cast<int>(post_tokens.size(0)),
         .num_dispatch_sms = num_dispatch_sms,
     };
@@ -137,4 +153,3 @@ inline void dummy_weight_load(
 }
 
 }  // namespace moe_dispatch_gemm_blackwell
-
