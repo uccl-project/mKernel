@@ -35,6 +35,8 @@ __device__ inline void dispatch_slice(const dispatch_globals &G, int slice) {
             init_semaphore(arrived[lane], 0, 1);
             ::dist::tma::expect_bytes(arrived[lane],
                                       sizeof(dispatch_globals::token_vec));
+
+            // [TODO:yihan] split into 2 pass for further opt, local weights can get to gemm while overlapping with loading from peer rank
             ::dist::tma::load_async(tokens[lane], G.pre_tokens[src_gpu],
                                     {src_token, 0}, arrived[lane]);
             wait(arrived[lane], 0);
