@@ -2,9 +2,8 @@
  * @file dispatch_gemm_blackwell.cu
  * @brief Single NVLink-domain MoE token gather using peer TMA/LSA.
  *
- * This is stage 1 of the Blackwell dispatch+GEMM port.  It replaces the full
- * RDMA send/copy/arrival protocol with direct loads from the owning GPU.  The
- * tcgen05 consumer will be added after this producer is validated separately.
+ * It replaces the RDMA send/copy/arrival protocol with direct loads from the
+ * owning GPU, then consumes the gathered rows with a persistent tcgen05 GEMM.
  */
 #include "operators/dispatch_gemm_blackwell/dispatch_gemm_blackwell.cuh"
 
@@ -62,8 +61,8 @@ __device__ inline void dispatch_slice(const Globals &G, int slice) {
     }
 }
 
-// Consumer-side half of the dispatch/GEMM handoff. The future tcgen05 loader
-// calls this before TMA-loading an A tile from the corresponding row block.
+// Consumer-side half of the dispatch/GEMM handoff. The tcgen05 loader calls
+// this before TMA-loading an A tile from the corresponding row block.
 template<typename Globals>
 __device__ inline void wait_row_ready(const Globals &G,
                                       int row_block,
