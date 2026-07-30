@@ -114,6 +114,104 @@ void launch_dummy_weight_load(const weight_load_globals& G,
     dummy_weight_load_kernel<<<1, 32, 0, stream>>>(G);
 }
 
+__global__ __launch_bounds__(256, 1)
+void tcgen05_micro_kernel(
+    const __grid_constant__ tcgen05_micro_globals G) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator allocator(&__shm[0]);
+    tcgen05_micro_globals::A_tile &A_smem =
+        allocator.allocate<tcgen05_micro_globals::A_tile>();
+    tcgen05_micro_globals::B_tile &B_smem =
+        allocator.allocate<tcgen05_micro_globals::B_tile>();
+    tcgen05_micro_globals::C_tile &C_smem =
+        allocator.allocate<tcgen05_micro_globals::C_tile>();
+
+    __shared__ semaphore inputs_arrived;
+    __shared__ semaphore inputs_finished;
+    __shared__ semaphore outputs_arrived;
+    __shared__ semaphore tmem_provisioned;
+    __shared__ uint32_t tmem_addr;
+
+    if (threadIdx.x == 0) {
+        init_semaphore(inputs_arrived, 0, 1);
+        init_semaphore(inputs_finished, 0, 1);
+        init_semaphore(outputs_arrived, 0, 1);
+        init_semaphore(tmem_provisioned, 0, 1);
+    }
+    __syncthreads();
+
+    tensor_allocator<1> tm_allocator;
+    using C_tmem = tt<float, 128, 256>;
+
+    const int wg = warpgroup::groupid();
+    const int warp_in_wg = warpgroup::warpid();
+    const int lane = warp::laneid();
+
+    if (wg == 0) {
+        // TMEM allocation is a warp-wide instruction.
+        if (warp_in_wg == 0) {
+            tm_allocator.provision(tmem_addr);
+            if (lane == 0)
+                arrive(tmem_provisioned);
+        }
+
+        wait(tmem_provisioned, 0);
+        tm_allocator.set_addr(tmem_addr);
+        C_tmem C_tm = tm_allocator.allocate<C_tmem>(0);
+
+        wait(outputs_arrived, 0);
+        rt_bf<32, 32> C_reg;
+
+        #pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            warpgroup::load_async(
+                C_reg, C_tm.template subtile<tt<float, 128, 32>>(0, n * 32));
+            tensor_load_wait();
+            tensor_before_thread_sync();
+            warpgroup::sync(1);
+
+            warpgroup::store(C_smem, C_reg);
+            warpgroup::sync(1);
+            if (warp_in_wg == 0 && lane == 0) {
+                ::dist::tma::store_async(G.C, C_smem, {0, n});
+                ::dist::tma::store_async_wait();
+            }
+            warpgroup::sync(1);
+        }
+
+        if (warp_in_wg == 0)
+            tm_allocator.deprovision();
+    } else {
+        if (warp_in_wg == 3 && lane == 0) {
+            ::dist::tma::expect_bytes(
+                inputs_arrived,
+                sizeof(tcgen05_micro_globals::A_tile) +
+                sizeof(tcgen05_micro_globals::B_tile));
+            ::dist::tma::load_async(A_smem, G.A, {0, 0}, inputs_arrived);
+            ::dist::tma::load_async(B_smem, G.B, {0, 0}, inputs_arrived);
+        } else if (warp_in_wg == 0 && lane == 0) {
+            wait(tmem_provisioned, 0);
+            tm_allocator.set_addr(tmem_addr);
+            C_tmem C_tm = tm_allocator.allocate<C_tmem>(0);
+            wait(inputs_arrived, 0);
+            warpgroup::mm_AB(C_tm, A_smem, B_smem, inputs_finished);
+            tensor_commit<1>(outputs_arrived);
+        }
+    }
+}
+
+void launch_tcgen05_micro(const tcgen05_micro_globals& G,
+                          cudaStream_t stream) {
+    constexpr int SHMEM_BYTES =
+        sizeof(tcgen05_micro_globals::A_tile) +
+        sizeof(tcgen05_micro_globals::B_tile) +
+        sizeof(tcgen05_micro_globals::C_tile) + 1024;
+    cudaFuncSetAttribute(tcgen05_micro_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         SHMEM_BYTES);
+    tcgen05_micro_kernel<<<1, 256, SHMEM_BYTES, stream>>>(G);
+}
+
 }  // namespace moe_dispatch_gemm_blackwell
 
 #include "operators/dispatch_gemm_blackwell/session.cuh"

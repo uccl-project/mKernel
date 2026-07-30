@@ -28,7 +28,17 @@ __device__ static inline uint64_t matrix_descriptor_raw(
     uint32_t stride_dim_offset,
     uint32_t swizzle_mode
 ) {
+    // tcgen05 shared-memory descriptors require the Blackwell format bit.
+    // Key this off the actual device architecture so the same release header
+    // remains usable by the existing Hopper targets.
+    constexpr uint64_t blackwell_format =
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+        (1ull << 46);
+#else
+        0ull;
+#endif
     return matrix_descriptor_encode(reinterpret_cast<uint64_t>(addr)) |
+           blackwell_format |
            matrix_descriptor_encode((uint64_t)leading_dim_offset) << 16 |
            matrix_descriptor_encode((uint64_t)stride_dim_offset) << 32 |
            (uint64_t)swizzle_mode << 62;
@@ -114,4 +124,3 @@ template<typename T> using get_st = typename st_getter<T>::type;
 } // namespace ducks
 
 } // namespace kittens
-

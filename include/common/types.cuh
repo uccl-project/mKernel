@@ -13,6 +13,7 @@
 #include "tk_types_register_rt.cuh"
 #include "tk_types_shared_st.cuh"
 #include "tk_types_shared_descriptor.cuh"
+#include "tk_types_tensor.cuh"
 #include "tk_types_global_util.cuh"
 
 namespace kittens {

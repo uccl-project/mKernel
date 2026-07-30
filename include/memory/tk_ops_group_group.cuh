@@ -50,6 +50,8 @@ __device__ static inline void arrive(int id) {
 #include "tk_ops_group_register_tile_reductions.cuh"
 #include "tk_ops_group_register_vec_maps.cuh"
 #include "tk_ops_group_mma_warpgroup.cuh"
+#include "tk_ops_group_mma_tcgen05_bf16.cuh"
+#include "tk_ops_group_memory_tile_tensor_to_register.cuh"
 #include "tk_ops_group_util_sync.cuh"
 
 
