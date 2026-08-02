@@ -53,15 +53,17 @@ struct fused_globals {
         1 + PROFILE_TASKS * PROFILE_FIELDS_PER_TASK;
 
     using token_vec = sv_bf<H>;
+    using dispatch_tile = st_bf<TOKENS_PER_BLOCK, 256, false>;
     using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
     using C_tile = st_bf<ROW_BLOCK, 32>;
 
     using pre_tokens_tensor = dist::distributed_tensor<
-        dist::local_tensor<bf16, 1, 1, -1, H, token_vec>,
+        dist::local_tensor<bf16, 1, 1, -1, H, token_vec, dispatch_tile>,
         NUM_DEVICES, false>;
     using post_tokens_tensor =
-        dist::local_tensor<bf16, 1, 1, -1, H, token_vec, A_tile>;
+        dist::local_tensor<bf16, 1, 1, -1, H,
+                           token_vec, dispatch_tile, A_tile>;
     using routes_tensor = dist::local_tensor<int, 1, 1, -1, 2>;
     using row_ready_tensor = dist::local_tensor<int, 1, 1, 1, -1>;
     using weights_tensor =
