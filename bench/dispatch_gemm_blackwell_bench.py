@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
                             "MKERNEL_DISPATCH_GEMM_ROUTING", "multinomial"))
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--dispatch-sms", type=int, default=44)
     parser.add_argument("--gemm-sms", type=int, default=108)
     parser.add_argument("--check", action="store_true")
@@ -209,21 +210,23 @@ def main() -> None:
             torch.cuda.synchronize()
         dist.barrier()
 
-        samples = []
-        for _ in range(args.iters):
-            row_ready.zero_()
+        trial_ms = []
+        for _ in range(args.trials):
+            dist.barrier()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            launch(mod, problem, args.dispatch_sms, args.gemm_sms)
+            for _ in range(args.iters):
+                row_ready.zero_()
+                launch(mod, problem, args.dispatch_sms, args.gemm_sms)
             end.record()
             end.synchronize()
-            samples.append(start.elapsed_time(end))
-
-        rank_avg = torch.tensor(
-            [sum(samples) / len(samples)], device="cuda", dtype=torch.float64)
-        dist.all_reduce(rank_avg, op=dist.ReduceOp.MAX)
-        avg_ms = rank_avg.item()
+            rank_avg = torch.tensor(
+                [start.elapsed_time(end) / args.iters],
+                device="cuda", dtype=torch.float64)
+            dist.all_reduce(rank_avg, op=dist.ReduceOp.MAX)
+            trial_ms.append(rank_avg.item())
+        avg_ms = sorted(trial_ms)[len(trial_ms) // 2]
         useful_tflops = 2.0 * max_actual_rows * H * I / (avg_ms * 1e9)
         padded_tflops = 2.0 * max_padded_rows * H * I / (avg_ms * 1e9)
 

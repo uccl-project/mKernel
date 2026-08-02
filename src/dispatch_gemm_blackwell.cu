@@ -347,7 +347,11 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
         }
     } else if (warp_in_wg == 3 && lane == 0) {
         int stage = 0;
-        int finished_phase[fused_globals::PIPELINE_STAGES] = {1, 1, 1};
+        int finished_phase[fused_globals::PIPELINE_STAGES];
+        #pragma unroll
+        for (int i = 0; i < fused_globals::PIPELINE_STAGES; ++i) {
+            finished_phase[i] = 1;
+        }
         int task_index = 0;
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
@@ -383,7 +387,11 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
         }
     } else if (warp_in_wg == 0 && lane == 0) {
         int stage = 0;
-        int arrived_phase[fused_globals::PIPELINE_STAGES] = {0, 0, 0};
+        int arrived_phase[fused_globals::PIPELINE_STAGES];
+        #pragma unroll
+        for (int i = 0; i < fused_globals::PIPELINE_STAGES; ++i) {
+            arrived_phase[i] = 0;
+        }
         int output_stage = 0;
         int reuse_phase[fused_globals::OUTPUT_STAGES] = {1, 1};
         int task_index = 0;
@@ -452,8 +460,9 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
             (G.num_output_tokens + fused_globals::TOKENS_PER_BLOCK - 1) /
             fused_globals::TOKENS_PER_BLOCK;
         for (int slice = blockIdx.x; slice < total_slices;
-             slice += G.num_dispatch_sms)
+             slice += G.num_dispatch_sms) {
             dispatch_slice(G, slice);
+        }
     } else {
         gemm_sm<PROFILE>(G, blockIdx.x - G.num_dispatch_sms);
     }

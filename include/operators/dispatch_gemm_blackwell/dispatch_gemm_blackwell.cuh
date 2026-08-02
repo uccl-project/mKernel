@@ -44,7 +44,7 @@ struct fused_globals {
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
     static constexpr int TOKENS_PER_BLOCK = 16;
-    static constexpr int PIPELINE_STAGES = 3;
+    static constexpr int PIPELINE_STAGES = 4;
     static constexpr int OUTPUT_STAGES = 2;
     static constexpr int SUPER_M = 8;
     static constexpr int PROFILE_TASKS = 2;
