@@ -15,39 +15,61 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
     fused_globals::token_vec (&tokens)[fused_globals::TOKENS_PER_BLOCK] =
         allocator.allocate<fused_globals::token_vec,
                            fused_globals::TOKENS_PER_BLOCK>();
-    __shared__ semaphore arrived[fused_globals::TOKENS_PER_BLOCK];
+    __shared__ semaphore arrived;
+    __shared__ int src_gpus[fused_globals::TOKENS_PER_BLOCK];
+    __shared__ int src_tokens[fused_globals::TOKENS_PER_BLOCK];
 
     const int lane = threadIdx.x;
+    if (lane >= 32)
+        return;
+
     const int dst_token = slice * fused_globals::TOKENS_PER_BLOCK + lane;
     const bool valid_dst =
         lane < fused_globals::TOKENS_PER_BLOCK &&
         dst_token < G.num_output_tokens;
+    int src_gpu = -1;
+    int src_token = -1;
 
     if (valid_dst) {
-        const int src_gpu = G.pull_dispatch_indices[{dst_token, 0}];
-        const int src_token = G.pull_dispatch_indices[{dst_token, 1}];
+        src_gpu = G.pull_dispatch_indices[{dst_token, 0}];
+        src_token = G.pull_dispatch_indices[{dst_token, 1}];
+    }
+    if (lane < fused_globals::TOKENS_PER_BLOCK) {
+        src_gpus[lane] = src_gpu;
+        src_tokens[lane] = src_token;
+    }
+    __syncwarp();
 
-        // Negative source coordinates represent a padded row. post_tokens is
-        // initialized to zero by the caller, but the row still counts toward
-        // readiness because GEMM consumes the padded row block as a whole.
-        if (src_gpu >= 0 && src_token >= 0) {
-            init_semaphore(arrived[lane], 0, 1);
-            ::dist::tma::expect_bytes(arrived[lane],
-                                      sizeof(fused_globals::token_vec));
+    // One elected thread issues the whole peer-TMA batch into one mbarrier.
+    // Negative coordinates are padded rows and intentionally have no payload.
+    if (lane == 0) {
+        int valid_sources = 0;
+        #pragma unroll
+        for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i)
+            valid_sources += src_gpus[i] >= 0 && src_tokens[i] >= 0;
 
-            ::dist::tma::load_async(tokens[lane], G.pre_tokens[src_gpu],
-                                    {src_token, 0}, arrived[lane]);
-            wait(arrived[lane], 0);
-
-            ::dist::tma::store_async(G.post_tokens, tokens[lane],
-                                     {dst_token, 0});
-            ::dist::tma::store_async_wait();
+        if (valid_sources != 0) {
+            init_semaphore(arrived, 0, 1);
+            ::dist::tma::expect_bytes(
+                arrived, valid_sources * sizeof(fused_globals::token_vec));
+            #pragma unroll
+            for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
+                if (src_gpus[i] >= 0 && src_tokens[i] >= 0) {
+                    ::dist::tma::load_async(
+                        tokens[i], G.pre_tokens[src_gpus[i]],
+                        {src_tokens[i], 0}, arrived);
+                }
+            }
+            wait(arrived, 0);
         }
     }
+    __syncwarp();
 
-    // All lanes, including inactive lanes 16..31, reach this point. Therefore
-    // lane 0 publishes readiness only after every valid lane has completed its
-    // post_tokens TMA store.
+    if (valid_dst && src_gpu >= 0 && src_token >= 0) {
+        ::dist::tma::store_async(G.post_tokens, tokens[lane], {dst_token, 0});
+        ::dist::tma::store_async_wait();
+    }
+
     const unsigned valid_mask = __ballot_sync(0xffffffffu, valid_dst);
     __syncwarp();
     if (lane == 0 && valid_mask != 0u) {
@@ -143,6 +165,26 @@ struct gemm_task_iterator {
     }
 };
 
+enum profile_field : int {
+    PROFILE_ROW_READY_WAIT = 0,
+    PROFILE_INPUT_WAIT = 1,
+    PROFILE_OUTPUT_READY_WAIT = 2,
+    PROFILE_EPILOGUE = 3,
+    PROFILE_OUTPUT_REUSE_WAIT = 4,
+};
+
+__device__ inline void write_profile(const fused_globals &G, int worker,
+                                     int task_index, profile_field field,
+                                     uint64_t cycles) {
+    if (task_index < fused_globals::PROFILE_TASKS) {
+        const int column = 1 +
+            task_index * fused_globals::PROFILE_FIELDS_PER_TASK + field;
+        G.profile[worker * fused_globals::PROFILE_WORDS + column] =
+            static_cast<int64_t>(cycles);
+    }
+}
+
+template<bool PROFILE>
 __device__ inline void gemm_sm(const fused_globals &G, int worker) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator(&__shm[0]);
@@ -193,12 +235,29 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
     if (wg == 0) {
         int output_stage = 0;
         int output_phase[fused_globals::OUTPUT_STAGES] = {0, 0};
+        int task_index = 0;
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
+            uint64_t wait_start = 0;
+            if constexpr (PROFILE) {
+                if (warp_in_wg == 0 && lane == 0)
+                    wait_start = clock64();
+            }
             wait(outputs_arrived[output_stage], output_phase[output_stage]);
+            if constexpr (PROFILE) {
+                if (warp_in_wg == 0 && lane == 0)
+                    write_profile(G, worker, task_index,
+                                  PROFILE_OUTPUT_READY_WAIT,
+                                  clock64() - wait_start);
+            }
             output_phase[output_stage] ^= 1;
 
+            uint64_t epilogue_start = 0;
+            if constexpr (PROFILE) {
+                if (warp_in_wg == 0 && lane == 0)
+                    epilogue_start = clock64();
+            }
             rt_bf<32, 32> C_reg;
             #pragma unroll
             for (int n = 0; n < fused_globals::COL_BLOCK / 32; ++n) {
@@ -224,18 +283,31 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
 
             if (warp_in_wg == 0 && lane == 0)
                 arrive(outputs_finished[output_stage]);
+            if constexpr (PROFILE) {
+                if (warp_in_wg == 0 && lane == 0)
+                    write_profile(G, worker, task_index, PROFILE_EPILOGUE,
+                                  clock64() - epilogue_start);
+            }
             output_stage ^= 1;
+            ++task_index;
         }
     } else if (warp_in_wg == 3 && lane == 0) {
         int stage = 0;
         int finished_phase[fused_globals::PIPELINE_STAGES] = {1, 1, 1};
+        int task_index = 0;
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
             const int expected_rows =
                 min(fused_globals::ROW_BLOCK,
                     G.num_output_tokens - task.row_block * fused_globals::ROW_BLOCK);
+            uint64_t wait_start = 0;
+            if constexpr (PROFILE)
+                wait_start = clock64();
             wait_row_ready(G, task.row_block, expected_rows);
+            if constexpr (PROFILE)
+                write_profile(G, worker, task_index, PROFILE_ROW_READY_WAIT,
+                              clock64() - wait_start);
 
             #pragma unroll 1
             for (int k = 0; k < fused_globals::H / fused_globals::RED_BLOCK; ++k) {
@@ -251,21 +323,36 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
                     {task.expert, k, task.col_block}, inputs_arrived[stage]);
                 stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
             }
+            ++task_index;
         }
     } else if (warp_in_wg == 0 && lane == 0) {
         int stage = 0;
         int arrived_phase[fused_globals::PIPELINE_STAGES] = {0, 0, 0};
         int output_stage = 0;
         int reuse_phase[fused_globals::OUTPUT_STAGES] = {1, 1};
+        int task_index = 0;
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
+            uint64_t reuse_wait_start = 0;
+            if constexpr (PROFILE)
+                reuse_wait_start = clock64();
             wait(outputs_finished[output_stage], reuse_phase[output_stage]);
+            if constexpr (PROFILE)
+                write_profile(G, worker, task_index,
+                              PROFILE_OUTPUT_REUSE_WAIT,
+                              clock64() - reuse_wait_start);
             reuse_phase[output_stage] ^= 1;
 
+            uint64_t input_wait_cycles = 0;
             #pragma unroll 1
             for (int k = 0; k < fused_globals::H / fused_globals::RED_BLOCK; ++k) {
+                uint64_t input_wait_start = 0;
+                if constexpr (PROFILE)
+                    input_wait_start = clock64();
                 wait(inputs_arrived[stage], arrived_phase[stage]);
+                if constexpr (PROFILE)
+                    input_wait_cycles += clock64() - input_wait_start;
                 arrived_phase[stage] ^= 1;
                 if (k == 0)
                     warpgroup::mm_AB(C_tm[output_stage], inputs[stage].A,
@@ -278,8 +365,14 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
                 stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
             }
             tensor_commit<1>(outputs_arrived[output_stage]);
+            if constexpr (PROFILE)
+                write_profile(G, worker, task_index, PROFILE_INPUT_WAIT,
+                              input_wait_cycles);
             output_stage ^= 1;
+            ++task_index;
         }
+        if constexpr (PROFILE)
+            G.profile[worker * fused_globals::PROFILE_WORDS] = task_index;
     }
 
     __syncthreads();
@@ -287,6 +380,7 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
         tm_allocator.deprovision();
 }
 
+template<bool PROFILE>
 __global__ __launch_bounds__(256, 1)
 void fused_kernel(const __grid_constant__ fused_globals G) {
     if (blockIdx.x < G.num_dispatch_sms) {
@@ -297,16 +391,24 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
              slice += G.num_dispatch_sms)
             dispatch_slice(G, slice);
     } else {
-        gemm_sm(G, blockIdx.x - G.num_dispatch_sms);
+        gemm_sm<PROFILE>(G, blockIdx.x - G.num_dispatch_sms);
     }
 }
 
 void launch_fused(const fused_globals& G, cudaStream_t stream) {
-    cudaFuncSetAttribute(fused_kernel,
+    cudaFuncSetAttribute(fused_kernel<false>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          DYNAMIC_SHARED_MEMORY);
-    fused_kernel<<<G.num_dispatch_sms + G.num_gemm_sms, 256,
-                   DYNAMIC_SHARED_MEMORY, stream>>>(G);
+    fused_kernel<false><<<G.num_dispatch_sms + G.num_gemm_sms, 256,
+                          DYNAMIC_SHARED_MEMORY, stream>>>(G);
+}
+
+void launch_fused_profile(const fused_globals& G, cudaStream_t stream) {
+    cudaFuncSetAttribute(fused_kernel<true>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         DYNAMIC_SHARED_MEMORY);
+    fused_kernel<true><<<G.num_dispatch_sms + G.num_gemm_sms, 256,
+                         DYNAMIC_SHARED_MEMORY, stream>>>(G);
 }
 
 }  // namespace moe_dispatch_gemm_blackwell
