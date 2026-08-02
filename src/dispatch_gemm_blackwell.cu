@@ -18,7 +18,6 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
     __shared__ semaphore arrived;
     __shared__ int src_gpus[fused_globals::TOKENS_PER_BLOCK];
     __shared__ int src_tokens[fused_globals::TOKENS_PER_BLOCK];
-    __shared__ int use_tile_path;
 
     const int lane = threadIdx.x;
     if (lane < 32) {
@@ -39,84 +38,38 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
         }
         __syncwarp();
 
+        constexpr uint32_t TOKEN_BYTES = sizeof(fused_globals::token_vec);
+        static_assert(TOKEN_BYTES <= 16 * 1024 && TOKEN_BYTES % 16 == 0);
         if (lane == 0) {
-            use_tile_path = valid_dst && src_gpus[0] >= 0 &&
-                            src_tokens[0] >= 0 &&
-                            src_tokens[0] % fused_globals::TOKENS_PER_BLOCK == 0;
+            int source_rows = 0;
             #pragma unroll
-            for (int i = 1; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
-                use_tile_path = use_tile_path &&
-                                src_gpus[i] == src_gpus[0] &&
-                                src_tokens[i] == src_tokens[0] + i;
+            for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
+                source_rows += src_gpus[i] >= 0 && src_tokens[i] >= 0;
+            }
+            if (source_rows != 0) {
+                init_semaphore(arrived, 0, 1);
+                ::dist::tma::expect_bytes(
+                    arrived, source_rows * sizeof(fused_globals::token_vec));
+                #pragma unroll
+                for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
+                    if (src_gpus[i] >= 0 && src_tokens[i] >= 0) {
+                        const bf16 *src =
+                            G.pre_tokens[src_gpus[i]].raw_ptr +
+                            static_cast<int64_t>(src_tokens[i]) *
+                                fused_globals::H;
+                        ::dist::tma::bulk_load_async(
+                            &tokens[i], src, TOKEN_BYTES, arrived);
+                    }
+                }
+                wait(arrived, 0);
             }
         }
         __syncwarp();
-
-        if (use_tile_path) {
-            if (lane == 0) {
-                auto *tiles = reinterpret_cast<fused_globals::dispatch_tile *>(
-                    &tokens[0]);
-                constexpr int CHUNKS =
-                    fused_globals::H / fused_globals::dispatch_tile::cols;
-                init_semaphore(arrived, 0, 1);
-                ::dist::tma::expect_bytes(
-                    arrived, CHUNKS * sizeof(fused_globals::dispatch_tile));
-                #pragma unroll 1
-                for (int chunk = 0; chunk < CHUNKS; ++chunk) {
-                    ::dist::tma::load_async(
-                        tiles[chunk], G.pre_tokens[src_gpus[0]],
-                        {src_tokens[0] / fused_globals::TOKENS_PER_BLOCK,
-                         chunk}, arrived);
-                }
-                wait(arrived, 0);
-
-                #pragma unroll 1
-                for (int chunk = 0; chunk < CHUNKS; ++chunk) {
-                    ::dist::tma::store_async(
-                        G.post_tokens, tiles[chunk], {slice, chunk});
-                    if (chunk >= 7) {
-                        ::dist::tma::store_async_wait<7>();
-                    }
-                }
-                ::dist::tma::store_async_wait();
-            }
-            __syncwarp();
-        } else {
-            constexpr uint32_t TOKEN_BYTES =
-                sizeof(fused_globals::token_vec);
-            static_assert(TOKEN_BYTES <= 16 * 1024 && TOKEN_BYTES % 16 == 0);
-            if (lane == 0) {
-                int source_rows = 0;
-                #pragma unroll
-                for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
-                    source_rows += src_gpus[i] >= 0 && src_tokens[i] >= 0;
-                }
-                if (source_rows != 0) {
-                    init_semaphore(arrived, 0, 1);
-                    ::dist::tma::expect_bytes(
-                        arrived, source_rows * sizeof(fused_globals::token_vec));
-                    #pragma unroll
-                    for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
-                        if (src_gpus[i] >= 0 && src_tokens[i] >= 0) {
-                            const bf16 *src =
-                                G.pre_tokens[src_gpus[i]].raw_ptr +
-                                static_cast<int64_t>(src_tokens[i]) *
-                                    fused_globals::H;
-                            ::dist::tma::bulk_load_async(
-                                &tokens[i], src, TOKEN_BYTES, arrived);
-                        }
-                    }
-                    wait(arrived, 0);
-                }
-            }
-            __syncwarp();
-            if (valid_dst && src_gpu >= 0 && src_token >= 0) {
-                bf16 *dst = G.post_tokens.raw_ptr +
-                    static_cast<int64_t>(dst_token) * fused_globals::H;
-                ::dist::tma::bulk_store_async(
-                    dst, &tokens[lane], TOKEN_BYTES);
-                ::dist::tma::store_async_wait();
-            }
+        if (valid_dst && src_gpu >= 0 && src_token >= 0) {
+            bf16 *dst = G.post_tokens.raw_ptr +
+                static_cast<int64_t>(dst_token) * fused_globals::H;
+            ::dist::tma::bulk_store_async(dst, &tokens[lane], TOKEN_BYTES);
+            ::dist::tma::store_async_wait();
         }
 
         const unsigned valid_mask = __ballot_sync(0xffffffffu, valid_dst);
@@ -131,8 +84,7 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
     }
 }
 
-// Consumer-side half of the dispatch/GEMM handoff. The tcgen05 loader calls
-// this before TMA-loading an A tile from the corresponding row block.
+// GEMM SM check this, if it hits output row block, then starts working
 __device__ inline void wait_row_ready(const fused_globals &G,
                                       int row_block,
                                       int expected_rows) {
@@ -145,6 +97,8 @@ __device__ inline void wait_row_ready(const fused_globals &G,
     }
 }
 
+
+// Task iterator, for each CTA worker, uses this to loop over all 
 struct gemm_task {
     int expert;
     int row_block;
