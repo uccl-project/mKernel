@@ -33,7 +33,7 @@ using namespace kittens;
 
 namespace moe_dispatch_gemm_blackwell {
 
-// 16 * 7168 * sizeof(bf16) = 224 KiB, plus a small static mbarrier array.
+// 16 * 7168 * sizeof(bf16) = 224 KiB, plus allocator alignment headroom.
 static constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
 
 struct fused_globals {

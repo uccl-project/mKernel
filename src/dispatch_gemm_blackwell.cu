@@ -29,7 +29,6 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
             dst_token < G.num_output_tokens;
         int src_gpu = -1;
         int src_token = -1;
-
         if (valid_dst) {
             src_gpu = G.pull_dispatch_indices[{dst_token, 0}];
             src_token = G.pull_dispatch_indices[{dst_token, 1}];
@@ -67,8 +66,7 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
                     ::dist::tma::load_async(
                         tiles[chunk], G.pre_tokens[src_gpus[0]],
                         {src_tokens[0] / fused_globals::TOKENS_PER_BLOCK,
-                         chunk},
-                        arrived);
+                         chunk}, arrived);
                 }
                 wait(arrived, 0);
 
@@ -84,35 +82,39 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
             }
             __syncwarp();
         } else {
-            // One thread issues the whole peer-TMA batch into one mbarrier.
+            constexpr uint32_t TOKEN_BYTES =
+                sizeof(fused_globals::token_vec);
+            static_assert(TOKEN_BYTES <= 16 * 1024 && TOKEN_BYTES % 16 == 0);
             if (lane == 0) {
-                int valid_sources = 0;
+                int source_rows = 0;
                 #pragma unroll
                 for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
-                    valid_sources += src_gpus[i] >= 0 && src_tokens[i] >= 0;
+                    source_rows += src_gpus[i] >= 0 && src_tokens[i] >= 0;
                 }
-
-                if (valid_sources != 0) {
+                if (source_rows != 0) {
                     init_semaphore(arrived, 0, 1);
                     ::dist::tma::expect_bytes(
-                        arrived,
-                        valid_sources * sizeof(fused_globals::token_vec));
+                        arrived, source_rows * sizeof(fused_globals::token_vec));
                     #pragma unroll
                     for (int i = 0; i < fused_globals::TOKENS_PER_BLOCK; ++i) {
                         if (src_gpus[i] >= 0 && src_tokens[i] >= 0) {
-                            ::dist::tma::load_async(
-                                tokens[i], G.pre_tokens[src_gpus[i]],
-                                {src_tokens[i], 0}, arrived);
+                            const bf16 *src =
+                                G.pre_tokens[src_gpus[i]].raw_ptr +
+                                static_cast<int64_t>(src_tokens[i]) *
+                                    fused_globals::H;
+                            ::dist::tma::bulk_load_async(
+                                &tokens[i], src, TOKEN_BYTES, arrived);
                         }
                     }
                     wait(arrived, 0);
                 }
             }
             __syncwarp();
-
             if (valid_dst && src_gpu >= 0 && src_token >= 0) {
-                ::dist::tma::store_async(
-                    G.post_tokens, tokens[lane], {dst_token, 0});
+                bf16 *dst = G.post_tokens.raw_ptr +
+                    static_cast<int64_t>(dst_token) * fused_globals::H;
+                ::dist::tma::bulk_store_async(
+                    dst, &tokens[lane], TOKEN_BYTES);
                 ::dist::tma::store_async_wait();
             }
         }
@@ -469,19 +471,21 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
 }
 
 void launch_fused(const fused_globals& G, cudaStream_t stream) {
-    cudaFuncSetAttribute(fused_kernel<false>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         DYNAMIC_SHARED_MEMORY);
+    MKERNEL_CUDACHECK(cudaFuncSetAttribute(
+        fused_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        DYNAMIC_SHARED_MEMORY));
     fused_kernel<false><<<G.num_dispatch_sms + G.num_gemm_sms, 256,
                           DYNAMIC_SHARED_MEMORY, stream>>>(G);
+    MKERNEL_CUDACHECK(cudaGetLastError());
 }
 
 void launch_fused_profile(const fused_globals& G, cudaStream_t stream) {
-    cudaFuncSetAttribute(fused_kernel<true>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         DYNAMIC_SHARED_MEMORY);
+    MKERNEL_CUDACHECK(cudaFuncSetAttribute(
+        fused_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        DYNAMIC_SHARED_MEMORY));
     fused_kernel<true><<<G.num_dispatch_sms + G.num_gemm_sms, 256,
                          DYNAMIC_SHARED_MEMORY, stream>>>(G);
+    MKERNEL_CUDACHECK(cudaGetLastError());
 }
 
 }  // namespace moe_dispatch_gemm_blackwell
