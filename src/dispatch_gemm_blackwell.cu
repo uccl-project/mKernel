@@ -154,9 +154,8 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
 
     __shared__ semaphore inputs_arrived[fused_globals::PIPELINE_STAGES];
     __shared__ semaphore inputs_finished[fused_globals::PIPELINE_STAGES];
-    __shared__ semaphore outputs_arrived;
-    __shared__ semaphore outputs_finished;
-    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore outputs_arrived[fused_globals::OUTPUT_STAGES];
+    __shared__ semaphore outputs_finished[fused_globals::OUTPUT_STAGES];
     __shared__ uint32_t tmem_addr;
 
     if (threadIdx.x == 0) {
@@ -165,9 +164,11 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
             init_semaphore(inputs_arrived[i], 0, 1);
             init_semaphore(inputs_finished[i], 0, 1);
         }
-        init_semaphore(outputs_arrived, 0, 1);
-        init_semaphore(outputs_finished, 0, 1);
-        init_semaphore(tmem_provisioned, 0, 1);
+        #pragma unroll
+        for (int i = 0; i < fused_globals::OUTPUT_STAGES; ++i) {
+            init_semaphore(outputs_arrived[i], 0, 1);
+            init_semaphore(outputs_finished[i], 0, 1);
+        }
     }
     __syncthreads();
 
@@ -178,29 +179,32 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
     const int warp_in_wg = warpgroup::warpid();
     const int lane = warp::laneid();
 
-    if (wg == 0) {
-        if (warp_in_wg == 0) {
-            tm_allocator.provision(tmem_addr);
-            if (lane == 0)
-                arrive(tmem_provisioned);
-        }
-        wait(tmem_provisioned, 0);
-        tm_allocator.set_addr(tmem_addr);
-        C_tmem C_tm = tm_allocator.allocate<C_tmem>(0);
+    if (wg == 0 && warp_in_wg == 0)
+        tm_allocator.provision(tmem_addr);
+    tensor_before_thread_sync();
+    __syncthreads();
+    tensor_after_thread_sync();
+    tm_allocator.set_addr(tmem_addr);
+    C_tmem C_tm[fused_globals::OUTPUT_STAGES] = {
+        tm_allocator.allocate<C_tmem>(0),
+        tm_allocator.allocate<C_tmem>(fused_globals::COL_BLOCK),
+    };
 
-        int output_phase = 0;
+    if (wg == 0) {
+        int output_stage = 0;
+        int output_phase[fused_globals::OUTPUT_STAGES] = {0, 0};
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
-            wait(outputs_arrived, output_phase);
-            output_phase ^= 1;
+            wait(outputs_arrived[output_stage], output_phase[output_stage]);
+            output_phase[output_stage] ^= 1;
 
             rt_bf<32, 32> C_reg;
             #pragma unroll
             for (int n = 0; n < fused_globals::COL_BLOCK / 32; ++n) {
                 warpgroup::load_async(
                     C_reg,
-                    C_tm.template subtile<tt<float,
+                    C_tm[output_stage].template subtile<tt<float,
                         fused_globals::ROW_BLOCK, 32>>(0, n * 32));
                 tensor_load_wait();
                 tensor_before_thread_sync();
@@ -219,12 +223,9 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
             }
 
             if (warp_in_wg == 0 && lane == 0)
-                arrive(outputs_finished);
+                arrive(outputs_finished[output_stage]);
+            output_stage ^= 1;
         }
-
-        warpgroup::sync(1);
-        if (warp_in_wg == 0)
-            tm_allocator.deprovision();
     } else if (warp_in_wg == 3 && lane == 0) {
         int stage = 0;
         int finished_phase[fused_globals::PIPELINE_STAGES] = {1, 1, 1};
@@ -252,34 +253,38 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
             }
         }
     } else if (warp_in_wg == 0 && lane == 0) {
-        wait(tmem_provisioned, 0);
-        tm_allocator.set_addr(tmem_addr);
-        C_tmem C_tm = tm_allocator.allocate<C_tmem>(0);
-
         int stage = 0;
         int arrived_phase[fused_globals::PIPELINE_STAGES] = {0, 0, 0};
-        int output_reuse_phase = 1;
+        int output_stage = 0;
+        int reuse_phase[fused_globals::OUTPUT_STAGES] = {1, 1};
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
-            wait(outputs_finished, output_reuse_phase);
-            output_reuse_phase ^= 1;
+            wait(outputs_finished[output_stage], reuse_phase[output_stage]);
+            reuse_phase[output_stage] ^= 1;
 
             #pragma unroll 1
             for (int k = 0; k < fused_globals::H / fused_globals::RED_BLOCK; ++k) {
                 wait(inputs_arrived[stage], arrived_phase[stage]);
                 arrived_phase[stage] ^= 1;
                 if (k == 0)
-                    warpgroup::mm_AB(C_tm, inputs[stage].A, inputs[stage].B,
+                    warpgroup::mm_AB(C_tm[output_stage], inputs[stage].A,
+                                     inputs[stage].B,
                                      inputs_finished[stage]);
                 else
-                    warpgroup::mma_AB(C_tm, inputs[stage].A, inputs[stage].B,
+                    warpgroup::mma_AB(C_tm[output_stage], inputs[stage].A,
+                                      inputs[stage].B,
                                       inputs_finished[stage]);
                 stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
             }
-            tensor_commit<1>(outputs_arrived);
+            tensor_commit<1>(outputs_arrived[output_stage]);
+            output_stage ^= 1;
         }
     }
+
+    __syncthreads();
+    if (wg == 0 && warp_in_wg == 0)
+        tm_allocator.deprovision();
 }
 
 __global__ __launch_bounds__(256, 1)

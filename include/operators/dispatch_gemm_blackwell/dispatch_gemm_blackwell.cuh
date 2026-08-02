@@ -45,6 +45,7 @@ struct fused_globals {
     static constexpr int RED_BLOCK = 64;
     static constexpr int TOKENS_PER_BLOCK = 16;
     static constexpr int PIPELINE_STAGES = 3;
+    static constexpr int OUTPUT_STAGES = 2;
     static constexpr int SUPER_M = 8;
 
     using token_vec = sv_bf<H>;
