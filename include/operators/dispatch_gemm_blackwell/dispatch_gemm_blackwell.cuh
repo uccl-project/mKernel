@@ -175,10 +175,11 @@ inline void dispatch_gemm_impl(
         .num_gemm_sms = num_gemm_sms,
         .profile = profile == nullptr ? nullptr : profile->data_ptr<int64_t>(),
     };
-    if (profile == nullptr)
+    if (profile == nullptr) {
         launch_fused(G, stream);
-    else
+    } else {
         launch_fused_profile(G, stream);
+    }
 }
 
 inline void dispatch_gemm(
