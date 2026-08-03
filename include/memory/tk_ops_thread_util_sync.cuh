@@ -218,6 +218,35 @@ template<typename... Args>             inline constexpr uint32_t size_bytes     
 template<typename T, typename... Args> inline constexpr uint32_t size_bytes<T, Args...> = detail::size_info<T>::bytes + size_bytes<Args...>; // recursive case
 
 /* ----------   TCGEN05 synchronization  ---------- */
+// Vendored from ThunderKittens ops/thread/util/sync.cuh for the Blackwell
+// (sm_103a) tcgen05 port of gemm_rs. mKernel's original subset left this
+// section empty because only the Hopper wgmma path was kept.
+
+__device__ static inline void tensor_before_thread_sync() {
+    asm volatile("tcgen05.fence::before_thread_sync;\n");
+}
+__device__ static inline void tensor_after_thread_sync() {
+    asm volatile("tcgen05.fence::after_thread_sync;\n");
+}
+__device__ inline static void tensor_load_wait() {
+   asm volatile("tcgen05.wait::ld.sync.aligned;");
+}
+__device__ inline static void tensor_store_wait() {
+   asm volatile("tcgen05.wait::st.sync.aligned;");
+}
+template <int ncta>
+__device__ static inline void tensor_commit(kittens::semaphore &sem, uint16_t dst_cta_mask = 0b11) {
+    if constexpr (ncta == 1) {
+        asm volatile(
+            "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
+        ::  "l"(__cvta_generic_to_shared(&sem)));
+    }
+    else {
+        asm volatile(
+            "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;\n"
+        ::  "l"(__cvta_generic_to_shared(&sem)), "h"(dst_cta_mask));
+    }
+}
 
 __device__ static inline void tensor_before_thread_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;\n");

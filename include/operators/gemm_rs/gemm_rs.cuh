@@ -64,7 +64,14 @@ namespace gemm_rs_multinode {
 // ============================================================================
 
 struct config {
+#ifdef MKERNEL_TCGEN05
+    // 2-CTA clusters: mm2_ABt spans the pair, so A is split by rows and B by
+    // columns across it and each is read once per cluster rather than once per
+    // CTA. That is the arithmetic-intensity win (128 -> 171 FLOP/byte).
+    static constexpr int CLUSTER_SIZE = 2;
+#else
     static constexpr int CLUSTER_SIZE = 1;
+#endif
     static constexpr int NUM_BLOCKS = 132;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
@@ -112,14 +119,41 @@ __device__ __forceinline__ uint32_t gemm_rs_poll_arrival_relaxed(volatile uint32
 
 struct intra_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
+#ifdef MKERNEL_TCGEN05
+    // Two A tiles plus this CTA's half of B = 48 KB per stage. Outputs alias
+    // the last stage, so 4 stages is 208 KB of the 227 KB budget -- the same
+    // shape and depth upstream's b200 kernel runs.
+    //
+    // This was 3 while B was full width; the 2-CTA split halved the B tile and
+    // bought the stage back. Measurement says that matters: at M=32768 this
+    // kernel and upstream request identical bytes (51.5 GB) for identical
+    // FLOPs, and upstream is 1.2x faster, so the gap is prefetch depth keeping
+    // the tensor cores fed rather than anything about memory traffic.
     static constexpr int PIPELINE_STAGES = 4;
+#else
+    static constexpr int PIPELINE_STAGES = 4;
+#endif
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
+#ifdef MKERNEL_TCGEN05
+    // Blackwell: tcgen05 issues one M=128 MMA per row block, so A is a single
+    // 128-row tile rather than two 64-row halves.
+    using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
+#else
     using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
+#endif
+#ifdef MKERNEL_TCGEN05
+    // Blackwell takes B N-major (shape (N, K)) so the MMA can be issued as
+    // ABt. That is what the 2-CTA form requires -- with mm2_ABt the N extent
+    // is B::rows * ncta, i.e. the pair splits B by columns and reads it once
+    // per cluster. Same bytes as the K-major tile it replaces.
+    using B_tile = st_bf<COL_BLOCK / 2, RED_BLOCK>;
+#else
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
+#endif
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
 
     using A_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, A_tile>;
@@ -159,8 +193,25 @@ struct intra_globals {
     unsigned int *next_comm;
     unsigned int *kernel_done;
 
+#ifdef MKERNEL_TCGEN05
+    // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks that share a
+    // single B tile — that sharing is the point: it doubles the FLOPs per byte
+    // of B read, which measurement showed is what actually limits this kernel.
+    static constexpr int ROW_BLOCKS_PER_TASK = 2;          // per CTA
+    static constexpr int ROW_BLOCKS_PER_CLUSTER = 4;       // x2 CTAs
+    struct pipeline_inputs { A_tile A[ROW_BLOCKS_PER_TASK]; B_tile B; };
+#else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
+#endif
+#ifdef MKERNEL_TCGEN05
+    // One staging tile, not two: the pair of 64-row halves goes out in
+    // sequence. Halving this to 32 KB is what buys outputs their own
+    // allocation at 4 stages (4x48 + 32 = 224 KB), which removes the loader's
+    // per-task wait on the epilogue -- the edge the roofline points at.
+    struct pipeline_outputs { C_tile C; };
+#else
     struct pipeline_outputs { C_tile C[2]; };
+#endif
 };
 
 struct fused_globals {
@@ -542,9 +593,22 @@ void entrypoint_fused(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev_idx).stream();
 
     const int M = (int)A.size(0);
+#ifdef MKERNEL_TCGEN05
+    const int N = (int)B.size(0);   // B is (N, K) on this path
+#else
     const int N = (int)B.size(1);
+#endif
     const int M_local = (int)output.data_.size(0);
     const int row_blocks = M / intra_globals::ROW_BLOCK;
+#ifdef MKERNEL_TCGEN05
+    // Tasks pair adjacent row blocks inside a device slice, so each slice must
+    // hold an even number of them.
+    TORCH_CHECK((row_blocks / intra_globals::NUM_DEVICES)
+                    % intra_globals::ROW_BLOCKS_PER_CLUSTER == 0,
+                "gemm_rs (Blackwell): row blocks per device slice must be a multiple of ",
+                intra_globals::ROW_BLOCKS_PER_CLUSTER, "; got ",
+                row_blocks / intra_globals::NUM_DEVICES);
+#endif
     const int col_blocks = N / intra_globals::COL_BLOCK;
     const int local_row_blocks = M_local / fused_globals::ROW_BLOCK;
     const int total_inter_tiles = local_row_blocks * col_blocks;

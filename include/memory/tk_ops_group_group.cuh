@@ -12,6 +12,8 @@
 #include "tk_ops_thread_memory_tile_tma.cuh"
 #include "tk_ops_thread_memory_vec_tma.cuh"
 #include "tk_ops_thread_util_util.cuh"
+#include "tk_ops_thread_mma_tcgen05.cuh"
+#include "tk_ops_thread_memory_tile_shared_to_tensor.cuh"
 
 #define KITTENS_CHECK_WARP static_assert(GROUP_WARPS==1, "Warp (GROUP_WARPS=1) function called from a non-warp group.");
 // A "warpgroup" is a special group of 4 consecutive warps defined by NVIDIA for certain SM_90+ operations.
@@ -49,6 +51,8 @@ __device__ static inline void arrive(int id) {
 #include "tk_ops_group_register_tile_maps.cuh"
 #include "tk_ops_group_register_tile_reductions.cuh"
 #include "tk_ops_group_register_vec_maps.cuh"
+#include "tk_ops_group_memory_tile_tensor_to_register.cuh"
+#include "tk_ops_group_mma_tcgen05.cuh"
 #include "tk_ops_group_mma_warpgroup.cuh"
 #include "tk_ops_group_mma_tcgen05_bf16.cuh"
 #include "tk_ops_group_memory_tile_tensor_to_register.cuh"

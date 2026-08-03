@@ -31,8 +31,28 @@ else
     $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
 endif
 
+# === Target GPU ===
+#   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
+#   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
+GPU ?= hopper
+ifeq ($(GPU),blackwell)
+    ARCH              := -gencode arch=compute_103a,code=sm_103a
+    ARCH_DEFINES      := -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05
+    DEFAULT_CUDA_HOME := /usr/local/cuda-13.2
+    # conda forces a host compiler through NVCC_PREPEND_FLAGS/CXX on some boxes,
+    # which makes nvcc miss system headers; pin the system g++.
+    CCBIN             := -ccbin /usr/bin/g++
+else ifeq ($(GPU),hopper)
+    ARCH              := -gencode arch=compute_90a,code=sm_90a
+    ARCH_DEFINES      := -DKITTENS_HOPPER
+    DEFAULT_CUDA_HOME := /usr/local/cuda-12.9
+    CCBIN             :=
+else
+    $(error Unknown GPU=$(GPU). Use GPU=hopper or GPU=blackwell.)
+endif
+
 # === Tooling ===
-CUDA_HOME       ?= /usr/local/cuda
+CUDA_HOME       ?= $(DEFAULT_CUDA_HOME)
 EFA_HOME        ?= /opt/amazon/efa
 NVCC            := $(CUDA_HOME)/bin/nvcc
 # Python with torch installed. Override with `PYTHON=/path/to/python`.
@@ -50,34 +70,13 @@ PY_INC          := $(shell $(PYTHON) -c "import sysconfig; print('-I'+sysconfig.
 TORCH_INC       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(' '.join('-I'+p for p in e.include_paths()))")
 TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(e.library_paths()[0])")
 
-# === Common compile flags ===
-ARCH            := -gencode arch=compute_90a,code=sm_90a
-# dispatch_gemm_blackwell uses tcgen05 and must be compiled for the native
-# Blackwell architecture. B300 is SM 10.3; override BLACKWELL_SM for another
-# Blackwell GPU (for example BLACKWELL_SM=100).
-BLACKWELL_SM ?= 103
-ARCH_dispatch_gemm_blackwell := \
-    -gencode arch=compute_$(BLACKWELL_SM)a,code=sm_$(BLACKWELL_SM)a
 # INTRA_NUM_DEVICES = GPUs per logical node (multicast group size). Default 8
 # matches an 8-GPU-per-node deployment. Override to test emulated multinode
 # (e.g. `make INTRA_NUM_DEVICES=4 all` for 4 GPUs / "node").
 INTRA_NUM_DEVICES ?= 8
-BLACKWELL_INTRA_NUM_DEVICES ?= 8
-INTRA_NUM_DEVICES_dispatch_gemm_blackwell := $(BLACKWELL_INTRA_NUM_DEVICES)
-
-# $* is available while expanding the pattern-rule recipe below. Per-target
-# values keep existing kernels on ARCH/INTRA_NUM_DEVICES while allowing the
-# optional Blackwell kernel to select its native architecture and domain.
-TARGET_ARCH     = $(or $(ARCH_$*),$(ARCH))
-TARGET_INTRA_NUM_DEVICES = $(or $(INTRA_NUM_DEVICES_$*),$(INTRA_NUM_DEVICES))
-# The Blackwell kernel is intra-node-only. Keep its direct target independent
-# of the repository-wide EFA default so it works on the B300/CX7 machine with
-# a plain make dispatch-gemm-blackwell.
-TARGET_BACKEND_DEFINES = $(if $(filter dispatch_gemm_blackwell,$*),-DINTERNODE_BACKEND_IBVERBS,$(BACKEND_DEFINES))
-TARGET_BACKEND_LIBS = $(if $(filter dispatch_gemm_blackwell,$*),-libverbs,$(BACKEND_LIBS))
-COMMON_DEFINES  = -DKITTENS_HOPPER -DINTRA_NUM_DEVICES=$(TARGET_INTRA_NUM_DEVICES) $(TARGET_BACKEND_DEFINES)
-COMMON_FLAGS    = -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(TARGET_ARCH)
-LDFLAGS         = -shared -lcuda $(TARGET_BACKEND_LIBS) \
+COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
+COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH) $(CCBIN)
+LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
                    -Xlinker -rpath -Xlinker $(TORCH_LIB)
 
