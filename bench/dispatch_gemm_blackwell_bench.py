@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
                             "MKERNEL_DISPATCH_GEMM_ROUTING", "multinomial"))
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--dispatch-sms", type=int, default=28)
     parser.add_argument("--gemm-sms", type=int, default=124)
     parser.add_argument("--check", action="store_true")
@@ -210,23 +210,31 @@ def main() -> None:
             torch.cuda.synchronize()
         dist.barrier()
 
+        if num_tokens <= 16384:
+            n_iters = max(args.iters, 64)
+        elif num_tokens <= 65536:
+            n_iters = max(args.iters, 32)
+        else:
+            n_iters = max(args.iters, 24)
+
         trial_ms = []
         for _ in range(args.trials):
             dist.barrier()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
             start.record()
-            for _ in range(args.iters):
+            for _ in range(n_iters):
                 row_ready.zero_()
                 launch(mod, problem, args.dispatch_sms, args.gemm_sms)
             end.record()
             end.synchronize()
             rank_avg = torch.tensor(
-                [start.elapsed_time(end) / args.iters],
+                [start.elapsed_time(end) / n_iters],
                 device="cuda", dtype=torch.float64)
             dist.all_reduce(rank_avg, op=dist.ReduceOp.MAX)
             trial_ms.append(rank_avg.item())
-        avg_ms = sorted(trial_ms)[len(trial_ms) // 2]
+        avg_ms = sum(trial_ms) / len(trial_ms)
         useful_tflops = 2.0 * max_actual_rows * H * I / (avg_ms * 1e9)
         padded_tflops = 2.0 * max_padded_rows * H * I / (avg_ms * 1e9)
 
