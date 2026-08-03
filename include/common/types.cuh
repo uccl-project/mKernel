@@ -13,9 +13,17 @@
 #include "tk_types_register_rt.cuh"
 #include "tk_types_shared_st.cuh"
 #include "tk_types_shared_descriptor.cuh"
-#include "tk_types_tensor.cuh"
 #include "tk_types_global_util.cuh"
+// Two tensor-memory (tcgen05) type sets live in this tree and define the same
+// names (kittens::tt, kittens::tensor_allocator). MKERNEL_TCGEN05 (GPU=blackwell,
+// gemm_rs/ag_gemm) selects the full ThunderKittens pair; everything else keeps
+// the minimal set that came with dispatch_gemm_blackwell.
+#ifdef MKERNEL_TCGEN05
+#include "tk_types_tensor_tt.cuh"
+#include "tk_types_tensor_tensor.cuh"
+#else
 #include "tk_types_tensor.cuh"
+#endif
 
 namespace kittens {
 

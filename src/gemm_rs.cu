@@ -41,7 +41,12 @@ __device__ inline void compute_tile_impl(
     semaphore (&inputs_finished)[G::PIPELINE_STAGES],
     semaphore &outputs_arrived, semaphore &outputs_finished,
     int &stage, uint32_t &phasebits,
-    int row_blocks, int col_blocks, int num_iters)
+    int row_blocks, int col_blocks, int num_iters
+#ifdef MKERNEL_TCGEN05
+    , tt<float, G::ROW_BLOCK, G::COL_BLOCK> &d_tt,
+    semaphore &mma_done, semaphore &tmem_free
+#endif
+    )
 {
     const int wg_id = warpgroup::groupid();
     const int w_id  = warpgroup::warpid();
@@ -60,14 +65,47 @@ __device__ inline void compute_tile_impl(
                 wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                 update_phasebit<1>(phasebits, stage);
                 tma::expect_bytes(inputs_arrived[stage], sizeof(typename G::pipeline_inputs));
+#ifdef MKERNEL_TCGEN05
+                tma::load_async(inputs[stage].A, Gv.A,
+                                {row_idx, red_idx}, inputs_arrived[stage]);
+#else
                 #pragma unroll
                 for (int i = 0; i < 2; i++)
                     tma::load_async(inputs[stage].A[i], Gv.A,
                                     {row_idx * 2 + i, red_idx}, inputs_arrived[stage]);
+#endif
                 tma::load_async(inputs[stage].B, Gv.B, {red_idx, col_idx}, inputs_arrived[stage]);
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
-        } else if (w_id == 1 && l_id == 0) {
+        }
+#ifdef MKERNEL_TCGEN05
+        else if (w_id == 2 && l_id == 0) {
+            // Blackwell MMA issuer. tcgen05 MMAs are issued by a single thread
+            // and land in tensor memory, so this warp replaces the per-consumer
+            // wgmma that the Hopper path runs. It walks the same input pipeline
+            // the loader warp fills.
+            //
+            // Tensor memory for this tile must be free before the first
+            // (accumulate=0) MMA overwrites it.
+            wait(tmem_free, get_phasebit<1>(phasebits, 0));
+            update_phasebit<1>(phasebits, 0);
+            for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                update_phasebit<0>(phasebits, stage);
+                // mm_AB zeroes the accumulator, mma_AB accumulates onto it.
+                // The semaphore fires once the MMA has consumed the shared
+                // operands, releasing the pipeline stage back to the loader.
+                if (red_idx == 0)
+                    warp::mm_AB (d_tt, inputs[stage].A, inputs[stage].B, inputs_finished[stage]);
+                else
+                    warp::mma_AB(d_tt, inputs[stage].A, inputs[stage].B, inputs_finished[stage]);
+                stage = (stage + 1) % G::PIPELINE_STAGES;
+            }
+            // Signal the consumers that the accumulator is complete.
+            kittens::tensor_commit<1>(mma_done);
+        }
+#endif
+        else if (w_id == 1 && l_id == 0) {
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
             update_phasebit<0>(phasebits, 0);
             #pragma unroll
@@ -96,6 +134,36 @@ __device__ inline void compute_tile_impl(
             arrive(outputs_finished);
         }
     } else {
+#ifdef MKERNEL_TCGEN05
+        // Blackwell consumers do no MMA. They wait for the tensor-memory
+        // accumulator, pull their 16-row slice into registers, release tmem,
+        // then stage the tile in shared for the epilogue TMA warp.
+        //
+        // Row mapping follows ThunderKittens' group<8> tmem layout: the 8
+        // consumer warps (2 warpgroups x 4 warps) each own 16 of the 128 rows,
+        // at `32*(w%4) + 16*(w/4)`. Two warps share each 32-lane tmem
+        // sub-partition, which is the access granularity tcgen05.ld requires.
+        const int cw   = wg_id * 4 + w_id;                  // consumer warp 0..7
+        const int trow = 32 * (cw % 4) + 16 * (cw / 4);     // its tmem row
+        rt_fl<G::ROW_BLOCK / 8, G::COL_BLOCK> C_accum;
+
+        wait(mma_done, get_phasebit<0>(phasebits, 0));
+        update_phasebit<0>(phasebits, 0);
+        warp::load_async(C_accum,
+                         d_tt.template subtile<tt<float, G::ROW_BLOCK / 8, G::COL_BLOCK>>(trow, 0));
+        kittens::tensor_load_wait();
+        group<8>::sync(3);
+        // Tensor memory is drained; the MMA warp may start the next tile.
+        // One arrival per consumer warpgroup, so tmem_free expects 2.
+        warpgroup::arrive(tmem_free);
+
+        // trow is a global row in the 128-row block; C[] is two 64-row tiles.
+        auto dst = outputs.C[trow / 64].template subtile<G::ROW_BLOCK / 8, G::COL_BLOCK>(
+                       {(trow % 64) / (G::ROW_BLOCK / 8), 0});
+        warp::store(dst, C_accum);
+        group<8>::sync(4);
+        warpgroup::arrive(outputs_arrived);
+#else
         rt_fl<G::ROW_BLOCK / 8, G::COL_BLOCK> C_accum;
         warp::zero(C_accum);
         for (int red_idx = 0; red_idx < num_iters; red_idx++) {
@@ -110,6 +178,7 @@ __device__ inline void compute_tile_impl(
         warpgroup::store(outputs.C[wg_id], C_accum);
         warpgroup::sync(wg_id + 1);
         warpgroup::arrive(outputs_arrived);
+#endif
     }
 }
 
@@ -861,16 +930,41 @@ __device__ inline void fused_kernel(const fused_globals &G) {
     __shared__ semaphore inputs_finished[intra_globals::PIPELINE_STAGES];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
+#ifdef MKERNEL_TCGEN05
+    // mma_done : MMA warp -> consumers, "tensor-memory accumulator is complete"
+    // tmem_free: consumers -> MMA warp, "tensor memory drained, safe to reuse"
+    __shared__ semaphore mma_done;
+    __shared__ semaphore tmem_free;
+#endif
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < intra_globals::PIPELINE_STAGES; ++i) {
             init_semaphore(inputs_arrived[i], 0, 1);
+#ifdef MKERNEL_TCGEN05
+            // Blackwell: the single tcgen05 MMA releases the stage (one commit),
+            // instead of 8 consumer warps each arriving after their wgmma.
+            init_semaphore(inputs_finished[i], 0, 1);
+#else
             init_semaphore(inputs_finished[i], 0, 8);
+#endif
         }
         init_semaphore(outputs_arrived, 0, 2);
         init_semaphore(outputs_finished, 0, 1);
+#ifdef MKERNEL_TCGEN05
+        init_semaphore(mma_done,  0, 1);   // one tensor_commit
+        init_semaphore(tmem_free, 0, 2);   // one arrival per consumer warpgroup
+#endif
     }
     __syncthreads();
+
+#ifdef MKERNEL_TCGEN05
+    // Tensor-memory allocation is CTA-wide (the ctor runs tcgen05.alloc on warp
+    // 0 then bar.sync 0), so it must be reached by every thread of the CTA and
+    // must sit outside the role dispatch below.
+    tensor_allocator<1, 1> tm_alloc{};
+    auto d_tt = tm_alloc.allocate<tt<float, intra_globals::ROW_BLOCK,
+                                          intra_globals::COL_BLOCK>>(0);
+#endif
 
 
 
@@ -899,7 +993,11 @@ __device__ inline void fused_kernel(const fused_globals &G) {
             compute_tile_impl<intra_globals>(I, row_idx, col_idx, ready_idx,
                                               inputs, outputs, inputs_arrived, inputs_finished,
                                               outputs_arrived, outputs_finished, stage, phasebits,
-                                              row_blocks, col_blocks, num_iters);
+                                              row_blocks, col_blocks, num_iters
+#ifdef MKERNEL_TCGEN05
+                                              , d_tt, mma_done, tmem_free
+#endif
+                                              );
             // Compute-side chunk-ready signal. When this GPU finishes all
             // tiles in a chunk, emit a "I'm done contributing" signal so the
             // owner's send CTA knows this GPU's partials have landed in

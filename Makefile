@@ -33,7 +33,7 @@ endif
 
 # === Target GPU ===
 #   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
-#   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
+#   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs and ag_gemm)
 GPU ?= hopper
 ifeq ($(GPU),blackwell)
     ARCH              := -gencode arch=compute_103a,code=sm_103a

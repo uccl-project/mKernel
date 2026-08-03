@@ -118,7 +118,14 @@ struct intra_globals {
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
+#ifdef MKERNEL_TCGEN05
+    // Blackwell: tcgen05 issues one M=128 MMA for the whole row block, so A
+    // arrives as a single 128-row tile instead of two 64-row halves. Same
+    // bytes, one TMA load instead of two.
+    using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
+#else
     using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
+#endif
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
 
@@ -159,7 +166,11 @@ struct intra_globals {
     unsigned int *next_comm;
     unsigned int *kernel_done;
 
+#ifdef MKERNEL_TCGEN05
+    struct pipeline_inputs { A_tile A;    B_tile B; };
+#else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
+#endif
     struct pipeline_outputs { C_tile C[2]; };
 };
 
