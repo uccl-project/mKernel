@@ -13,8 +13,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("weights"),
           pybind11::arg("outputs"),
           pybind11::arg("padded_tokens_per_expert"),
-          pybind11::arg("num_dispatch_sms"),
-          pybind11::arg("num_gemm_sms"));
+          pybind11::arg("num_dispatch_sms") = 28,
+          pybind11::arg("num_gemm_sms") = 124);
     m.def("moe_dispatch_gemm_blackwell_profile",
           &moe_dispatch_gemm_blackwell::dispatch_gemm_profile,
           pybind11::arg("pre_tokens"),
@@ -25,6 +25,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("outputs"),
           pybind11::arg("padded_tokens_per_expert"),
           pybind11::arg("profile"),
-          pybind11::arg("num_dispatch_sms"),
-          pybind11::arg("num_gemm_sms"));
+          pybind11::arg("num_dispatch_sms") = 28,
+          pybind11::arg("num_gemm_sms") = 124);
 }

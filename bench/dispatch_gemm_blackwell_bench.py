@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--trials", type=int, default=3)
-    parser.add_argument("--dispatch-sms", type=int, default=44)
-    parser.add_argument("--gemm-sms", type=int, default=108)
+    parser.add_argument("--dispatch-sms", type=int, default=28)
+    parser.add_argument("--gemm-sms", type=int, default=124)
     parser.add_argument("--check", action="store_true")
     return parser.parse_args()
 
