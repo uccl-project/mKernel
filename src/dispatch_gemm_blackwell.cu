@@ -169,26 +169,6 @@ struct gemm_task_iterator {
     }
 };
 
-enum profile_field : int {
-    PROFILE_ROW_READY_WAIT = 0,
-    PROFILE_INPUT_WAIT = 1,
-    PROFILE_OUTPUT_READY_WAIT = 2,
-    PROFILE_EPILOGUE = 3,
-    PROFILE_OUTPUT_REUSE_WAIT = 4,
-};
-
-__device__ inline void write_profile(const fused_globals &G, int worker,
-                                     int task_index, profile_field field,
-                                     uint64_t cycles) {
-    if (task_index < fused_globals::PROFILE_TASKS) {
-        const int column = 1 +
-            task_index * fused_globals::PROFILE_FIELDS_PER_TASK + field;
-        G.profile[worker * fused_globals::PROFILE_WORDS + column] =
-            static_cast<int64_t>(cycles);
-    }
-}
-
-template<bool PROFILE>
 __device__ inline void gemm_sm(const fused_globals &G, int worker) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator(&__shm[0]);
@@ -240,32 +220,12 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
     if (wg == 0) {
         int output_stage = 0;
         int output_phase[fused_globals::OUTPUT_STAGES] = {0, 0};
-        int task_index = 0;
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
-            uint64_t wait_start = 0;
-            if constexpr (PROFILE) {
-                if (warp_in_wg == 0 && lane == 0) {
-                    wait_start = clock64();
-                }
-            }
             wait(outputs_arrived[output_stage], output_phase[output_stage]);
-            if constexpr (PROFILE) {
-                if (warp_in_wg == 0 && lane == 0) {
-                    write_profile(G, worker, task_index,
-                                  PROFILE_OUTPUT_READY_WAIT,
-                                  clock64() - wait_start);
-                }
-            }
             output_phase[output_stage] ^= 1;
 
-            uint64_t epilogue_start = 0;
-            if constexpr (PROFILE) {
-                if (warp_in_wg == 0 && lane == 0) {
-                    epilogue_start = clock64();
-                }
-            }
             rt_bf<32, 32> C_reg;
             #pragma unroll
             for (int n = 0; n < fused_globals::COL_BLOCK / 32; ++n) {
@@ -292,14 +252,7 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
             if (warp_in_wg == 0 && lane == 0) {
                 arrive(outputs_finished[output_stage]);
             }
-            if constexpr (PROFILE) {
-                if (warp_in_wg == 0 && lane == 0) {
-                    write_profile(G, worker, task_index, PROFILE_EPILOGUE,
-                                  clock64() - epilogue_start);
-                }
-            }
             output_stage ^= 1;
-            ++task_index;
         }
     } else if (warp_in_wg == 3 && lane == 0) {
         int stage = 0;
@@ -308,22 +261,13 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
         for (int i = 0; i < fused_globals::PIPELINE_STAGES; ++i) {
             finished_phase[i] = 1;
         }
-        int task_index = 0;
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
             const int expected_rows =
                 min(fused_globals::ROW_BLOCK,
                     G.num_output_tokens - task.row_block * fused_globals::ROW_BLOCK);
-            uint64_t wait_start = 0;
-            if constexpr (PROFILE) {
-                wait_start = clock64();
-            }
             wait_row_ready(G, task.row_block, expected_rows);
-            if constexpr (PROFILE) {
-                write_profile(G, worker, task_index, PROFILE_ROW_READY_WAIT,
-                              clock64() - wait_start);
-            }
 
             #pragma unroll 1
             for (int k = 0; k < fused_globals::H / fused_globals::RED_BLOCK; ++k) {
@@ -339,7 +283,6 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
                     {task.expert, k, task.col_block}, inputs_arrived[stage]);
                 stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
             }
-            ++task_index;
         }
     } else if (warp_in_wg == 0 && lane == 0) {
         int stage = 0;
@@ -350,33 +293,15 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
         }
         int output_stage = 0;
         int reuse_phase[fused_globals::OUTPUT_STAGES] = {1, 1};
-        int task_index = 0;
         gemm_task_iterator tasks(G, worker, G.num_gemm_sms);
         gemm_task task;
         while (tasks.next(task)) {
-            uint64_t reuse_wait_start = 0;
-            if constexpr (PROFILE) {
-                reuse_wait_start = clock64();
-            }
             wait(outputs_finished[output_stage], reuse_phase[output_stage]);
-            if constexpr (PROFILE) {
-                write_profile(G, worker, task_index,
-                              PROFILE_OUTPUT_REUSE_WAIT,
-                              clock64() - reuse_wait_start);
-            }
             reuse_phase[output_stage] ^= 1;
 
-            uint64_t input_wait_cycles = 0;
             #pragma unroll 1
             for (int k = 0; k < fused_globals::H / fused_globals::RED_BLOCK; ++k) {
-                uint64_t input_wait_start = 0;
-                if constexpr (PROFILE) {
-                    input_wait_start = clock64();
-                }
                 wait(inputs_arrived[stage], arrived_phase[stage]);
-                if constexpr (PROFILE) {
-                    input_wait_cycles += clock64() - input_wait_start;
-                }
                 arrived_phase[stage] ^= 1;
                 if (k == 0) {
                     warpgroup::mm_AB(C_tm[output_stage], inputs[stage].A,
@@ -390,15 +315,7 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
                 stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
             }
             tensor_commit<1>(outputs_arrived[output_stage]);
-            if constexpr (PROFILE) {
-                write_profile(G, worker, task_index, PROFILE_INPUT_WAIT,
-                              input_wait_cycles);
-            }
             output_stage ^= 1;
-            ++task_index;
-        }
-        if constexpr (PROFILE) {
-            G.profile[worker * fused_globals::PROFILE_WORDS] = task_index;
         }
     }
 
@@ -408,7 +325,6 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
     }
 }
 
-template<bool PROFILE>
 __global__ __launch_bounds__(256, 1)
 void fused_kernel(const __grid_constant__ fused_globals G) {
     if (blockIdx.x < G.num_dispatch_sms) {
@@ -420,25 +336,16 @@ void fused_kernel(const __grid_constant__ fused_globals G) {
             dispatch_slice(G, slice);
         }
     } else {
-        gemm_sm<PROFILE>(G, blockIdx.x - G.num_dispatch_sms);
+        gemm_sm(G, blockIdx.x - G.num_dispatch_sms);
     }
 }
 
 void launch_fused(const fused_globals& G, cudaStream_t stream) {
     MKERNEL_CUDACHECK(cudaFuncSetAttribute(
-        fused_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         DYNAMIC_SHARED_MEMORY));
-    fused_kernel<false><<<G.num_dispatch_sms + G.num_gemm_sms, 256,
-                          DYNAMIC_SHARED_MEMORY, stream>>>(G);
-    MKERNEL_CUDACHECK(cudaGetLastError());
-}
-
-void launch_fused_profile(const fused_globals& G, cudaStream_t stream) {
-    MKERNEL_CUDACHECK(cudaFuncSetAttribute(
-        fused_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        DYNAMIC_SHARED_MEMORY));
-    fused_kernel<true><<<G.num_dispatch_sms + G.num_gemm_sms, 256,
-                         DYNAMIC_SHARED_MEMORY, stream>>>(G);
+    fused_kernel<<<G.num_dispatch_sms + G.num_gemm_sms, 256,
+                   DYNAMIC_SHARED_MEMORY, stream>>>(G);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 

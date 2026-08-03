@@ -47,11 +47,6 @@ struct fused_globals {
     static constexpr int PIPELINE_STAGES = 4;
     static constexpr int OUTPUT_STAGES = 2;
     static constexpr int SUPER_M = 4;
-    static constexpr int PROFILE_TASKS = 2;
-    static constexpr int PROFILE_FIELDS_PER_TASK = 5;
-    static constexpr int PROFILE_WORDS =
-        1 + PROFILE_TASKS * PROFILE_FIELDS_PER_TASK;
-
     using token_vec = sv_bf<H>;
     using dispatch_tile = st_bf<TOKENS_PER_BLOCK, 256, false>;
     using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
@@ -84,7 +79,6 @@ struct fused_globals {
     int num_local_experts;
     int num_dispatch_sms;
     int num_gemm_sms;
-    int64_t *profile;
 
     struct pipeline_input {
         A_tile A;
@@ -93,7 +87,6 @@ struct fused_globals {
 };
 
 void launch_fused(const fused_globals& G, cudaStream_t stream);
-void launch_fused_profile(const fused_globals& G, cudaStream_t stream);
 
 inline void dispatch_gemm_impl(
     dist::ParallelBuffer &pre_tokens,
@@ -104,8 +97,7 @@ inline void dispatch_gemm_impl(
     at::Tensor &outputs,
     at::Tensor &padded_tokens_per_expert,
     int num_dispatch_sms,
-    int num_gemm_sms,
-    at::Tensor *profile
+    int num_gemm_sms
 ) {
     const int dev_idx = pre_tokens.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -146,16 +138,6 @@ inline void dispatch_gemm_impl(
                 "dispatch and GEMM SM counts must be positive");
     TORCH_CHECK(num_dispatch_sms + num_gemm_sms <= kittens::num_sms(dev_idx),
                 "dispatch + GEMM SM counts exceed the device SM count");
-    if (profile != nullptr) {
-        TORCH_CHECK(profile->is_cuda() && profile->get_device() == dev_idx &&
-                    profile->scalar_type() == at::kLong &&
-                    profile->is_contiguous() &&
-                    profile->sizes() == at::IntArrayRef(
-                        {num_gemm_sms, fused_globals::PROFILE_WORDS}),
-                    "profile must be contiguous CUDA int64 "
-                    "[num_gemm_sms, 11]");
-    }
-
     fused_globals G{
         .pre_tokens = ::dist::distributed_tensor_from_buffer<
             fused_globals::pre_tokens_tensor>(pre_tokens),
@@ -175,13 +157,8 @@ inline void dispatch_gemm_impl(
         .num_local_experts = static_cast<int>(weights.size(0)),
         .num_dispatch_sms = num_dispatch_sms,
         .num_gemm_sms = num_gemm_sms,
-        .profile = profile == nullptr ? nullptr : profile->data_ptr<int64_t>(),
     };
-    if (profile == nullptr) {
-        launch_fused(G, stream);
-    } else {
-        launch_fused_profile(G, stream);
-    }
+    launch_fused(G, stream);
 }
 
 inline void dispatch_gemm(
@@ -198,25 +175,7 @@ inline void dispatch_gemm(
     dispatch_gemm_impl(pre_tokens, post_tokens, pull_dispatch_indices,
                        row_ready, weights, outputs,
                        padded_tokens_per_expert, num_dispatch_sms,
-                       num_gemm_sms, nullptr);
-}
-
-inline void dispatch_gemm_profile(
-    dist::ParallelBuffer &pre_tokens,
-    at::Tensor &post_tokens,
-    at::Tensor &pull_dispatch_indices,
-    at::Tensor &row_ready,
-    at::Tensor &weights,
-    at::Tensor &outputs,
-    at::Tensor &padded_tokens_per_expert,
-    at::Tensor &profile,
-    int num_dispatch_sms,
-    int num_gemm_sms
-) {
-    dispatch_gemm_impl(pre_tokens, post_tokens, pull_dispatch_indices,
-                       row_ready, weights, outputs,
-                       padded_tokens_per_expert, num_dispatch_sms,
-                       num_gemm_sms, &profile);
+                       num_gemm_sms);
 }
 
 }  // namespace moe_dispatch_gemm_blackwell
