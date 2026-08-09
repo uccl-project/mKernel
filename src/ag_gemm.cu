@@ -262,6 +262,13 @@ __device__ __forceinline__ int ag_gemm_shard_rank_for_step(
 // Comp SM: GEMM on both local and remote halves
 // ============================================================================
 
+#ifdef MKERNEL_TCGEN05
+// Tensor-memory accumulator ring depth. Tensor memory is 512 columns; a
+// 128x256 fp32 accumulator costs 256, so 2 is the maximum and lets the MMA
+// warp start the next tile while consumers still drain the previous one.
+static constexpr int MMA_PIPE_DEPTH = 2;
+#endif
+
 __device__ inline void fused_comp_sm(const globals& G) {
     if (G.debug_skip_compute != 0) {
         return;
@@ -282,8 +289,9 @@ __device__ inline void fused_comp_sm(const globals& G) {
 #ifdef MKERNEL_TCGEN05
     // mma_done : MMA warp -> consumers, "tensor-memory accumulator is complete"
     // tmem_free: consumers -> MMA warp, "tensor memory drained, safe to reuse"
-    __shared__ semaphore mma_done;
-    __shared__ semaphore tmem_free;
+    // One pair per accumulator in the ring.
+    __shared__ semaphore mma_done[MMA_PIPE_DEPTH];
+    __shared__ semaphore tmem_free[MMA_PIPE_DEPTH];
 #endif
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -300,8 +308,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
         init_semaphore(outputs_arrived, 0, 2);
         init_semaphore(outputs_finished, 0, 1);
 #ifdef MKERNEL_TCGEN05
-        init_semaphore(mma_done,  0, 1);   // one tensor_commit
-        init_semaphore(tmem_free, 0, 2);   // one arrival per consumer warpgroup
+        #pragma unroll
+        for (int i = 0; i < MMA_PIPE_DEPTH; ++i) {
+            init_semaphore(mma_done[i],  0, 1);   // one tensor_commit
+            init_semaphore(tmem_free[i], 0, 2);   // one per consumer warpgroup
+        }
 #endif
     }
     __syncthreads();
@@ -311,8 +322,10 @@ __device__ inline void fused_comp_sm(const globals& G) {
     // 0 then bar.sync 0), so every thread of a compute CTA must reach it and it
     // must sit outside the warp-role split below.
     tensor_allocator<1, 1> tm_alloc{};
-    auto d_tt = tm_alloc.allocate<tt<float, globals::ROW_BLOCK,
-                                           globals::COL_BLOCK>>(0);
+    // One allocation covering the whole ring; each tile subtiles its half.
+    auto d_tt_pool = tm_alloc.allocate<tt<float, globals::ROW_BLOCK,
+                                                globals::COL_BLOCK * MMA_PIPE_DEPTH>>(0);
+    int acc_ring = 0;
 #endif
 
     int warpgroup_id = warpgroup::groupid();
@@ -454,8 +467,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 }
                 // Tensor memory must be drained before the accumulate=0 MMA
                 // overwrites it.
-                wait(tmem_free, get_phasebit<1>(phasebits, 0));
-                update_phasebit<1>(phasebits, 0);
+                wait(tmem_free[acc_ring], get_phasebit<1>(phasebits, acc_ring));
+                update_phasebit<1>(phasebits, acc_ring);
+                auto d_tt = d_tt_pool.template subtile<tt<float, globals::ROW_BLOCK,
+                                                                globals::COL_BLOCK>>(
+                                0, globals::COL_BLOCK * acc_ring);
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                     wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
                     update_phasebit<0>(phasebits, stage);
@@ -468,7 +484,10 @@ __device__ inline void fused_comp_sm(const globals& G) {
                         warp::mma_AB(d_tt, inputs[stage].A, inputs[stage].B, inputs_finished[stage]);
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
-                kittens::tensor_commit<1>(mma_done);
+                // Move to the other half of tensor memory so the next tile's
+                // MMAs can start while these consumers are still draining.
+                kittens::tensor_commit<1>(mma_done[acc_ring]);
+                acc_ring ^= 1;
             }
         }
 #endif
@@ -525,16 +544,18 @@ __device__ inline void fused_comp_sm(const globals& G) {
             const int cw   = warpgroup_id * 4 + warp_id;      // consumer warp 0..7
             const int trow = 32 * (cw % 4) + 16 * (cw / 4);   // its tmem row
 
-            wait(mma_done, get_phasebit<0>(phasebits, 0));
-            update_phasebit<0>(phasebits, 0);
+            wait(mma_done[acc_ring], get_phasebit<0>(phasebits, acc_ring));
+            update_phasebit<0>(phasebits, acc_ring);
             warp::load_async(C_accum,
-                             d_tt.template subtile<tt<float, globals::ROW_BLOCK / 8,
-                                                          globals::COL_BLOCK>>(trow, 0));
+                             d_tt_pool.template subtile<tt<float, globals::ROW_BLOCK / 8,
+                                                                globals::COL_BLOCK>>(
+                                 trow, globals::COL_BLOCK * acc_ring));
             kittens::tensor_load_wait();
             group<8>::sync(3);
             // Tensor memory is drained; the MMA warp may start the next tile.
             // One arrival per consumer warpgroup, so tmem_free expects 2.
-            warpgroup::arrive(tmem_free);
+            warpgroup::arrive(tmem_free[acc_ring]);
+            acc_ring ^= 1;
 
             // trow is a row in the 128-row block; C[] is two 64-row tiles.
             auto dst = outputs.C[trow / 64]

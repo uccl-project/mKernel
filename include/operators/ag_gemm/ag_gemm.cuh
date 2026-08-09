@@ -83,7 +83,15 @@ struct globals {
     static constexpr int NUM_NODES = 2;
     // Three stages keep the producer/consumer pipeline deep enough while
     // leaving more shared memory headroom than a four-stage pipeline.
+#ifdef MKERNEL_TCGEN05
+    // Blackwell: 3 stages leaves 48 KB of the 227 KB shared budget unused
+    // (2x48 KB of live stages + 64 KB of outputs aliased on the last one).
+    // Input pipeline depth measured as the dominant factor for the tcgen05
+    // path on gemm_rs, so spend it: 4 stages lands at 208 KB.
+    static constexpr int PIPELINE_STAGES = 4;
+#else
     static constexpr int PIPELINE_STAGES = 3;
+#endif
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
