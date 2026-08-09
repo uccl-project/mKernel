@@ -64,7 +64,14 @@ namespace gemm_rs_multinode {
 // ============================================================================
 
 struct config {
+#ifdef MKERNEL_TCGEN05
+    // 2-CTA clusters: mm2_ABt spans the pair, so A is split by rows and B by
+    // columns across it and each is read once per cluster rather than once per
+    // CTA. That is the arithmetic-intensity win (128 -> 171 FLOP/byte).
+    static constexpr int CLUSTER_SIZE = 2;
+#else
     static constexpr int CLUSTER_SIZE = 1;
+#endif
     static constexpr int NUM_BLOCKS = 132;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
@@ -138,7 +145,7 @@ struct intra_globals {
     // ABt. That is what the 2-CTA form requires -- with mm2_ABt the N extent
     // is B::rows * ncta, i.e. the pair splits B by columns and reads it once
     // per cluster. Same bytes as the K-major tile it replaces.
-    using B_tile = st_bf<COL_BLOCK, RED_BLOCK>;
+    using B_tile = st_bf<COL_BLOCK / 2, RED_BLOCK>;
 #else
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
 #endif
@@ -185,7 +192,8 @@ struct intra_globals {
     // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks that share a
     // single B tile — that sharing is the point: it doubles the FLOPs per byte
     // of B read, which measurement showed is what actually limits this kernel.
-    static constexpr int ROW_BLOCKS_PER_TASK = 2;
+    static constexpr int ROW_BLOCKS_PER_TASK = 2;          // per CTA
+    static constexpr int ROW_BLOCKS_PER_CLUSTER = 4;       // x2 CTAs
     struct pipeline_inputs { A_tile A[ROW_BLOCKS_PER_TASK]; B_tile B; };
 #else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
@@ -583,9 +591,9 @@ void entrypoint_fused(
     // Tasks pair adjacent row blocks inside a device slice, so each slice must
     // hold an even number of them.
     TORCH_CHECK((row_blocks / intra_globals::NUM_DEVICES)
-                    % intra_globals::ROW_BLOCKS_PER_TASK == 0,
+                    % intra_globals::ROW_BLOCKS_PER_CLUSTER == 0,
                 "gemm_rs (Blackwell): row blocks per device slice must be a multiple of ",
-                intra_globals::ROW_BLOCKS_PER_TASK, "; got ",
+                intra_globals::ROW_BLOCKS_PER_CLUSTER, "; got ",
                 row_blocks / intra_globals::NUM_DEVICES);
 #endif
     const int col_blocks = N / intra_globals::COL_BLOCK;

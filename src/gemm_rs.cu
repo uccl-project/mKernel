@@ -53,7 +53,8 @@ __device__ inline void compute_tile_impl(
     int row_blocks, int col_blocks, int num_iters
 #ifdef MKERNEL_TCGEN05
     , tt<float, G::ROW_BLOCK, G::COL_BLOCK * G::ROW_BLOCKS_PER_TASK> &d_tt_pool,
-    semaphore &mma_done, semaphore &tmem_free, semaphore &outputs_free
+    semaphore &mma_done, semaphore &tmem_free, semaphore &outputs_free,
+    int ctarank
 #endif
     )
 {
@@ -78,55 +79,65 @@ __device__ inline void compute_tile_impl(
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                 wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                 update_phasebit<1>(phasebits, stage);
-                tma::expect_bytes(inputs_arrived[stage], sizeof(typename G::pipeline_inputs));
 #ifdef MKERNEL_TCGEN05
-                // Both row blocks of the pair; they share the single B tile
-                // loaded below.
+                // Every CTA loads its own slice (mask = 1 << ctarank) but points
+                // the transaction count at CTA 0, so the leader's single wait
+                // covers the whole cluster's inputs. The expect() that balances
+                // these bytes is issued by the two MMA warps below.
+                //
+                // A: this CTA's two row blocks. B: this CTA's half of N -- the
+                // pair together covers COL_BLOCK, read once per cluster.
                 #pragma unroll
                 for (int h = 0; h < G::ROW_BLOCKS_PER_TASK; h++)
-                    tma::load_async(inputs[stage].A[h], Gv.A,
-                                    {row_idx + h, red_idx}, inputs_arrived[stage]);
+                    tma::cluster::load_async(inputs[stage].A[h], Gv.A,
+                                             {row_idx + 2 * ctarank + h, red_idx},
+                                             inputs_arrived[stage],
+                                             (uint16_t)(1 << ctarank), 0);
+                tma::cluster::load_async(inputs[stage].B, Gv.B,
+                                         {2 * col_idx + ctarank, red_idx}, inputs_arrived[stage],
+                                         (uint16_t)(1 << ctarank), 0);
 #else
+                tma::expect_bytes(inputs_arrived[stage], sizeof(typename G::pipeline_inputs));
                 #pragma unroll
                 for (int i = 0; i < 2; i++)
                     tma::load_async(inputs[stage].A[i], Gv.A,
                                     {row_idx * 2 + i, red_idx}, inputs_arrived[stage]);
-#endif
-#ifdef MKERNEL_TCGEN05
-                tma::load_async(inputs[stage].B, Gv.B, {col_idx, red_idx}, inputs_arrived[stage]);
-#else
                 tma::load_async(inputs[stage].B, Gv.B, {red_idx, col_idx}, inputs_arrived[stage]);
 #endif
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
         }
 #ifdef MKERNEL_TCGEN05
-        else if (w_id == 2 && l_id == 0) {
-            // Blackwell MMA issuer. tcgen05 MMAs are issued by a single thread
-            // and land in tensor memory, so this warp replaces the per-consumer
-            // wgmma the Hopper path runs. Both accumulators must be drained
-            // before the accumulate=0 MMAs overwrite them.
-            wait(tmem_free, get_phasebit<1>(phasebits, 0));
-            update_phasebit<1>(phasebits, 0);
+        else if ((w_id == 2 || w_id == 3) && l_id == 0 && ctarank == 0) {
+            // Blackwell MMA issuers. mm2_ABt spans the CTA pair: A is split by
+            // rows (each CTA keeps its own 128 accumulator rows) and B by
+            // columns, so the leader issues one MMA per accumulator index and
+            // both CTAs' operands feed it. Only ctarank 0 issues.
+            const int acc = w_id - 2;                    // accumulator 0 or 1
             using acc_t = tt<float, G::ROW_BLOCK, G::COL_BLOCK>;
-            auto d0 = d_tt_pool.template subtile<acc_t>(0, 0);
-            auto d1 = d_tt_pool.template subtile<acc_t>(0, G::COL_BLOCK);
+            auto d = d_tt_pool.template subtile<acc_t>(0, G::COL_BLOCK * acc);
+
+            // Both accumulators must be drained cluster-wide before the
+            // accumulate=0 MMAs overwrite them.
+            tma::cluster::wait(tmem_free, get_phasebit<1>(phasebits, 0));
+            update_phasebit<1>(phasebits, 0);
+
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                // One expect per MMA warp; together they account for the six
+                // tile loads (three per CTA) that the loaders redirected here.
+                tma::cluster::expect(inputs_arrived[stage],
+                                     inputs[0].A[0], inputs[0].A[1], inputs[0].B);
+                tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
                 update_phasebit<0>(phasebits, stage);
-                // Two MMAs off one B tile. Only the second carries the
-                // semaphore: tcgen05.commit covers every MMA issued before it,
-                // so one commit releases the stage once both have read it.
-                if (red_idx == 0) {
-                    warp::mm_ABt (d0, inputs[stage].A[0], inputs[stage].B);
-                    warp::mm_ABt (d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
-                } else {
-                    warp::mma_ABt(d0, inputs[stage].A[0], inputs[stage].B);
-                    warp::mma_ABt(d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
-                }
+                // commit<2> multicasts, so each CTA's inputs_finished sees both
+                // MMAs and its loader is released in step with the leader.
+                if (red_idx == 0)
+                    warp::mm2_ABt (d, inputs[stage].A[acc], inputs[stage].B, inputs_finished[stage]);
+                else
+                    warp::mma2_ABt(d, inputs[stage].A[acc], inputs[stage].B, inputs_finished[stage]);
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
-            kittens::tensor_commit<1>(mma_done);
+            kittens::tensor_commit<2>(mma_done);
         }
 #endif
         else if (w_id == 1 && l_id == 0) {
@@ -141,7 +152,7 @@ __device__ inline void compute_tile_impl(
                 // phase bit and flip it each round.
                 wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
                 update_phasebit<0>(phasebits, 0);
-                const int rb = row_idx + h;
+                const int rb = row_idx + 2 * ctarank + h;
                 #pragma unroll
                 for (int i = 0; i < 2; i++)
                     tma::store_async(Gv.workspace[Gv.dev_idx], outputs.C[i], {rb * 2 + i, col_idx});
@@ -170,7 +181,7 @@ __device__ inline void compute_tile_impl(
                     }
                 }
                 tma::store_async_read_wait();
-                signal_ready(Gv.ready, ready_idx + h * col_blocks);
+                signal_ready(Gv.ready, ready_idx + (2 * ctarank + h) * col_blocks);
                 if (h + 1 < G::ROW_BLOCKS_PER_TASK) arrive(outputs_free);
                 else                                arrive(outputs_finished);
             }
@@ -248,8 +259,9 @@ __device__ inline void compute_tile_impl(
             group<8>::sync(4);
             warpgroup::arrive(outputs_arrived);
         }
-        // Both accumulators are drained; the MMA warp may start the next task.
-        warpgroup::arrive(tmem_free);
+        // Both accumulators are drained. Signal the leader CTA, which is where
+        // the MMA warps wait: 2 warpgroups x 2 CTAs = 4 arrivals.
+        if (w_id == 0 && l_id == 0) tma::cluster::arrive(tmem_free, 0, 1);
 #else
         rt_fl<G::ROW_BLOCK / 8, G::COL_BLOCK> C_accum;
         warp::zero(C_accum);
@@ -1033,11 +1045,13 @@ __device__ inline void fused_kernel(const fused_globals &G) {
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < intra_globals::PIPELINE_STAGES; ++i) {
-            init_semaphore(inputs_arrived[i], 0, 1);
+            // One expect() per MMA warp on the leader CTA.
+            init_semaphore(inputs_arrived[i], 0, 2);
 #ifdef MKERNEL_TCGEN05
             // Blackwell: the single tcgen05 MMA releases the stage (one commit),
             // instead of 8 consumer warps each arriving after their wgmma.
-            init_semaphore(inputs_finished[i], 0, 1);
+            // Both MMA warps commit, and commit<2> multicasts to both CTAs.
+            init_semaphore(inputs_finished[i], 0, 2);
 #else
             init_semaphore(inputs_finished[i], 0, 8);
 #endif
@@ -1045,8 +1059,8 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         init_semaphore(outputs_arrived, 0, 2);   // per round, one per consumer warpgroup
         init_semaphore(outputs_finished, 0, 1);
 #ifdef MKERNEL_TCGEN05
-        init_semaphore(mma_done,     0, 1);   // one tensor_commit per task
-        init_semaphore(tmem_free,    0, 2);   // one per consumer warpgroup
+        init_semaphore(mma_done,     0, 2);   // one commit per accumulator
+        init_semaphore(tmem_free,    0, 4);   // 2 warpgroups x 2 CTAs
         init_semaphore(outputs_free, 0, 1);   // one per store-warp round
 #endif
     }
@@ -1056,7 +1070,10 @@ __device__ inline void fused_kernel(const fused_globals &G) {
     // Tensor-memory allocation is CTA-wide (the ctor runs tcgen05.alloc on warp
     // 0 then bar.sync 0), so it must be reached by every thread of the CTA and
     // must sit outside the role dispatch below.
-    tensor_allocator<1, 1> tm_alloc{};
+    // Cluster-wide sync: every CTA's semaphores must exist before any peer
+    // redirects a transaction or arrival at them.
+    everyone::tma::cluster::sync();
+    tensor_allocator<1, 2> tm_alloc{};
     // All 512 columns: one 128x256 fp32 accumulator per row block of the task.
     auto d_tt_pool = tm_alloc.allocate<tt<float, intra_globals::ROW_BLOCK,
                                                 intra_globals::COL_BLOCK *
@@ -1093,11 +1110,14 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         // row block. Same slice also means the same owner device, so the
         // staging math below is unchanged.
         const int tiles_per_round = intra_globals::NUM_DEVICES * col_blocks;
-        const int num_pair_blocks = num_blocks / intra_globals::ROW_BLOCKS_PER_TASK;
-        for (int pair_id = (int)blockIdx.x; pair_id < num_pair_blocks; pair_id += I.num_comp_sms) {
+        const int num_cluster_tasks = num_blocks / intra_globals::ROW_BLOCKS_PER_CLUSTER;
+        const int ctarank    = cluster_ctarank();
+        const int cluster_id = (int)blockIdx.x / config::CLUSTER_SIZE;
+        const int num_clusters = I.num_comp_sms / config::CLUSTER_SIZE;
+        for (int pair_id = cluster_id; pair_id < num_cluster_tasks; pair_id += num_clusters) {
             const int round_pair = pair_id / tiles_per_round;
             const int within     = pair_id - round_pair * tiles_per_round;
-            const int task_id    = round_pair * intra_globals::ROW_BLOCKS_PER_TASK * tiles_per_round
+            const int task_id    = round_pair * intra_globals::ROW_BLOCKS_PER_CLUSTER * tiles_per_round
                                  + within;
 #else
         for (int task_id = (int)blockIdx.x; task_id < num_blocks; task_id += I.num_comp_sms) {
@@ -1115,7 +1135,8 @@ __device__ inline void fused_kernel(const fused_globals &G) {
                                               outputs_arrived, outputs_finished, stage, phasebits,
                                               row_blocks, col_blocks, num_iters
 #ifdef MKERNEL_TCGEN05
-                                              , d_tt_pool, mma_done, tmem_free, outputs_free
+                                              , d_tt_pool, mma_done, tmem_free, outputs_free,
+                                              ctarank
 #endif
                                               );
             // Compute-side chunk-ready signal. When this GPU finishes all
@@ -1131,7 +1152,7 @@ __device__ inline void fused_kernel(const fused_globals &G) {
 #ifdef MKERNEL_TCGEN05
               // One signal per row block of the task.
               for (int h = 0; h < intra_globals::ROW_BLOCKS_PER_TASK; ++h) {
-                const int row_idx = row_idx_base + h;
+                const int row_idx = row_idx_base + 2 * ctarank + h;
 #endif
                 auto &Rt = *G.rt;
                 const int chunk_col = col_idx / Rt.chunk_tiles_val;
@@ -1214,7 +1235,12 @@ __global__ void gemm_rs_fused_zero_kernel(gemm_rs_zero_regions_t regs) {
     }
 }
 
+#ifdef MKERNEL_TCGEN05
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
+__cluster_dims__(config::CLUSTER_SIZE, 1, 1)
+#else
+__global__ __launch_bounds__(config::NUM_THREADS, 1)
+#endif
 void gemm_rs_fused_kernel_stub(const __grid_constant__ fused_globals G) {
     fused_kernel(G);
 }
@@ -1223,9 +1249,11 @@ void gemm_rs_fused_kernel_stub(const __grid_constant__ fused_globals G) {
 void launch_fused_gemm_rs(const fused_globals& G, unsigned int active_sms) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int dynamic_shared_memory = config::DYNAMIC_SHARED_MEMORY;
-    const unsigned int grid = (active_sms == 0u)
+    unsigned int grid = (active_sms == 0u)
         ? (unsigned int)config::NUM_BLOCKS
         : active_sms;
+    // Clusters are launched whole.
+    grid -= grid % (unsigned int)config::CLUSTER_SIZE;
     MKERNEL_CUDACHECK(cudaFuncSetAttribute(
         gemm_rs_fused_kernel_stub,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
