@@ -112,16 +112,23 @@ __device__ __forceinline__ uint32_t gemm_rs_poll_arrival_relaxed(volatile uint32
 
 struct intra_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
+#ifdef MKERNEL_TCGEN05
+    // Blackwell stages carry two A tiles (one per row block of the pair) plus
+    // the shared B tile = 64 KB. Outputs alias the last stage, so 3 stages is
+    // 192 KB of the 227 KB budget. Each stage now feeds twice the MMA work, so
+    // the shallower ring still covers more latency than the Hopper path's 4.
+    static constexpr int PIPELINE_STAGES = 3;
+#else
     static constexpr int PIPELINE_STAGES = 4;
+#endif
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
 #ifdef MKERNEL_TCGEN05
-    // Blackwell: tcgen05 issues one M=128 MMA for the whole row block, so A
-    // arrives as a single 128-row tile instead of two 64-row halves. Same
-    // bytes, one TMA load instead of two.
+    // Blackwell: tcgen05 issues one M=128 MMA per row block, so A is a single
+    // 128-row tile rather than two 64-row halves.
     using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
 #else
     using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
@@ -167,7 +174,11 @@ struct intra_globals {
     unsigned int *kernel_done;
 
 #ifdef MKERNEL_TCGEN05
-    struct pipeline_inputs { A_tile A;    B_tile B; };
+    // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks that share a
+    // single B tile — that sharing is the point: it doubles the FLOPs per byte
+    // of B read, which measurement showed is what actually limits this kernel.
+    static constexpr int ROW_BLOCKS_PER_TASK = 2;
+    struct pipeline_inputs { A_tile A[ROW_BLOCKS_PER_TASK]; B_tile B; };
 #else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
 #endif
@@ -556,6 +567,15 @@ void entrypoint_fused(
     const int N = (int)B.size(1);
     const int M_local = (int)output.data_.size(0);
     const int row_blocks = M / intra_globals::ROW_BLOCK;
+#ifdef MKERNEL_TCGEN05
+    // Tasks pair adjacent row blocks inside a device slice, so each slice must
+    // hold an even number of them.
+    TORCH_CHECK((row_blocks / intra_globals::NUM_DEVICES)
+                    % intra_globals::ROW_BLOCKS_PER_TASK == 0,
+                "gemm_rs (Blackwell): row blocks per device slice must be a multiple of ",
+                intra_globals::ROW_BLOCKS_PER_TASK, "; got ",
+                row_blocks / intra_globals::NUM_DEVICES);
+#endif
     const int col_blocks = N / intra_globals::COL_BLOCK;
     const int local_row_blocks = M_local / fused_globals::ROW_BLOCK;
     const int total_inter_tiles = local_row_blocks * col_blocks;
