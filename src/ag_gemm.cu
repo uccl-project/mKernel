@@ -279,16 +279,41 @@ __device__ inline void fused_comp_sm(const globals& G) {
     __shared__ semaphore inputs_finished[globals::PIPELINE_STAGES];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
+#ifdef MKERNEL_TCGEN05
+    // mma_done : MMA warp -> consumers, "tensor-memory accumulator is complete"
+    // tmem_free: consumers -> MMA warp, "tensor memory drained, safe to reuse"
+    __shared__ semaphore mma_done;
+    __shared__ semaphore tmem_free;
+#endif
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < globals::PIPELINE_STAGES; ++i) {
             init_semaphore(inputs_arrived[i], 0, 1);
+#ifdef MKERNEL_TCGEN05
+            // Blackwell: the single tcgen05 MMA releases the stage (one
+            // commit), instead of 8 consumer warps each arriving after wgmma.
+            init_semaphore(inputs_finished[i], 0, 1);
+#else
             init_semaphore(inputs_finished[i], 0, 8);
+#endif
         }
         init_semaphore(outputs_arrived, 0, 2);
         init_semaphore(outputs_finished, 0, 1);
+#ifdef MKERNEL_TCGEN05
+        init_semaphore(mma_done,  0, 1);   // one tensor_commit
+        init_semaphore(tmem_free, 0, 2);   // one arrival per consumer warpgroup
+#endif
     }
     __syncthreads();
+
+#ifdef MKERNEL_TCGEN05
+    // Tensor-memory allocation is CTA-wide (the ctor runs tcgen05.alloc on warp
+    // 0 then bar.sync 0), so every thread of a compute CTA must reach it and it
+    // must sit outside the warp-role split below.
+    tensor_allocator<1, 1> tm_alloc{};
+    auto d_tt = tm_alloc.allocate<tt<float, globals::ROW_BLOCK,
+                                           globals::COL_BLOCK>>(0);
+#endif
 
     int warpgroup_id = warpgroup::groupid();
     int warp_id = warpgroup::warpid();
@@ -383,6 +408,17 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     update_phasebit<1>(phasebits, stage);
                     tma::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs));
+#ifdef MKERNEL_TCGEN05
+                    // One 128-row A tile; coordinates are in units of A_tile,
+                    // so the *2+i indexing of the two-half layout collapses.
+                    if (is_remote) {
+                        tma::load_async(inputs[stage].A, G.A_recv[G.dev_idx],
+                                        {recv_peer_slot * node_row_blocks + shard_rb, red_idx}, inputs_arrived[stage]);
+                    } else {
+                        tma::load_async(inputs[stage].A, G.A_local,
+                                        {row_idx, red_idx}, inputs_arrived[stage]);
+                    }
+#else
                     #pragma unroll
                     for (int i = 0; i < 2; i++) {
                         if (is_remote) {
@@ -396,11 +432,47 @@ __device__ inline void fused_comp_sm(const globals& G) {
                                             {row_idx * 2 + i, red_idx}, inputs_arrived[stage]);
                         }
                     }
+#endif
                     tma::load_async(inputs[stage].B, G.B, {red_idx, col_idx}, inputs_arrived[stage]);
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
             }
-        } else if (warp_id == 1 && lane_id == 0) {
+        }
+#ifdef MKERNEL_TCGEN05
+        else if (warp_id == 2 && lane_id == 0) {
+            // Blackwell MMA issuer. tcgen05 MMAs are issued by one thread and
+            // accumulate in tensor memory, so this warp replaces the wgmma the
+            // consumers used to run. It walks the same task order as the loader
+            // and consumers — including the identical remote-skip — so the
+            // input pipeline stays in lockstep.
+            for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
+                const int shard_step = task_id / num_node_blocks;
+                const int shard_rank = ag_gemm_shard_rank_for_step(
+                    G.node_idx, G.num_nodes, shard_step);
+                if (shard_rank != G.node_idx && G.debug_skip_remote_compute != 0) {
+                    continue;
+                }
+                // Tensor memory must be drained before the accumulate=0 MMA
+                // overwrites it.
+                wait(tmem_free, get_phasebit<1>(phasebits, 0));
+                update_phasebit<1>(phasebits, 0);
+                for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                    wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    update_phasebit<0>(phasebits, stage);
+                    // mm_AB zeroes the accumulator, mma_AB accumulates onto it.
+                    // The semaphore fires once the MMA has consumed the shared
+                    // operands, releasing the stage back to the loader.
+                    if (red_idx == 0)
+                        warp::mm_AB (d_tt, inputs[stage].A, inputs[stage].B, inputs_finished[stage]);
+                    else
+                        warp::mma_AB(d_tt, inputs[stage].A, inputs[stage].B, inputs_finished[stage]);
+                    stage = (stage + 1) % globals::PIPELINE_STAGES;
+                }
+                kittens::tensor_commit<1>(mma_done);
+            }
+        }
+#endif
+        else if (warp_id == 1 && lane_id == 0) {
             // TMA store warp — same super-tile-swizzled task order as loader
             for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
                 const int shard_step = task_id / num_node_blocks;
@@ -441,6 +513,37 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 continue;
             }
             rt_fl<globals::ROW_BLOCK / 8, globals::COL_BLOCK> C_accum;
+#ifdef MKERNEL_TCGEN05
+            // Blackwell consumers do no MMA. They wait for the tensor-memory
+            // accumulator, pull their 16-row slice into registers, release
+            // tmem, then stage the tile in shared for the epilogue TMA warp.
+            //
+            // Row mapping follows ThunderKittens' group<8> tmem layout: the 8
+            // consumer warps each own 16 of the 128 rows, at
+            // `32*(w%4) + 16*(w/4)`. Two warps share each 32-lane tmem
+            // sub-partition, which is the granularity tcgen05.ld requires.
+            const int cw   = warpgroup_id * 4 + warp_id;      // consumer warp 0..7
+            const int trow = 32 * (cw % 4) + 16 * (cw / 4);   // its tmem row
+
+            wait(mma_done, get_phasebit<0>(phasebits, 0));
+            update_phasebit<0>(phasebits, 0);
+            warp::load_async(C_accum,
+                             d_tt.template subtile<tt<float, globals::ROW_BLOCK / 8,
+                                                          globals::COL_BLOCK>>(trow, 0));
+            kittens::tensor_load_wait();
+            group<8>::sync(3);
+            // Tensor memory is drained; the MMA warp may start the next tile.
+            // One arrival per consumer warpgroup, so tmem_free expects 2.
+            warpgroup::arrive(tmem_free);
+
+            // trow is a row in the 128-row block; C[] is two 64-row tiles.
+            auto dst = outputs.C[trow / 64]
+                           .template subtile<globals::ROW_BLOCK / 8, globals::COL_BLOCK>(
+                               {(trow % 64) / (globals::ROW_BLOCK / 8), 0});
+            warp::store(dst, C_accum);
+            group<8>::sync(4);
+            warpgroup::arrive(outputs_arrived);
+#else
             warp::zero(C_accum);
 
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
@@ -456,6 +559,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
             warpgroup::store(outputs.C[warpgroup_id], C_accum);
             warpgroup::sync(warpgroup_id + 1);
             warpgroup::arrive(outputs_arrived);
+#endif
         }
     }
 }
@@ -616,9 +720,13 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
     }
 
     const int prologue_blocks = G.num_intra_comm > 0 ? G.num_intra_comm : 1;
+    // Single-node runs have no peers, so there are no RDMA work requests to
+    // post. Skipping is not just an optimisation: the caller has no session,
+    // so the d2h FIFO handles are null and the prologue would fault on them.
     const bool skip_prologue =
-        std::getenv("AG_GEMM_SKIP_PROLOGUE") != nullptr &&
-        std::getenv("AG_GEMM_SKIP_PROLOGUE")[0] == '1';
+        G.num_nodes == 1 ||
+        (std::getenv("AG_GEMM_SKIP_PROLOGUE") != nullptr &&
+         std::getenv("AG_GEMM_SKIP_PROLOGUE")[0] == '1');
     if (skip_prologue) {
         ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
                                     dynamic_shared_memory, stream>>>(G);

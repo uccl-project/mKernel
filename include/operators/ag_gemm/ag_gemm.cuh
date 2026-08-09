@@ -89,7 +89,14 @@ struct globals {
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
+#ifdef MKERNEL_TCGEN05
+    // Blackwell: tcgen05 issues one M=128 MMA per row block, so the compute
+    // path takes A as a single 128-row tile instead of two 64-row halves.
+    // A_comm_tile (the ring all-gather granularity) is unaffected.
+    using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
+#else
     using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
+#endif
     using A_comm_tile = st_bf<ROW_BLOCK * 2, RED_BLOCK * 2>;
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
@@ -146,7 +153,11 @@ struct globals {
     const int num_intra_comm;  // CTAs for intra-node IPC gather + RDMA push
     const int num_comp_sms;    // CTAs for GEMM compute
 
+#ifdef MKERNEL_TCGEN05
+    struct pipeline_inputs { A_tile A;    B_tile B; };
+#else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
+#endif
     struct pipeline_outputs { C_tile C[2]; };
 };
 
@@ -449,7 +460,13 @@ void entrypoint(
     // Ring all-gather: n_peers hops, each into its own recv bank so a
     // forward never overwrites a slot another GPU is still TMA-reading.
     const int ring_recv_banks = std::max(1, num_nodes - 1);
-    const int recv_tensor_rows = M_node * (num_nodes - 1) * ring_recv_banks;
+    // Single-node runs have no peers, so the ring receive area is empty. TMA
+    // descriptors cannot be built over a zero-extent tensor, so clamp to one
+    // A_comm_tile of rows. The kernel never reads it: with num_nodes == 1
+    // every task decodes to the local shard, so is_remote is never true.
+    const int recv_rows_raw = M_node * (num_nodes - 1) * ring_recv_banks;
+    const int recv_tensor_rows =
+        std::max(globals::ROW_BLOCK * 2, recv_rows_raw);
     const int recv_tensor_cols = K;
     auto A_recv_local_tensor = ::dist::make_local_tensor<globals::A_local_tensor>(
         (uint64_t)recv_buf_ptr, 1, 1,
@@ -461,7 +478,7 @@ void entrypoint(
         .A_local = A_local,
         .A_recv_local_tensor = A_recv_local_tensor,
         .A_recv = ::dist::distributed_tensor_from_buffer<globals::A_distributed_tensor>(
-            A_recv, 1, 1, M_node * (num_nodes - 1), K),
+            A_recv, 1, 1, std::max(globals::ROW_BLOCK * 2, M_node * (num_nodes - 1)), K),
         .B = ::dist::local_tensor_from_tensor<globals::B_local_tensor>(B),
         .C = ::dist::local_tensor_from_tensor<globals::C_local_tensor>(C),
         .d2h_fifos = fifo_bundle,
