@@ -92,7 +92,11 @@ __device__ inline void compute_tile_impl(
                     tma::load_async(inputs[stage].A[i], Gv.A,
                                     {row_idx * 2 + i, red_idx}, inputs_arrived[stage]);
 #endif
+#ifdef MKERNEL_TCGEN05
+                tma::load_async(inputs[stage].B, Gv.B, {col_idx, red_idx}, inputs_arrived[stage]);
+#else
                 tma::load_async(inputs[stage].B, Gv.B, {red_idx, col_idx}, inputs_arrived[stage]);
+#endif
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
         }
@@ -114,11 +118,11 @@ __device__ inline void compute_tile_impl(
                 // semaphore: tcgen05.commit covers every MMA issued before it,
                 // so one commit releases the stage once both have read it.
                 if (red_idx == 0) {
-                    warp::mm_AB (d0, inputs[stage].A[0], inputs[stage].B);
-                    warp::mm_AB (d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
+                    warp::mm_ABt (d0, inputs[stage].A[0], inputs[stage].B);
+                    warp::mm_ABt (d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
                 } else {
-                    warp::mma_AB(d0, inputs[stage].A[0], inputs[stage].B);
-                    warp::mma_AB(d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
+                    warp::mma_ABt(d0, inputs[stage].A[0], inputs[stage].B);
+                    warp::mma_ABt(d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
                 }
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
@@ -147,7 +151,15 @@ __device__ inline void compute_tile_impl(
                     const int local_row_idx_at_owner_fuse =
                         rb - owner_dev_idx_fuse * row_blocks_per_dev_fuse;
                     const int col_blocks_local_fuse =
-                        (int)(Gv.B.cols() / G::COL_BLOCK);
+#ifdef MKERNEL_TCGEN05
+                        (int)(Gv.B.rows() / G::COL_BLOCK);   // B is (N, K)
+#else
+    #ifdef MKERNEL_TCGEN05
+                    (int)(Gv.B.rows() / G::COL_BLOCK);   // B is (N, K)
+#else
+                    (int)(Gv.B.cols() / G::COL_BLOCK);
+#endif
+#endif
                     const int global_tile_idx_owner_fuse =
                         local_row_idx_at_owner_fuse * col_blocks_local_fuse + col_idx;
                     #pragma unroll
@@ -176,7 +188,11 @@ __device__ inline void compute_tile_impl(
                 const int local_row_idx_at_owner_fuse =
                     row_idx - owner_dev_idx_fuse * row_blocks_per_dev_fuse;
                 const int col_blocks_local_fuse =
+#ifdef MKERNEL_TCGEN05
+                    (int)(Gv.B.rows() / G::COL_BLOCK);   // B is (N, K)
+#else
                     (int)(Gv.B.cols() / G::COL_BLOCK);
+#endif
                 const int global_tile_idx_owner_fuse =
                     local_row_idx_at_owner_fuse * col_blocks_local_fuse + col_idx;
                 #pragma unroll
@@ -295,7 +311,11 @@ __device__ inline void fused_comm_tile_impl(
             // Accumulate this partial tile into the owning GPU's chunk-major
             // staging buffer. Each C_tile maps to one row-tile in that layout.
             const int col_blocks_local =
+#ifdef MKERNEL_TCGEN05
+                (int)(I.B.rows() / fused_globals::COL_BLOCK);   // B is (N, K)
+#else
                 (int)(I.B.cols() / fused_globals::COL_BLOCK);
+#endif
             const int global_tile_idx_owner =
                 local_row_idx * col_blocks_local + col_idx;
             tma::store_add_async(I.staging[owner_dev_idx], partials[i],
@@ -1046,7 +1066,11 @@ __device__ inline void fused_kernel(const fused_globals &G) {
 
 
     const int row_blocks = I.A.rows() / intra_globals::ROW_BLOCK;
+#ifdef MKERNEL_TCGEN05
+    const int col_blocks = I.B.rows() / intra_globals::COL_BLOCK;   // B is (N, K)
+#else
     const int col_blocks = I.B.cols() / intra_globals::COL_BLOCK;
+#endif
     const int num_blocks = row_blocks * col_blocks;
     const int num_iters = I.A.cols() / intra_globals::RED_BLOCK;
 

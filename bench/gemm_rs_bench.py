@@ -122,6 +122,10 @@ def parse_args():
     return p.parse_args()
 
 
+# The Blackwell (tcgen05) build takes B as (N, K); the Hopper build takes (K, N).
+TCGEN05 = os.environ.get("MKERNEL_TCGEN05", "1") == "1"
+
+
 def main():
     args = parse_args()
     rank = int(os.environ["RANK"])
@@ -192,7 +196,10 @@ def main():
         torch.manual_seed(42 + global_gpu_idx)
         torch.cuda.manual_seed(42 + global_gpu_idx)
         A = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
-        B = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
+        # The Blackwell path issues the MMA as ABt, so it takes B N-major.
+        # Keep one logical B and hand the kernel whichever layout it wants.
+        B_ref = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
+        B = B_ref.t().contiguous() if TCGEN05 else B_ref
 
         workspace = mod.DistBuffer(
             (m, n), dtype=torch.bfloat16,
@@ -407,7 +414,7 @@ def main():
             # all 8 local GPUs in the node, then reduce the owning local-rank
             # slice across nodes.
             # Keep on GPU so the NCCL backend can all_reduce/all_gather it.
-            ref_slice = torch.matmul(A[row_lo:row_hi], B)
+            ref_slice = torch.matmul(A[row_lo:row_hi], B_ref)
             dist.all_reduce(
                 ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
             )

@@ -133,7 +133,15 @@ struct intra_globals {
 #else
     using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
 #endif
+#ifdef MKERNEL_TCGEN05
+    // Blackwell takes B N-major (shape (N, K)) so the MMA can be issued as
+    // ABt. That is what the 2-CTA form requires -- with mm2_ABt the N extent
+    // is B::rows * ncta, i.e. the pair splits B by columns and reads it once
+    // per cluster. Same bytes as the K-major tile it replaces.
+    using B_tile = st_bf<COL_BLOCK, RED_BLOCK>;
+#else
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
+#endif
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
 
     using A_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, A_tile>;
@@ -564,7 +572,11 @@ void entrypoint_fused(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev_idx).stream();
 
     const int M = (int)A.size(0);
+#ifdef MKERNEL_TCGEN05
+    const int N = (int)B.size(0);   // B is (N, K) on this path
+#else
     const int N = (int)B.size(1);
+#endif
     const int M_local = (int)output.data_.size(0);
     const int row_blocks = M / intra_globals::ROW_BLOCK;
 #ifdef MKERNEL_TCGEN05
