@@ -84,11 +84,11 @@ struct globals {
     // Three stages keep the producer/consumer pipeline deep enough while
     // leaving more shared memory headroom than a four-stage pipeline.
 #ifdef MKERNEL_TCGEN05
-    // Blackwell: 3 stages leaves 48 KB of the 227 KB shared budget unused
-    // (2x48 KB of live stages + 64 KB of outputs aliased on the last one).
-    // Input pipeline depth measured as the dominant factor for the tcgen05
-    // path on gemm_rs, so spend it: 4 stages lands at 208 KB.
-    static constexpr int PIPELINE_STAGES = 4;
+    // A stage now carries two A tiles (one per row block of the pair) plus the
+    // shared B tile = 64 KB. With outputs on their own 32 KB allocation that
+    // is 3x64 + 32 = 224 KB. Each stage feeds twice the MMA work, so the
+    // shallower pipeline still covers more latency than the old 4.
+    static constexpr int PIPELINE_STAGES = 3;
 #else
     static constexpr int PIPELINE_STAGES = 3;
 #endif
@@ -162,11 +162,21 @@ struct globals {
     const int num_comp_sms;    // CTAs for GEMM compute
 
 #ifdef MKERNEL_TCGEN05
-    struct pipeline_inputs { A_tile A;    B_tile B; };
+    // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks sharing a single
+    // B tile; that sharing doubles the FLOPs per byte of B read.
+    static constexpr int ROW_BLOCKS_PER_TASK = 2;
+    struct pipeline_inputs { A_tile A[ROW_BLOCKS_PER_TASK]; B_tile B; };
 #else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
 #endif
+#ifdef MKERNEL_TCGEN05
+    // One staging tile: the four 64-row halves of the pair go out in sequence,
+    // which is what lets outputs have their own allocation instead of aliasing
+    // the last input stage and gating the loader.
+    struct pipeline_outputs { C_tile C; };
+#else
     struct pipeline_outputs { C_tile C[2]; };
+#endif
 };
 
 __device__ inline unsigned long long ag_gemm_globaltimer() {
