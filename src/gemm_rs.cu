@@ -54,7 +54,7 @@ __device__ inline void compute_tile_impl(
 #ifdef MKERNEL_TCGEN05
     , tt<float, G::ROW_BLOCK, G::COL_BLOCK * G::ROW_BLOCKS_PER_TASK> &d_tt_pool,
     semaphore &mma_done, semaphore (&tmem_free)[G::ROW_BLOCKS_PER_TASK],
-    semaphore &outputs_free, int ctarank
+    semaphore &outputs_free, int ctarank, bool write_workspace
 #endif
     )
 {
@@ -162,8 +162,13 @@ __device__ inline void compute_tile_impl(
                 for (int hs = 0; hs < 2; hs++) {
                     wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
                     update_phasebit<0>(phasebits, 0);
-                    tma::store_async(Gv.workspace[Gv.dev_idx], outputs.C,
-                                     {rb * 2 + hs, col_idx});
+                    // workspace is only ever read back by the inter-node
+                    // reduce path (fused_comm_tile_impl). With no session that
+                    // path never launches, so the copy is dead work - half the
+                    // epilogue's TMA stores and half its global write traffic.
+                    if (write_workspace)
+                        tma::store_async(Gv.workspace[Gv.dev_idx], outputs.C,
+                                         {rb * 2 + hs, col_idx});
                     tma::store_add_async(Gv.staging[owner_dev_idx_fuse], outputs.C,
                                          {2 * global_tile_idx_owner_fuse + hs, 0});
                     tma::store_async_read_wait();
@@ -1141,7 +1146,7 @@ __device__ inline void fused_kernel(const fused_globals &G) {
                                               row_blocks, col_blocks, num_iters
 #ifdef MKERNEL_TCGEN05
                                               , d_tt_pool, mma_done, tmem_free, outputs_free,
-                                              ctarank
+                                              ctarank, /*write_workspace=*/G.rt != nullptr
 #endif
                                               );
             // Compute-side chunk-ready signal. When this GPU finishes all
