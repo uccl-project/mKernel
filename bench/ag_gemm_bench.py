@@ -54,6 +54,10 @@ DEFAULT_SHAPES = (
 # at small M (NCCL has minimal launch overhead and beats the fused path there
 # unless we cut the comm-CTA budget). The 64-sms default oversubscribes comm
 # CTAs at medium M where the GEMM wave count is lower.
+# The Blackwell (tcgen05) build takes B as (N, K)? No - ag_gemm keeps its
+# layout. This flag only gates the Hopper-tuned comm-SM table below.
+TCGEN05 = os.environ.get("MKERNEL_TCGEN05", "1") == "1"
+
 SMS_PER_SHAPE = {4096: 8, 6144: 8, 8192: 8, 12288: 8, 16384: 8,
                  24576: 8, 49152: 8, 65536: 8, 57344: 8, 73728: 8}
 
@@ -146,9 +150,20 @@ def main():
             INTRA_OVERRIDE[base_n] = int(os.environ[env_key])
             if is_chief:
                 print(f"[ag_gemm] env override {env_key}={os.environ[env_key]}", flush=True)
+    default_num_comm_sms = args.num_comm_sms
     for base_n in shapes:
         # Per-shape num_comm_sms override (small-M overhead reduction).
-        if base_n in SMS_PER_SHAPE:
+        # Reset first: this used to mutate args and never restore it, so a shape
+        # absent from the table inherited the previous shape's value. That made
+        # M=32768 run with 8 comm CTAs instead of 64 in any multi-shape sweep,
+        # worth about 24% on that shape.
+        args.num_comm_sms = default_num_comm_sms
+        # The table above is Hopper tuning. On Blackwell the tcgen05 compute
+        # path is fast enough that the intra-node all-gather becomes the
+        # critical path, and 8 comm CTAs starve it: measured 0.551 -> 0.325 ms
+        # at M=8192 and 2.238 -> 1.348 at M=16384 going from 8 to 32, flat
+        # beyond. Keep the 64 default there.
+        if base_n in SMS_PER_SHAPE and not TCGEN05:
             args.num_comm_sms = SMS_PER_SHAPE[base_n]
             if is_chief:
                 print(f"[ag_gemm] M={base_n}: per-shape num_comm_sms={args.num_comm_sms}",
