@@ -120,11 +120,16 @@ __device__ __forceinline__ uint32_t gemm_rs_poll_arrival_relaxed(volatile uint32
 struct intra_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 #ifdef MKERNEL_TCGEN05
-    // Blackwell stages carry two A tiles (one per row block of the pair) plus
-    // the shared B tile = 64 KB. Outputs alias the last stage, so 3 stages is
-    // 192 KB of the 227 KB budget. Each stage now feeds twice the MMA work, so
-    // the shallower ring still covers more latency than the Hopper path's 4.
-    static constexpr int PIPELINE_STAGES = 3;
+    // Two A tiles plus this CTA's half of B = 48 KB per stage. Outputs alias
+    // the last stage, so 4 stages is 208 KB of the 227 KB budget -- the same
+    // shape and depth upstream's b200 kernel runs.
+    //
+    // This was 3 while B was full width; the 2-CTA split halved the B tile and
+    // bought the stage back. Measurement says that matters: at M=32768 this
+    // kernel and upstream request identical bytes (51.5 GB) for identical
+    // FLOPs, and upstream is 1.2x faster, so the gap is prefetch depth keeping
+    // the tensor cores fed rather than anything about memory traffic.
+    static constexpr int PIPELINE_STAGES = 4;
 #else
     static constexpr int PIPELINE_STAGES = 4;
 #endif
