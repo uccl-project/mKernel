@@ -203,7 +203,15 @@ struct intra_globals {
 #else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
 #endif
+#ifdef MKERNEL_TCGEN05
+    // One staging tile, not two: the pair of 64-row halves goes out in
+    // sequence. Halving this to 32 KB is what buys outputs their own
+    // allocation at 4 stages (4x48 + 32 = 224 KB), which removes the loader's
+    // per-task wait on the epilogue -- the edge the roofline points at.
+    struct pipeline_outputs { C_tile C; };
+#else
     struct pipeline_outputs { C_tile C[2]; };
+#endif
 };
 
 struct fused_globals {

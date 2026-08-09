@@ -53,8 +53,8 @@ __device__ inline void compute_tile_impl(
     int row_blocks, int col_blocks, int num_iters
 #ifdef MKERNEL_TCGEN05
     , tt<float, G::ROW_BLOCK, G::COL_BLOCK * G::ROW_BLOCKS_PER_TASK> &d_tt_pool,
-    semaphore &mma_done, semaphore &tmem_free, semaphore &outputs_free,
-    int ctarank
+    semaphore &mma_done, semaphore (&tmem_free)[G::ROW_BLOCKS_PER_TASK],
+    semaphore &outputs_free, int ctarank
 #endif
     )
 {
@@ -67,15 +67,14 @@ __device__ inline void compute_tile_impl(
 
     if (wg_id == config::NUM_WARPGROUPS - 1) {
         if (w_id == 0 && l_id == 0) {
-            // Outputs alias the last input stage, so the loader must not
-            // refill until the store warp has drained it.
-            //
-            // Measured on B300: giving outputs their own allocation removes
-            // this gate, but at 48 KB/stage + 64 KB of outputs it only fits
-            // with 3 stages, and dropping the input pipeline from 4 to 3
-            // stages costs ~18% at M=32768 - far more than the gate is worth.
+#ifndef MKERNEL_TCGEN05
+            // Outputs alias the last input stage here, so the loader must not
+            // refill until the store warp has drained it. The Blackwell path
+            // gives outputs their own 32 KB allocation and moves this gate onto
+            // the consumers, which are the ones that write the tile.
             wait(outputs_finished, get_phasebit<1>(phasebits, G::PIPELINE_STAGES));
             update_phasebit<1>(phasebits, G::PIPELINE_STAGES);
+#endif
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                 wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                 update_phasebit<1>(phasebits, stage);
@@ -117,10 +116,12 @@ __device__ inline void compute_tile_impl(
             using acc_t = tt<float, G::ROW_BLOCK, G::COL_BLOCK>;
             auto d = d_tt_pool.template subtile<acc_t>(0, G::COL_BLOCK * acc);
 
-            // Both accumulators must be drained cluster-wide before the
-            // accumulate=0 MMAs overwrite them.
-            tma::cluster::wait(tmem_free, get_phasebit<1>(phasebits, 0));
-            update_phasebit<1>(phasebits, 0);
+            // This accumulator must be drained cluster-wide before the
+            // accumulate=0 MMA overwrites it. Per-accumulator, so the warp
+            // owning acc 0 is released as soon as acc 0's registers are read,
+            // without waiting on the rest of the epilogue.
+            tma::cluster::wait(tmem_free[acc], get_phasebit<1>(phasebits, acc));
+            update_phasebit<1>(phasebits, acc);
 
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                 // One expect per MMA warp; together they account for the six
@@ -142,48 +143,34 @@ __device__ inline void compute_tile_impl(
 #endif
         else if (w_id == 1 && l_id == 0) {
 #ifdef MKERNEL_TCGEN05
-            // The shared output tile is single-buffered, so the pair's two row
-            // blocks are drained one after the other. outputs_free releases the
-            // tile back to the consumers after the first; outputs_finished
-            // releases the whole task back to the loader after the second.
+            // One staging tile for four 64-row halves (two row blocks x two
+            // halves), drained in sequence. outputs_free hands the tile back to
+            // the consumers between sub-rounds; outputs_finished closes the
+            // task after the last one.
+            int sub = 0;
             #pragma unroll
             for (int h = 0; h < G::ROW_BLOCKS_PER_TASK; h++) {
-                // Both rounds wait on the same semaphore, so they share one
-                // phase bit and flip it each round.
-                wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
-                update_phasebit<0>(phasebits, 0);
                 const int rb = row_idx + 2 * ctarank + h;
+                const int row_blocks_per_dev_fuse = row_blocks / G::NUM_DEVICES;
+                const int owner_dev_idx_fuse = rb / row_blocks_per_dev_fuse;
+                const int local_row_idx_at_owner_fuse =
+                    rb - owner_dev_idx_fuse * row_blocks_per_dev_fuse;
+                const int col_blocks_local_fuse = (int)(Gv.B.rows() / G::COL_BLOCK);
+                const int global_tile_idx_owner_fuse =
+                    local_row_idx_at_owner_fuse * col_blocks_local_fuse + col_idx;
                 #pragma unroll
-                for (int i = 0; i < 2; i++)
-                    tma::store_async(Gv.workspace[Gv.dev_idx], outputs.C[i], {rb * 2 + i, col_idx});
-                {
-                    const int row_blocks_per_dev_fuse = row_blocks / G::NUM_DEVICES;
-                    const int owner_dev_idx_fuse = rb / row_blocks_per_dev_fuse;
-                    const int local_row_idx_at_owner_fuse =
-                        rb - owner_dev_idx_fuse * row_blocks_per_dev_fuse;
-                    const int col_blocks_local_fuse =
-#ifdef MKERNEL_TCGEN05
-                        (int)(Gv.B.rows() / G::COL_BLOCK);   // B is (N, K)
-#else
-    #ifdef MKERNEL_TCGEN05
-                    (int)(Gv.B.rows() / G::COL_BLOCK);   // B is (N, K)
-#else
-                    (int)(Gv.B.cols() / G::COL_BLOCK);
-#endif
-#endif
-                    const int global_tile_idx_owner_fuse =
-                        local_row_idx_at_owner_fuse * col_blocks_local_fuse + col_idx;
-                    #pragma unroll
-                    for (int i = 0; i < 2; i++) {
-                        tma::store_add_async(
-                            Gv.staging[owner_dev_idx_fuse], outputs.C[i],
-                            {2 * global_tile_idx_owner_fuse + i, 0});
-                    }
+                for (int hs = 0; hs < 2; hs++) {
+                    wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+                    update_phasebit<0>(phasebits, 0);
+                    tma::store_async(Gv.workspace[Gv.dev_idx], outputs.C,
+                                     {rb * 2 + hs, col_idx});
+                    tma::store_add_async(Gv.staging[owner_dev_idx_fuse], outputs.C,
+                                         {2 * global_tile_idx_owner_fuse + hs, 0});
+                    tma::store_async_read_wait();
+                    if (++sub == 2 * G::ROW_BLOCKS_PER_TASK) arrive(outputs_finished);
+                    else                                      arrive(outputs_free);
                 }
-                tma::store_async_read_wait();
                 signal_ready(Gv.ready, ready_idx + (2 * ctarank + h) * col_blocks);
-                if (h + 1 < G::ROW_BLOCKS_PER_TASK) arrive(outputs_free);
-                else                                arrive(outputs_finished);
             }
 #else
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
@@ -239,29 +226,39 @@ __device__ inline void compute_tile_impl(
 
         #pragma unroll
         for (int h = 0; h < G::ROW_BLOCKS_PER_TASK; h++) {
-            // Pull this half out of tensor memory first, so the read overlaps
-            // the previous half's TMA store rather than waiting behind it.
             warp::load_async(C_accum,
                              d_tt_pool.template subtile<tt<float, G::ROW_BLOCK / 8, G::COL_BLOCK>>(
                                  trow, G::COL_BLOCK * h));
             kittens::tensor_load_wait();
             group<8>::sync(3);
-            if (h > 0) {
-                // Shared C still holds the previous row block until the store
-                // warp has drained it.
-                wait(outputs_free, get_phasebit<0>(phasebits, 1));
-                update_phasebit<0>(phasebits, 1);
+            // Registers hold this accumulator now, so tensor memory is free
+            // even though the stores are still ahead.
+            if (w_id == 0 && l_id == 0) tma::cluster::arrive(tmem_free[h], 0, 1);
+
+            // The single staging tile takes one 64-row half at a time. Under
+            // the group<8> tmem layout warps {0,1,4,5} own rows < 64 and
+            // {2,3,6,7} own the rest, so each sub-round only four of the eight
+            // warps write -- the others just ride the barrier.
+            #pragma unroll
+            for (int hs = 0; hs < 2; hs++) {
+                if (h == 0 && hs == 0) {
+                    // First sub-round of the task: wait on the previous task.
+                    // The <1> half starts signalled, so task 0 passes through.
+                    wait(outputs_finished, get_phasebit<1>(phasebits, 0));
+                    update_phasebit<1>(phasebits, 0);
+                } else {
+                    wait(outputs_free, get_phasebit<0>(phasebits, 1));
+                    update_phasebit<0>(phasebits, 1);
+                }
+                if (trow / 64 == hs) {
+                    auto dst = outputs.C.template subtile<G::ROW_BLOCK / 8, G::COL_BLOCK>(
+                                   {(trow % 64) / (G::ROW_BLOCK / 8), 0});
+                    warp::store(dst, C_accum);
+                }
+                group<8>::sync(4);
+                if (wg_id == 0 && w_id == 0 && l_id == 0) arrive(outputs_arrived);
             }
-            // trow is a row in the 128-row block; C[] is two 64-row tiles.
-            auto dst = outputs.C[trow / 64].template subtile<G::ROW_BLOCK / 8, G::COL_BLOCK>(
-                           {(trow % 64) / (G::ROW_BLOCK / 8), 0});
-            warp::store(dst, C_accum);
-            group<8>::sync(4);
-            warpgroup::arrive(outputs_arrived);
         }
-        // Both accumulators are drained. Signal the leader CTA, which is where
-        // the MMA warps wait: 2 warpgroups x 2 CTAs = 4 arrivals.
-        if (w_id == 0 && l_id == 0) tma::cluster::arrive(tmem_free, 0, 1);
 #else
         rt_fl<G::ROW_BLOCK / 8, G::COL_BLOCK> C_accum;
         warp::zero(C_accum);
@@ -1025,9 +1022,15 @@ __device__ inline void fused_kernel(const fused_globals &G) {
     tma_swizzle_allocator allocator((int *)&__shm[0]);
     intra_globals::pipeline_inputs (&inputs)[intra_globals::PIPELINE_STAGES] =
         allocator.allocate<intra_globals::pipeline_inputs, intra_globals::PIPELINE_STAGES>();
+#ifdef MKERNEL_TCGEN05
+    // Own allocation, so the loader never waits on the epilogue.
+    intra_globals::pipeline_outputs &outputs =
+        allocator.allocate<intra_globals::pipeline_outputs>();
+#else
     intra_globals::pipeline_outputs &outputs =
         *reinterpret_cast<intra_globals::pipeline_outputs *>(
             &inputs[intra_globals::PIPELINE_STAGES - 1]);
+#endif
 
     __shared__ semaphore inputs_arrived[intra_globals::PIPELINE_STAGES];
     __shared__ semaphore inputs_finished[intra_globals::PIPELINE_STAGES];
@@ -1039,7 +1042,7 @@ __device__ inline void fused_kernel(const fused_globals &G) {
     // outputs_free: store warp -> consumers, "shared C drained, next row
     // block of the pair may be staged".
     __shared__ semaphore mma_done;
-    __shared__ semaphore tmem_free;
+    __shared__ semaphore tmem_free[intra_globals::ROW_BLOCKS_PER_TASK];
     __shared__ semaphore outputs_free;
 #endif
     if (threadIdx.x == 0) {
@@ -1056,11 +1059,13 @@ __device__ inline void fused_kernel(const fused_globals &G) {
             init_semaphore(inputs_finished[i], 0, 8);
 #endif
         }
-        init_semaphore(outputs_arrived, 0, 2);   // per round, one per consumer warpgroup
+        init_semaphore(outputs_arrived, 0, 1);   // one signal per epilogue sub-round
         init_semaphore(outputs_finished, 0, 1);
 #ifdef MKERNEL_TCGEN05
         init_semaphore(mma_done,     0, 2);   // one commit per accumulator
-        init_semaphore(tmem_free,    0, 4);   // 2 warpgroups x 2 CTAs
+        #pragma unroll
+        for (int i = 0; i < intra_globals::ROW_BLOCKS_PER_TASK; ++i)
+            init_semaphore(tmem_free[i], 0, 4);   // 2 warpgroups x 2 CTAs
         init_semaphore(outputs_free, 0, 1);   // one per store-warp round
 #endif
     }
