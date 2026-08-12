@@ -237,12 +237,19 @@ __device__ static inline void tensor_store_wait() {
 
 template<int NCTA>
 __device__ static inline void tensor_commit(semaphore &sem) {
-    static_assert(NCTA == 1,
-                  "the minimal mKernel Blackwell backend supports CTA-group 1 only");
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
-        :: "l"(__cvta_generic_to_shared(&sem))
-        : "memory");
+    static_assert(NCTA == 1 || NCTA == 2);
+    if constexpr (NCTA == 1) {
+        asm volatile(
+            "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
+            :: "l"(__cvta_generic_to_shared(&sem))
+            : "memory");
+    } else {
+        asm volatile(
+            "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;\n"
+            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&sem))),
+               "h"(static_cast<uint16_t>(0x3))
+            : "memory");
+    }
 }
 
 } // namespace kittens

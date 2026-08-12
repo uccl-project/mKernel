@@ -2,8 +2,8 @@
  * @file
  * @brief Minimal Blackwell tensor-memory types used by BF16 tcgen05 GEMM.
  *
- * This deliberately implements CTA-group 1 only.  Cluster allocation and
- * scaled FP8/FP4 tensor-memory layouts can be added when a kernel needs them.
+ * Supports both CTA-group 1 and the paired-SM CTA-group 2 allocation used by
+ * Blackwell cluster UMMA kernels.
  */
 #pragma once
 
@@ -82,6 +82,43 @@ struct tensor_allocator {
         asm volatile(
             "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;\n"
             :: "r"(addr), "n"(cols)
+            : "memory");
+    }
+};
+
+template<int _cols>
+struct tensor_allocator_2sm {
+    static constexpr int cols = _cols;
+    static_assert(cols >= 32 && cols <= MAX_TENSOR_COLS);
+    static_assert((cols & (cols - 1)) == 0,
+                  "2-SM TMEM allocation must use a power-of-two column count");
+
+    uint32_t addr = 0;
+
+    __device__ inline void set_addr(uint32_t value) { addr = value; }
+
+    // Both CTAs issue this from the same logical warp and pass the same
+    // CTA-local shared-memory offset.
+    __device__ inline void provision(uint32_t &shared_addr) {
+        asm volatile(
+            "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;\n"
+            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&shared_addr))),
+               "r"(cols)
+            : "memory");
+        asm volatile(
+            "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;\n"
+            ::: "memory");
+    }
+
+    template<ducks::tt::full TT>
+    __device__ inline TT allocate(int col_offset = 0) const {
+        return TT(addr + col_offset);
+    }
+
+    __device__ inline void deprovision() {
+        asm volatile(
+            "tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;\n"
+            :: "r"(addr), "r"(cols)
             : "memory");
     }
 };
