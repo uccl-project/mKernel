@@ -32,6 +32,8 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
             src_gpu = G.pull_dispatch_indices[{dst_token, 0}];
             src_token = G.pull_dispatch_indices[{dst_token, 1}];
         }
+        const bool valid_src = src_gpu >= 0 && src_token >= 0;
+        const bool padded_src = src_gpu < 0 && src_token < 0;
         if (lane < fused_globals::TOKENS_PER_BLOCK) {
             src_gpus[lane] = src_gpu;
             src_tokens[lane] = src_token;
@@ -65,21 +67,25 @@ __device__ inline void dispatch_slice(const fused_globals &G, int slice) {
             }
         }
         __syncwarp();
-        if (valid_dst && src_gpu >= 0 && src_token >= 0) {
+        if (valid_dst && valid_src) {
             bf16 *dst = G.post_tokens.raw_ptr +
                 static_cast<int64_t>(dst_token) * fused_globals::H;
             ::dist::tma::bulk_store_async(dst, &tokens[lane], TOKEN_BYTES);
             ::dist::tma::store_async_wait();
         }
 
-        const unsigned valid_mask = __ballot_sync(0xffffffffu, valid_dst);
+        const unsigned copied_mask =
+            __ballot_sync(0xffffffffu, valid_dst && valid_src);
+        const unsigned padded_mask =
+            __ballot_sync(0xffffffffu, valid_dst && padded_src);
+        const unsigned ready_mask = copied_mask | padded_mask;
         __syncwarp();
-        if (lane == 0 && valid_mask != 0u) {
+        if (lane == 0 && ready_mask != 0u) {
             constexpr int SLICES_PER_ROW_BLOCK =
                 fused_globals::ROW_BLOCK / fused_globals::TOKENS_PER_BLOCK;
             const int row_block = slice / SLICES_PER_ROW_BLOCK;
             comm::atomic_u32::release_add_gpu(
-                &G.row_ready[{row_block}], __popc(valid_mask));
+                &G.row_ready[{row_block}], __popc(ready_mask));
         }
     }
 }
