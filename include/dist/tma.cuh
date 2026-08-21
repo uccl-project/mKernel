@@ -20,6 +20,8 @@ using ::kittens::tma::load_async;
 using ::kittens::tma::store_async_read_wait;
 using ::kittens::tma::store_async_wait;
 using ::kittens::tma::expect_bytes;
+using ::kittens::tma::bulk_load_async;
+using ::kittens::tma::bulk_store_async;
 
 } // namespace tma
 } // namespace dist

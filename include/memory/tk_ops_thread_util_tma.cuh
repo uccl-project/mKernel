@@ -67,6 +67,35 @@ __device__ static inline void store_async_read_wait() {
     );
 }
 
+/* ----------   Raw 1D bulk transfers  ---------- */
+
+__device__ static inline void bulk_load_async(
+    void *shared_dst, const void *global_src, uint32_t size_bytes,
+    semaphore &bar) {
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+        "[%0], [%1], %2, [%3];\n"
+        :
+        : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_dst))),
+          "l"(global_src), "r"(size_bytes),
+          "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&bar)))
+        : "memory");
+}
+
+__device__ static inline void bulk_store_async(
+    void *global_dst, void *shared_src, uint32_t size_bytes) {
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    asm volatile(
+        "cp.async.bulk.global.shared::cta.bulk_group "
+        "[%0], [%1], %2;\n"
+        :
+        : "l"(global_dst),
+          "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_src))),
+          "r"(size_bytes)
+        : "memory");
+    store_commit_group();
+}
+
 /* ----------   Cluster-scope operations  ---------- */
 
 namespace cluster {
