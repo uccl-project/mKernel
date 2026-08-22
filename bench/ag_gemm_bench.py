@@ -331,6 +331,24 @@ def main():
             run_once(); torch.cuda.synchronize()
             dist.barrier()
 
+        # AG_GEMM_TRACE_OUT=<dir>: capture one traced iteration (needs a
+        # build with AG_GEMM_TRACE=1) and dump the raw records per rank.
+        trace_out = os.environ.get("AG_GEMM_TRACE_OUT")
+        if trace_out and getattr(mod, "trace_enabled", lambda: False)():
+            import numpy as np
+            os.makedirs(trace_out, exist_ok=True)
+            reset_state(); epoch += 1
+            if not intra_only: mod.set_epoch(epoch)
+            dist.barrier(); time.sleep(0.1)
+            mod.trace_reset()
+            run_once(); torch.cuda.synchronize()
+            recs = mod.trace_read().numpy()
+            np.save(os.path.join(trace_out, f"ag_trace_M{M}_rank{dist.get_rank()}.npy"), recs)
+            if is_chief:
+                print(f"[ag_gemm-trace] M={M} records/rank={recs.shape[0]} -> {trace_out}",
+                      flush=True)
+            dist.barrier()
+
         samples = []
         # Canonical: NCCL-style no-sync timing — N back-to-back iters with a
         # SINGLE sync after, divide by N. Mirrors nccl_16gpu_baseline.py's

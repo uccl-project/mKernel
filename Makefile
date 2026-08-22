@@ -90,7 +90,43 @@ COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 # Failed-experiment flags are NOT defined here (HYBRID, MERGED_COMM,
 # PUSH_NVL_FANOUT, DISPATCH_DONATE_INTER_SEND, ACTIVITY_TRACE, etc.) so
 # their #ifdef branches stay disabled.
+# AG_GEMM_TRACE=1 turns on the per-task activity trace (device-side %globaltimer
+# + clock64 records, read back via trace_read()). Profiling only -- it perturbs
+# timing slightly and costs 4 MB of static device memory.
+AG_GEMM_TRACE ?= 0
+# AG_GEMM_ROWPERM=1 orders compute's row blocks to match phase-1's production
+# order (see decode_comp_task). Perf change only -- it is a bijection.
+ifeq ($(GPU),blackwell)
+AG_GEMM_ROWPERM ?= 1
+else
+AG_GEMM_ROWPERM ?= 0
+endif
 DEFS_ag_gemm        :=
+ifeq ($(AG_GEMM_TRACE),1)
+DEFS_ag_gemm        += -DAG_GEMM_TRACE
+endif
+ifeq ($(AG_GEMM_ROWPERM),1)
+DEFS_ag_gemm        += -DAG_GEMM_ROWPERM
+endif
+# AG_GEMM_FASTPOLL=1 lets compute skip the per-K-strip readiness poll once
+# phase-1 has completed on every device.
+ifeq ($(GPU),blackwell)
+AG_GEMM_FASTPOLL ?= 1
+else
+AG_GEMM_FASTPOLL ?= 0
+endif
+ifeq ($(AG_GEMM_FASTPOLL),1)
+DEFS_ag_gemm        += -DAG_GEMM_FASTPOLL
+endif
+# AG_GEMM_OWNSHARD=1 skips the readiness wait for rows this device owns, whose
+# bytes are already in place before phase 1 runs. MEASURED SLOWER (M=32768
+# 6.556 -> 6.612 ms, M=16384 1.043 -> 1.081): letting those CTAs run ahead
+# breaks the lockstep tile order that the multicast read sharing depends on.
+# Kept off by repository convention for failed experiments.
+AG_GEMM_OWNSHARD ?= 0
+ifeq ($(AG_GEMM_OWNSHARD),1)
+DEFS_ag_gemm        += -DAG_GEMM_OWNSHARD
+endif
 # Arrival-flag layout is now a runtime flag (SessionConfig.use_arrival_queue);
 # gemm_ar's session shim sets it to true. No compile-time switch needed.
 DEFS_gemm_ar        :=

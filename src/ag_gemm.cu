@@ -25,6 +25,7 @@
  *   include/operators/ag_gemm/session.cuh
  */
 #include "operators/ag_gemm/ag_gemm.cuh"
+#include "operators/ag_gemm/ag_gemm_trace.cuh"
 
 namespace ag_gemm_multinode {
 
@@ -57,12 +58,19 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 const int row_idx = task_id / col_blocks;
                 const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
                 const int col_idx = task_id % col_blocks;
+#ifdef AG_GEMM_TRACE
+                const unsigned long long tr_t0 = trace::now_ns();
+                const unsigned long long tr_c0 = clock64();
+                unsigned long long tr_stall = 0;
+#endif
 
                 tma::expect_bytes(inputs_arrived[warp_id], sizeof(globals::A_comm_tile));
                 tma::load_async(A_smem[warp_id], G.A[G.dev_idx], {global_row_idx, col_idx},
                                 inputs_arrived[warp_id]);
 
+                AG_TRACE_STALL_BEGIN(tr_w);
                 wait(inputs_arrived[warp_id], get_phasebit<0>(phasebits, warp_id));
+                AG_TRACE_STALL_END(tr_stall, tr_w);
                 update_phasebit<0>(phasebits, warp_id);
                 tma::store_async(G.A, A_smem[warp_id], {global_row_idx, col_idx});
                 tma::store_async_wait();
@@ -78,6 +86,10 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // Per-(row,col) count is 1 because each task_id is processed by
                 // exactly one intra worker under the round-robin stripe.
                 signal_all(G.barrier, {0, global_row_idx, col_idx}, 1);
+#ifdef AG_GEMM_TRACE
+                trace::emit(trace::ROLE_GATHER, task_id, tr_t0, trace::now_ns(),
+                            tr_stall, 0ull, clock64() - tr_c0);
+#endif
             }
         }
     }
@@ -94,6 +106,21 @@ __device__ inline void intra_comm_sm(const globals& G) {
         }
     }
     __syncthreads();
+
+#ifdef AG_GEMM_FASTPOLL
+    // Publish "this CTA's phase-1 gather is complete" to every device. Placed
+    // after __syncthreads() so all warps of this CTA have drained their task
+    // loops (the gate above is thread-0 only and does not imply that). Each
+    // task already did store_async_wait + __threadfence_system before its own
+    // signal_all, so the multicast data is visible before this flag is.
+    //
+    // Compute reads this once per task: when it reaches NUM_DEVICES *
+    // num_intra_comm, every plane-0 slot of the local shard is necessarily set,
+    // so the per-K-strip readiness poll becomes pure overhead and is skipped.
+    if (threadIdx.x == 0) {
+        signal_all(G.barrier, {0, 1023, 1020}, 1);
+    }
+#endif
 
     if (G.debug_skip_phase2 != 0) {
         return;
@@ -249,6 +276,36 @@ __device__ inline comp_task decode_comp_task(int task_id,
         t.rb      = super_rows + rem % fr_safe;
         t.col_idx = rem / fr_safe;
     }
+#ifdef AG_GEMM_ROWPERM
+    // Match the order compute consumes rows to the order phase-1 produces them.
+    //
+    // Each GPU gathers only its own 1/8 shard -- intra rows [d*L, d*L+L) in
+    // row-major order -- and all 8 GPUs run concurrently. So readiness sweeps
+    // the intra-row space as {0, L, 2L, ...}, then {1, L+1, 2L+1, ...}: the
+    // j-th row of every owner becomes available at roughly the same time.
+    // The unpermuted task order instead walks rows 0,1,2,... so the first wave
+    // of compute CTAs asks for 140 consecutive rows, of which only 8 (one per
+    // owner) can possibly be ready. Measured: 86-92% of compute-CTA time is
+    // spent stalled for the first 3.3 ms.
+    //
+    // Relabelling row r as (r % NUM_DEVICES) * L + (r / NUM_DEVICES) makes the
+    // k-th row block consumed the k-th row block produced. It is a bijection,
+    // so every tile is still computed exactly once; only the order changes.
+    // It is also independent of dev_idx, so all GPUs keep walking tiles in
+    // lockstep -- the multicast read sharing that made device rotation a
+    // regression is preserved.
+    if (!t.is_remote) {
+        const int node_row_blocks = super_rows + final_rows;
+        const int total_intra     = node_row_blocks / 2;
+        const int local_intra     = total_intra / globals::NUM_DEVICES;
+        if (local_intra > 0 && total_intra % globals::NUM_DEVICES == 0) {
+            const int i     = t.rb >> 1;
+            const int perm  = (i % globals::NUM_DEVICES) * local_intra
+                            + (i / globals::NUM_DEVICES);
+            t.rb = (perm << 1) | (t.rb & 1);
+        }
+    }
+#endif
     return t;
 }
 
@@ -369,6 +426,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
         warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
 
         if (warp_id == 0 && lane_id == 0) {
+#ifdef AG_GEMM_FASTPOLL
+            // Sticky: once phase-1 is globally done it stays done for the epoch.
+            bool all_gathered = false;
+            const int gather_done_target = globals::NUM_DEVICES * G.num_intra_comm;
+#endif
             // TMA load warp — CTA-stride over super-tile-swizzled tiles
             for (int pair_id = comp_idx; pair_id < total_pairs; pair_id += G.num_comp_sms) {
                 // decode_comp_task varies rb fastest within a band, so flat and
@@ -390,6 +452,12 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 if (is_remote && G.debug_skip_remote_compute != 0) {
                     continue;
                 }
+#ifdef AG_GEMM_TRACE
+                const unsigned long long tr_t0 = trace::now_ns();
+                const unsigned long long tr_c0 = clock64();
+                unsigned long long tr_stall = 0;   // blocked on gather readiness
+                unsigned long long tr_pipe  = 0;   // blocked on the compute pipeline
+#endif
                 int row_idx;
                 int shard_rb = rb;
                 int recv_peer_slot = 0;
@@ -413,28 +481,68 @@ __device__ inline void fused_comp_sm(const globals& G) {
                         // phase-2 workers for this intra row.
                         const int intra_rb = row_idx / 2;
                         const int intra_col_blocks = G.A_recv.cols() / (globals::RED_BLOCK * 2);
+                        AG_TRACE_STALL_BEGIN(tr_w0);
                         wait(G.barrier, {2, intra_rb, 0}, G.dev_idx, intra_col_blocks);
+                        AG_TRACE_STALL_END(tr_stall, tr_w0);
                         __threadfence_system();
                     }
                 }
 
+#ifdef AG_GEMM_OWNSHARD
+                // Rows this device owns need no readiness wait at all. Phase 1
+                // loads them from G.A[dev_idx] and multicast-stores them back
+                // to G.A -- and A_local is built on that same local backing, so
+                // for our own shard the copy writes identical bytes to the very
+                // words compute reads. The data is already in place at kernel
+                // start; the only thing the barrier was buying us was ordering
+                // against a write that cannot change the value.
+                bool own_shard = false;
+                if (!is_remote) {
+                    const int total_intra = (super_rows + final_rows) / 2;
+                    const int local_intra = total_intra / globals::NUM_DEVICES;
+                    if (local_intra > 0)
+                        own_shard = ((row_idx >> 1) / local_intra) == G.dev_idx;
+                }
+#endif
+#ifdef AG_GEMM_FASTPOLL
+                if (!all_gathered) {
+                    all_gathered = comm::atomic_u32::relaxed_load_s32_sys(
+                        &G.barrier[G.dev_idx][{0, 1023, 1020}]) >= gather_done_target;
+                }
+#endif
+                AG_TRACE_STALL_BEGIN(tr_w1);
                 wait(outputs_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                AG_TRACE_STALL_END(tr_pipe, tr_w1);
                 update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
 
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                     // Per-K-strip wait on plane 0. Each intra col_chunk
                     // covers 2 compute K-strips, so wait when crossing the
                     // boundary.
+#if defined(AG_GEMM_FASTPOLL) && defined(AG_GEMM_OWNSHARD)
+                    if (!is_remote && !all_gathered && !own_shard && (red_idx & 1) == 0) {
+#elif defined(AG_GEMM_FASTPOLL)
+                    if (!is_remote && !all_gathered && (red_idx & 1) == 0) {
+#elif defined(AG_GEMM_OWNSHARD)
+                    if (!is_remote && !own_shard && (red_idx & 1) == 0) {
+#else
                     if (!is_remote && (red_idx & 1) == 0) {
+#endif
+                        AG_TRACE_STALL_BEGIN(tr_w2);
                         wait(G.barrier, {0, row_idx / 2, red_idx / 2},
                              G.dev_idx, 1);
+                        AG_TRACE_STALL_END(tr_stall, tr_w2);
                     }
                     if (is_remote && G.remote_ready_per_col != 0 && (red_idx & 1) == 0) {
+                        AG_TRACE_STALL_BEGIN(tr_w3);
                         wait(G.barrier, {2, row_idx / 2, red_idx / 2},
                              G.dev_idx, 1);
+                        AG_TRACE_STALL_END(tr_stall, tr_w3);
                         __threadfence_system();
                     }
+                    AG_TRACE_STALL_BEGIN(tr_w4);
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    AG_TRACE_STALL_END(tr_pipe, tr_w4);
                     update_phasebit<1>(phasebits, stage);
                     tma::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs));
 #ifdef MKERNEL_TCGEN05
@@ -470,6 +578,10 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     tma::load_async(inputs[stage].B, G.B, {red_idx, col_idx}, inputs_arrived[stage]);
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
+#ifdef AG_GEMM_TRACE
+                trace::emit(trace::ROLE_COMPUTE, pair_id, tr_t0, trace::now_ns(),
+                            tr_stall, tr_pipe, clock64() - tr_c0);
+#endif
             }
         }
 #ifdef MKERNEL_TCGEN05
@@ -735,6 +847,13 @@ __device__ inline void barrier_reset(const globals& G) {
             G.barrier[G.dev_idx][{2, i, 0}] = 0;
         }
     }
+#ifdef AG_GEMM_FASTPOLL
+    // Clear the phase-1-complete flag before the cross-device sync below, so
+    // the next epoch starts from zero. grid_sync_at_epoch already ran, so no
+    // CTA is still reading it.
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        G.barrier[G.dev_idx][{0, 1023, 1020}] = 0;
+#endif
     // Iter-end cross-device sync uses a slot outside the active data planes
     // (max shape is (num_rows<=128, num_cols<=1024) under validate_shapes).
     if (blockIdx.x == 0 && threadIdx.x == 0)

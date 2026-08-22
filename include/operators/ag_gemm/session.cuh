@@ -189,6 +189,40 @@ pybind11::list get_proxy_timelines_py() {
     return out;
 }
 
+#ifdef AG_GEMM_TRACE
+// ---------------------------------------------------------------------------
+// Activity-trace readback (AG_GEMM_TRACE builds only)
+// ---------------------------------------------------------------------------
+static void ag_trace_reset_py() {
+    int zero = 0;
+    MKERNEL_CUDACHECK(cudaMemcpyToSymbol(
+        ag_gemm_multinode::trace::g_count, &zero, sizeof(int)));
+}
+
+// Returns an (n, FIELDS) int64 CPU tensor; columns are the fields of
+// ag_gemm_multinode::trace::rec, in declaration order.
+static at::Tensor ag_trace_read_py() {
+    int n = 0;
+    MKERNEL_CUDACHECK(cudaMemcpyFromSymbol(
+        &n, ag_gemm_multinode::trace::g_count, sizeof(int)));
+    const bool overflowed = n > ag_gemm_multinode::trace::MAX_RECS;
+    if (overflowed) n = ag_gemm_multinode::trace::MAX_RECS;
+    if (n < 0) n = 0;
+    auto out = at::empty({n, ag_gemm_multinode::trace::FIELDS},
+                         at::TensorOptions().dtype(at::kLong));
+    if (n > 0) {
+        MKERNEL_CUDACHECK(cudaMemcpyFromSymbol(
+            out.data_ptr(), ag_gemm_multinode::trace::g_recs,
+            (size_t)n * sizeof(ag_gemm_multinode::trace::rec), 0,
+            cudaMemcpyDeviceToHost));
+    }
+    if (overflowed) {
+        fprintf(stderr, "[ag_gemm trace] buffer overflowed; records were dropped\n");
+    }
+    return out;
+}
+#endif  // AG_GEMM_TRACE
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
     m.def("create_session", &create_session_py,
@@ -207,6 +241,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);
     m.def("get_proxy_diagnostics", &get_proxy_diagnostics_py);
     m.def("get_proxy_timelines", &get_proxy_timelines_py);
+#ifdef AG_GEMM_TRACE
+    m.def("trace_reset", &ag_trace_reset_py);
+    m.def("trace_read", &ag_trace_read_py);
+    m.def("trace_enabled", []() { return true; });
+#else
+    m.def("trace_enabled", []() { return false; });
+#endif
     m.def("ag_gemm_multinode", &ag_gemm_multinode::entrypoint,
           pybind11::arg("A"),
           pybind11::arg("B"),
