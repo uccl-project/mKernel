@@ -375,7 +375,14 @@ def main():
             os.makedirs(trace_out, exist_ok=True)
             reset_state(); epoch += 1
             if not intra_only: mod.set_epoch(epoch)
-            dist.barrier(); time.sleep(0.1)
+            dist.barrier()
+            # Trace a STEADY-STATE iteration, not a cold one. Without these the
+            # traced launch starts from an idle GPU at 120 MHz and the numbers
+            # describe the clock ramp rather than the kernel -- the same mistake
+            # the timing harness used to make.
+            for _ in range(8):
+                run_once()
+            torch.cuda.synchronize()
             mod.trace_reset()
             run_once(); torch.cuda.synchronize()
             recs = mod.trace_read().numpy()
