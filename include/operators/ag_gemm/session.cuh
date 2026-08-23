@@ -221,6 +221,25 @@ static at::Tensor ag_trace_read_py() {
     }
     return out;
 }
+// Reads the live progress array while the kernel is still running. The copy
+// engines are independent of SM execution, so an async copy on a non-blocking
+// stream returns even when every CTA is spinning on a barrier -- which is the
+// only moment this is useful.
+static at::Tensor ag_trace_progress_py() {
+    static cudaStream_t s = nullptr;
+    if (s == nullptr)
+        MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    const int n = ag_gemm_multinode::trace::MAX_CTAS *
+                  ag_gemm_multinode::trace::ROLE_SLOTS;
+    auto out = at::empty({ag_gemm_multinode::trace::MAX_CTAS,
+                          ag_gemm_multinode::trace::ROLE_SLOTS},
+                         at::TensorOptions().dtype(at::kInt));
+    MKERNEL_CUDACHECK(cudaMemcpyFromSymbolAsync(
+        out.data_ptr(), ag_gemm_multinode::trace::g_progress,
+        (size_t)n * sizeof(int), 0, cudaMemcpyDeviceToHost, s));
+    MKERNEL_CUDACHECK(cudaStreamSynchronize(s));
+    return out;
+}
 #endif  // AG_GEMM_TRACE
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -244,6 +263,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #ifdef AG_GEMM_TRACE
     m.def("trace_reset", &ag_trace_reset_py);
     m.def("trace_read", &ag_trace_read_py);
+    m.def("trace_progress", &ag_trace_progress_py);
     m.def("trace_enabled", []() { return true; });
 #else
     m.def("trace_enabled", []() { return false; });

@@ -51,6 +51,37 @@ static_assert(sizeof(rec) == FIELDS * sizeof(unsigned long long), "rec must stay
 __device__ rec g_recs[MAX_RECS];
 __device__ int g_count;
 
+// ---------------------------------------------------------------------------
+// Live progress, for diagnosing a hang.
+//
+// The trace records above are only readable once the kernel finishes, which is
+// exactly the case a deadlock denies us. This array is instead written in place
+// as work advances and read back with an async copy on a non-blocking stream:
+// the copy engines run independently of SM execution, so it comes out even
+// while every CTA is spinning.
+//
+// Slot [cta][role]: the last value that role published. Roles are the warp
+// roles of the compute path plus the gather CTA.
+static constexpr int MAX_CTAS   = 256;
+static constexpr int ROLE_SLOTS = 9;
+static constexpr int SLOT_GATHER   = 0;  // gather task id
+static constexpr int SLOT_LOADER   = 1;  // compute loader: task id
+static constexpr int SLOT_LOADER_K = 2;  // compute loader: red_idx within task
+static constexpr int SLOT_MMA      = 3;  // MMA warp: task id
+static constexpr int SLOT_STORE    = 4;  // store warp: task id
+static constexpr int SLOT_CONSUMER = 5;  // consumer warpgroups: task id
+static constexpr int SLOT_GATHER_PH = 6; // gather CTA: 1 in loop, 2 loop done, 3 gate done
+static constexpr int SLOT_MMA_K    = 7;  // MMA warp: red_idx*8 + wait code
+static constexpr int SLOT_END      = 8;  // kernel tail: 1 role done, 2 grid-synced, 3 reset
+
+__device__ int g_progress[MAX_CTAS * ROLE_SLOTS];
+
+__device__ __forceinline__ void mark(int slot, int value) {
+    if (blockIdx.x < MAX_CTAS)
+        // Plain volatile store: we want the latest value, not a history.
+        reinterpret_cast<volatile int*>(g_progress)[blockIdx.x * ROLE_SLOTS + slot] = value;
+}
+
 __device__ __forceinline__ unsigned int smid() {
     unsigned int r;
     asm volatile("mov.u32 %0, %%smid;" : "=r"(r));
@@ -87,12 +118,14 @@ __device__ __forceinline__ void emit(
 }  // namespace trace
 }  // namespace ag_gemm_multinode
 
+#define AG_TRACE_MARK(slot, value) ::ag_gemm_multinode::trace::mark((slot), (value))
 // Inner-loop stall accounting. Cheap enough to leave in the k-loop.
 #define AG_TRACE_STALL_BEGIN(var) unsigned long long var = clock64()
 #define AG_TRACE_STALL_END(acc, var) (acc) += clock64() - (var)
 
 #else  // !AG_GEMM_TRACE
 
+#define AG_TRACE_MARK(slot, value) do {} while (0)
 #define AG_TRACE_STALL_BEGIN(var) do {} while (0)
 #define AG_TRACE_STALL_END(acc, var) do {} while (0)
 

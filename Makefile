@@ -123,6 +123,22 @@ endif
 # 6.556 -> 6.612 ms, M=16384 1.043 -> 1.081): letting those CTAs run ahead
 # breaks the lockstep tile order that the multicast read sharing depends on.
 # Kept off by repository convention for failed experiments.
+# AG_GEMM_CLUSTER2=1 runs the compute path as 2-CTA tcgen05 clusters: A split
+# by rows across the pair, B by columns, one MMA warp per accumulator on the
+# leader. Default on for GPU=blackwell.
+ifeq ($(GPU),blackwell)
+AG_GEMM_CLUSTER2 ?= 1
+else
+AG_GEMM_CLUSTER2 ?= 0
+endif
+ifeq ($(AG_GEMM_CLUSTER2),1)
+DEFS_ag_gemm        += -DAG_GEMM_CLUSTER2
+endif
+# Override the pipeline depth (default: 4 with clusters, 3 without).
+AG_GEMM_STAGES ?=
+ifneq ($(AG_GEMM_STAGES),)
+DEFS_ag_gemm        += -DAG_GEMM_PIPELINE_STAGES=$(AG_GEMM_STAGES)
+endif
 AG_GEMM_OWNSHARD ?= 0
 ifeq ($(AG_GEMM_OWNSHARD),1)
 DEFS_ag_gemm        += -DAG_GEMM_OWNSHARD

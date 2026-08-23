@@ -49,7 +49,15 @@ using namespace kittens;
 namespace ag_gemm_multinode {
 
 struct config {
+#if defined(MKERNEL_TCGEN05) && defined(AG_GEMM_CLUSTER2)
+    // 2-CTA tcgen05 clusters: A is split by rows across the pair, B by columns.
+    // Requires num_intra_comm to be even -- clusters are formed from
+    // consecutive blockIdx.x, and a cluster straddling the gather/compute role
+    // split would deadlock on the first cluster-scope barrier.
+    static constexpr int CLUSTER_SIZE = 2;
+#else
     static constexpr int CLUSTER_SIZE = 1;
+#endif
     static constexpr int NUM_BLOCKS = 132;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
@@ -84,11 +92,19 @@ struct globals {
     // Three stages keep the producer/consumer pipeline deep enough while
     // leaving more shared memory headroom than a four-stage pipeline.
 #ifdef MKERNEL_TCGEN05
-    // A stage now carries two A tiles (one per row block of the pair) plus the
-    // shared B tile = 64 KB. With outputs on their own 32 KB allocation that
-    // is 3x64 + 32 = 224 KB. Each stage feeds twice the MMA work, so the
-    // shallower pipeline still covers more latency than the old 4.
-    static constexpr int PIPELINE_STAGES = 3;
+    // A stage carries two A tiles (one per row block of the pair) plus the
+    // shared B tile. At CLUSTER_SIZE 1 that is 16+16+32 = 64 KB, and with
+    // outputs on their own 32 KB allocation only 3 stages fit in 226 KB.
+    // At CLUSTER_SIZE 2 each CTA holds half of B, so a stage is 48 KB and a
+    // fourth stage would fit (4x48 + 32 = 224 KB). Measured, medians of 3:
+    //   M=16384   3 stages 0.984 ms   4 stages 0.969 ms   (4 is 1.5% better)
+    //   M=32768   3 stages 6.496 ms   4 stages 6.609 ms   (4 is 1.7% worse)
+    // The two shapes disagree, so the default follows the larger one. Override
+    // with AG_GEMM_STAGES=4 when tuning for medium M.
+#ifndef AG_GEMM_PIPELINE_STAGES
+#define AG_GEMM_PIPELINE_STAGES 3
+#endif
+    static constexpr int PIPELINE_STAGES = AG_GEMM_PIPELINE_STAGES;
 #else
     static constexpr int PIPELINE_STAGES = 3;
 #endif
@@ -106,7 +122,14 @@ struct globals {
     using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
 #endif
     using A_comm_tile = st_bf<ROW_BLOCK * 2, RED_BLOCK * 2>;
+#ifdef MKERNEL_TCGEN05
+    // Blackwell issues the MMA as ABt, so B arrives N-major, i.e. (N, K). Each
+    // CTA of a cluster holds COL_BLOCK / CLUSTER_SIZE of the columns; the total
+    // B bytes per pipeline stage are the same either way.
+    using B_tile = st_bf<COL_BLOCK / config::CLUSTER_SIZE, RED_BLOCK>;
+#else
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
+#endif
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
 
     static constexpr int NUM_COMM_CHUNKS = config::DYNAMIC_SHARED_MEMORY / sizeof(A_comm_tile);
@@ -164,7 +187,10 @@ struct globals {
 #ifdef MKERNEL_TCGEN05
     // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks sharing a single
     // B tile; that sharing doubles the FLOPs per byte of B read.
-    static constexpr int ROW_BLOCKS_PER_TASK = 2;
+    static constexpr int ROW_BLOCKS_PER_TASK = 2;          // per CTA
+    // A cluster's CTAs walk one task together, covering this many row blocks.
+    static constexpr int ROW_BLOCKS_PER_CLUSTER =
+        ROW_BLOCKS_PER_TASK * config::CLUSTER_SIZE;
     struct pipeline_inputs { A_tile A[ROW_BLOCKS_PER_TASK]; B_tile B; };
 #else
     struct pipeline_inputs { A_tile A[2]; B_tile B; };
@@ -415,7 +441,11 @@ void entrypoint(
 
     const int M_node = A.data_.size(0);
     const int K = A.data_.size(1);
+#ifdef MKERNEL_TCGEN05
+    const int N = B.size(0);   // B is (N, K) on the Blackwell ABt path
+#else
     const int N = B.size(1);
+#endif
     const int M = M_node * num_nodes;
 
     TORCH_CHECK(M % globals::ROW_BLOCK == 0);
@@ -427,6 +457,12 @@ void entrypoint(
     TORCH_CHECK(M_node >= globals::NUM_DEVICES * globals::ROW_BLOCK * 2,
                 "M_node must be >= ", globals::NUM_DEVICES * globals::ROW_BLOCK * 2,
                 " (got M_node=", M_node, ")");
+    TORCH_CHECK((M_node / globals::ROW_BLOCK) % globals::ROW_BLOCKS_PER_CLUSTER == 0,
+                "row blocks per shard must be a multiple of ",
+                globals::ROW_BLOCKS_PER_CLUSTER, "; got ", M_node / globals::ROW_BLOCK);
+    static_assert(globals::SUPER_M % globals::ROW_BLOCKS_PER_CLUSTER == 0,
+                  "SUPER_M must be a multiple of ROW_BLOCKS_PER_CLUSTER so a "
+                  "cluster's row blocks never straddle a super-tile band");
     TORCH_CHECK(M_node % (globals::NUM_DEVICES * globals::ROW_BLOCK * 2) == 0,
                 "M_node must be a multiple of ",
                 globals::NUM_DEVICES * globals::ROW_BLOCK * 2,
@@ -454,10 +490,19 @@ void entrypoint(
         // gather tasks while returning idle CTAs to compute.
         else if (M <= 8192) adaptive_comm_sms = std::min(num_comm_sms, 32);
     }
-    const int num_intra_comm = (num_intra_comm_override > 0)
+    int num_intra_comm = (num_intra_comm_override > 0)
         ? num_intra_comm_override
         : std::max(4, adaptive_comm_sms / 2);
+    // Clusters are formed from consecutive blockIdx.x, and gather CTAs occupy
+    // the low block indices. If num_intra_comm were odd, one cluster would hold
+    // a gather CTA and a compute CTA, and the compute half would deadlock on
+    // the first cluster-scope barrier waiting for a partner that never reaches
+    // it. Round up so the role split lands on a cluster boundary.
+    if (config::CLUSTER_SIZE > 1 && (num_intra_comm % config::CLUSTER_SIZE) != 0)
+        num_intra_comm += config::CLUSTER_SIZE - (num_intra_comm % config::CLUSTER_SIZE);
     int num_comp_sms = active_sms - num_intra_comm;
+    // Whole clusters only; the launcher truncates the grid the same way.
+    num_comp_sms -= num_comp_sms % config::CLUSTER_SIZE;
     const bool host_skip_compute =
         std::getenv("AG_GEMM_SKIP_COMPUTE") != nullptr &&
         std::getenv("AG_GEMM_SKIP_COMPUTE")[0] == '1';

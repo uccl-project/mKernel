@@ -195,7 +195,10 @@ def main():
         torch.manual_seed(42 + global_gpu_idx); torch.cuda.manual_seed(42 + global_gpu_idx)
         A_local = torch.randn((M_local, K), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
         torch.manual_seed(100); torch.cuda.manual_seed(100)
-        B = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
+        # The Blackwell path issues the MMA as ABt, so it takes B N-major.
+        # Keep one logical B and hand the kernel whichever layout it wants.
+        B_ref = torch.randn((K, N), device="cuda", dtype=torch.bfloat16) / (K ** 0.25)
+        B = B_ref.t().contiguous() if TCGEN05 else B_ref
 
         if use_ngt2_fallback:
             if is_chief:
@@ -204,7 +207,7 @@ def main():
                       flush=True)
             samples = []
             for _ in range(args.warmup):
-                C_tmp = torch.matmul(A_local, B)
+                C_tmp = torch.matmul(A_local, B_ref)
                 torch.cuda.synchronize()
                 del C_tmp
             dist.barrier()
@@ -212,7 +215,7 @@ def main():
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
                 s.record()
-                C_tmp = torch.matmul(A_local, B)
+                C_tmp = torch.matmul(A_local, B_ref)
                 e.record()
                 torch.cuda.synchronize()
                 samples.append(s.elapsed_time(e))
@@ -324,6 +327,49 @@ def main():
                 a_recv_tk, active_sms, args.num_intra_comm_sms, NUM_NODES,
             )
 
+        # AG_GEMM_HANG_PROBE=1: launch one iteration WITHOUT syncing and poll the
+        # device-side progress array. Copy engines run independently of SM
+        # execution, so this reports where each warp role got stuck.
+        if os.environ.get("AG_GEMM_HANG_PROBE") == "1" and hasattr(mod, "trace_progress"):
+            import numpy as np
+            NAMES = ["gather", "loader", "loader_k", "mma", "store", "consumer", "gath_ph", "mma_k", "end"]
+            reset_state(); epoch += 1
+            if not intra_only: mod.set_epoch(epoch)
+            dist.barrier(); time.sleep(0.1)
+            run_once()                      # async: do NOT synchronize
+            for probe_i in range(4):
+                time.sleep(2.0)
+                p = mod.trace_progress().numpy()
+                if not is_chief:
+                    continue
+                act = p[(p != 0).any(axis=1)]
+                print(f"[probe t={2*(probe_i+1):.0f}s] CTAs with progress: {act.shape[0]}",
+                      flush=True)
+                for si, nm in enumerate(NAMES):
+                    col = p[:, si]
+                    nz = col[col != 0]
+                    if nz.size == 0:
+                        print(f"    {nm:9s} : (never advanced)", flush=True)
+                    else:
+                        print(f"    {nm:9s} : n={nz.size:3d} min={nz.min():5d} "
+                              f"max={nz.max():5d} median={int(np.median(nz)):5d}", flush=True)
+                for si, nm in ((2, "loader_k"), (7, "mma_k"), (4, "store"), (5, "consumer")):
+                    col = p[:, si]; nz = col[col != 0]
+                    if nz.size:
+                        print(f"    {nm} decoded: k={nz.min()//8}..{nz.max()//8} "
+                              f"codes={sorted(set((nz % 8).tolist()))}", flush=True)
+                import collections
+                ec = collections.Counter(p[:, 8].tolist())
+                print(f"    END slot histogram (0=not reached 1=role done "
+                      f"2=grid-synced 3=reset done): {dict(ec)}", flush=True)
+                gp = p[:, 6]; gp = gp[gp != 0]
+                if gp.size:
+                    print(f"    gather phase codes: {sorted(set(gp.tolist()))} "
+                          f"(1=in task 2=pre-signal 3=post-signal 4=loop done 5=gate passed)",
+                          flush=True)
+            sys.stdout.flush()
+            os._exit(0)
+
         for wi in range(args.warmup):
             reset_state(); epoch += 1
             if not intra_only: mod.set_epoch(epoch)
@@ -399,7 +445,7 @@ def main():
             print(f"[ag_gemm] M={M} wall={wall_ms:.3f} ms", flush=True)
         gathered_a = gather_cpu_tensors(A_local)
         A_ref = torch.cat(gathered_a, dim=0).to(device="cuda")
-        C_ref = torch.matmul(A_ref, B)
+        C_ref = torch.matmul(A_ref, B_ref)
         if is_chief:
             rows_per_node = M // NUM_NODES
             for nr in range(NUM_NODES):

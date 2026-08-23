@@ -58,6 +58,8 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 const int row_idx = task_id / col_blocks;
                 const int global_row_idx = row_idx + G.dev_idx * local_row_blocks;
                 const int col_idx = task_id % col_blocks;
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER, task_id);
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER_PH, 1);
 #ifdef AG_GEMM_TRACE
                 const unsigned long long tr_t0 = trace::now_ns();
                 const unsigned long long tr_c0 = clock64();
@@ -85,7 +87,9 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // so it can stream tiles as cols arrive, not per whole row block.
                 // Per-(row,col) count is 1 because each task_id is processed by
                 // exactly one intra worker under the round-robin stripe.
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER_PH, 2);
                 signal_all(G.barrier, {0, global_row_idx, col_idx}, 1);
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER_PH, 3);
 #ifdef AG_GEMM_TRACE
                 trace::emit(trace::ROLE_GATHER, task_id, tr_t0, trace::now_ns(),
                             tr_stall, 0ull, clock64() - tr_c0);
@@ -94,6 +98,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
         }
     }
 
+    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER_PH, 4);
     // Wait until every intra CTA has finished phase-1 multicast gather.
     // Must run outside the lane_id==0 branch so all threads in this CTA
     // execute __syncthreads (CUDA requires full-block participation).
@@ -106,6 +111,7 @@ __device__ inline void intra_comm_sm(const globals& G) {
         }
     }
     __syncthreads();
+    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER_PH, 5);   // phase-1 gate passed
 
 #ifdef AG_GEMM_FASTPOLL
     // Publish "this CTA's phase-1 gather is complete" to every device. Placed
@@ -327,7 +333,12 @@ __device__ __forceinline__ int ag_gemm_shard_rank_for_step(
 static constexpr int ROW_BLOCKS_PER_TASK = globals::ROW_BLOCKS_PER_TASK;
 #endif
 
+#ifdef MKERNEL_TCGEN05
+__device__ inline void fused_comp_sm(const globals& G,
+                                     tensor_allocator<1, config::CLUSTER_SIZE>& tm_alloc) {
+#else
 __device__ inline void fused_comp_sm(const globals& G) {
+#endif
     if (G.debug_skip_compute != 0) {
         return;
     }
@@ -360,11 +371,12 @@ __device__ inline void fused_comp_sm(const globals& G) {
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < globals::PIPELINE_STAGES; ++i) {
-            init_semaphore(inputs_arrived[i], 0, 1);
+            // One expect() per MMA warp on the leader CTA.
+            init_semaphore(inputs_arrived[i], 0, config::CLUSTER_SIZE);
 #ifdef MKERNEL_TCGEN05
-            // Blackwell: the single tcgen05 MMA releases the stage (one
-            // commit), instead of 8 consumer warps each arriving after wgmma.
-            init_semaphore(inputs_finished[i], 0, 1);
+            // Blackwell: the tcgen05 MMA releases the stage (one commit per
+            // MMA warp), instead of 8 consumer warps each arriving after wgmma.
+            init_semaphore(inputs_finished[i], 0, config::CLUSTER_SIZE);
 #else
             init_semaphore(inputs_finished[i], 0, 8);
 #endif
@@ -372,11 +384,12 @@ __device__ inline void fused_comp_sm(const globals& G) {
         init_semaphore(outputs_arrived, 0, 1);   // one signal per sub-round
         init_semaphore(outputs_finished, 0, 1);
 #ifdef MKERNEL_TCGEN05
-        init_semaphore(mma_done,     0, 1);   // one commit covers both accumulators
+        // One commit per MMA warp; at CLUSTER_SIZE 1 the single warp issues both.
+        init_semaphore(mma_done,     0, config::CLUSTER_SIZE);
         init_semaphore(outputs_free, 0, 1);   // one per epilogue sub-round
         #pragma unroll
         for (int i = 0; i < ROW_BLOCKS_PER_TASK; ++i)
-            init_semaphore(tmem_free[i], 0, 2);   // one per consumer warpgroup
+            init_semaphore(tmem_free[i], 0, 2 * config::CLUSTER_SIZE);   // warpgroups x CTAs
 #endif
     }
     __syncthreads();
@@ -385,7 +398,9 @@ __device__ inline void fused_comp_sm(const globals& G) {
     // Tensor-memory allocation is CTA-wide (the ctor runs tcgen05.alloc on warp
     // 0 then bar.sync 0), so every thread of a compute CTA must reach it and it
     // must sit outside the warp-role split below.
-    tensor_allocator<1, 1> tm_alloc{};
+    // tm_alloc is constructed by fused_kernel: at ncta 2 its destructor runs a
+    // cluster barrier, so every CTA of every cluster -- gather CTAs included --
+    // has to construct and destroy it, not just the compute ones.
     // All 512 columns: one 128x256 fp32 accumulator per row block of the task.
     auto d_tt_pool = tm_alloc.allocate<tt<float, globals::ROW_BLOCK,
                                                 globals::COL_BLOCK * ROW_BLOCKS_PER_TASK>>(0);
@@ -398,7 +413,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
     uint32_t phasebits = 0xFFFF0000;
 
     const int node_row_blocks = G.A_local.rows() / globals::ROW_BLOCK;
+#ifdef MKERNEL_TCGEN05
+    const int col_blocks = G.B.rows() / globals::COL_BLOCK;   // B is (N, K)
+#else
     const int col_blocks = G.B.cols() / globals::COL_BLOCK;
+#endif
     const int num_iters = G.A_local.cols() / globals::RED_BLOCK;
 
     const int super_rows = (node_row_blocks / globals::SUPER_M) * globals::SUPER_M;
@@ -408,8 +427,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
     const int num_node_blocks = node_row_blocks * col_blocks;
     const int total_blocks = num_node_blocks * G.num_nodes;
 #ifdef MKERNEL_TCGEN05
-    const int pairs_per_shard = num_node_blocks / globals::ROW_BLOCKS_PER_TASK;
-    const int total_pairs     = pairs_per_shard * G.num_nodes;
+    // Cluster task space. At CLUSTER_SIZE 1 these collapse onto the pair space
+    // above and every index below is bit-identical to the pre-cluster code.
+    const int clusters_per_shard = num_node_blocks / globals::ROW_BLOCKS_PER_CLUSTER;
+    const int total_cluster_tasks = clusters_per_shard * G.num_nodes;
+    const int ctarank = (config::CLUSTER_SIZE > 1) ? (int)cluster_ctarank() : 0;
 #endif
 
     const int K_val = G.A_local.cols();
@@ -421,6 +443,13 @@ __device__ inline void fused_comp_sm(const globals& G) {
     // (node_row_blocks × col_blocks). See decode_comp_task() above for the
     // swizzle math.
     const int comp_idx = blockIdx.x - G.num_intra_comm;
+#ifdef MKERNEL_TCGEN05
+    // Clusters are consecutive blockIdx.x. num_intra_comm is forced even at
+    // CLUSTER_SIZE 2 (see the entrypoint), so comp_idx 0 is always a cluster
+    // leader and no cluster straddles the gather/compute role split.
+    const int cluster_id   = comp_idx / config::CLUSTER_SIZE;
+    const int num_clusters = G.num_comp_sms / config::CLUSTER_SIZE;
+#endif
 
     if (warpgroup_id == config::NUM_WARPGROUPS - 1) {
         warpgroup::decrease_registers<config::PRODUCER_REGISTERS>();
@@ -432,17 +461,19 @@ __device__ inline void fused_comp_sm(const globals& G) {
             const int gather_done_target = globals::NUM_DEVICES * G.num_intra_comm;
 #endif
             // TMA load warp — CTA-stride over super-tile-swizzled tiles
-            for (int pair_id = comp_idx; pair_id < total_pairs; pair_id += G.num_comp_sms) {
+            for (int pair_id = cluster_id; pair_id < total_cluster_tasks; pair_id += num_clusters) {
                 // decode_comp_task varies rb fastest within a band, so flat and
                 // flat+1 are adjacent row blocks at the same column. SUPER_M and
                 // final_rows are both even, so flat=2k never straddles a band or
                 // the super/tail boundary, and rb comes out even - which also
                 // puts the pair inside one 256-row intra block, leaving the
                 // per-K-strip barrier waits below untouched.
-                const int shard_step = pair_id / pairs_per_shard;
+                const int shard_step = pair_id / clusters_per_shard;
                 const int shard_rank = ag_gemm_shard_rank_for_step(
                     G.node_idx, G.num_nodes, shard_step);
-                const int shard_task_id = 2 * (pair_id - shard_step * pairs_per_shard);
+                const int shard_task_id =
+                    globals::ROW_BLOCKS_PER_CLUSTER * (pair_id - shard_step * clusters_per_shard)
+                  + globals::ROW_BLOCKS_PER_TASK * ctarank;
                 const comp_task t = decode_comp_task(
                     shard_task_id, super_rows, final_rows, super_blocks, col_blocks,
                     num_node_blocks);
@@ -458,6 +489,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 unsigned long long tr_stall = 0;   // blocked on gather readiness
                 unsigned long long tr_pipe  = 0;   // blocked on the compute pipeline
 #endif
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_LOADER, pair_id);
                 int row_idx;
                 int shard_rb = rb;
                 int recv_peer_slot = 0;
@@ -516,6 +548,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
 
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_LOADER_K, red_idx * 8 + 1);
                     // Per-K-strip wait on plane 0. Each intra col_chunk
                     // covers 2 compute K-strips, so wait when crossing the
                     // boundary.
@@ -532,6 +565,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                         wait(G.barrier, {0, row_idx / 2, red_idx / 2},
                              G.dev_idx, 1);
                         AG_TRACE_STALL_END(tr_stall, tr_w2);
+                        AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_LOADER_K, red_idx * 8 + 2);
                     }
                     if (is_remote && G.remote_ready_per_col != 0 && (red_idx & 1) == 0) {
                         AG_TRACE_STALL_BEGIN(tr_w3);
@@ -543,24 +577,47 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     AG_TRACE_STALL_BEGIN(tr_w4);
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     AG_TRACE_STALL_END(tr_pipe, tr_w4);
+                    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_LOADER_K, red_idx * 8 + 3);
                     update_phasebit<1>(phasebits, stage);
-                    tma::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs));
 #ifdef MKERNEL_TCGEN05
                     // One 128-row A tile; coordinates are in units of A_tile,
                     // so the *2+i indexing of the two-half layout collapses.
                     // Both row blocks of the pair; they share the B tile below.
-                    #pragma unroll
-                    for (int h = 0; h < globals::ROW_BLOCKS_PER_TASK; h++) {
-                        if (is_remote) {
-                            tma::load_async(inputs[stage].A[h], G.A_recv[G.dev_idx],
-                                            {recv_peer_slot * node_row_blocks + shard_rb + h, red_idx},
-                                            inputs_arrived[stage]);
-                        } else {
-                            tma::load_async(inputs[stage].A[h], G.A_local,
-                                            {row_idx + h, red_idx}, inputs_arrived[stage]);
+                    if constexpr (config::CLUSTER_SIZE > 1) {
+                        // Each CTA loads its own slice (mask = 1 << ctarank) but
+                        // points the completion at the leader's barrier
+                        // (dst_mbar_cta = 0), which the MMA warps' single
+                        // cluster::expect accounts for. No expect here.
+                        #pragma unroll
+                        for (int h = 0; h < globals::ROW_BLOCKS_PER_TASK; h++) {
+                            if (is_remote) {
+                                tma::cluster::load_async(
+                                    inputs[stage].A[h], G.A_recv[G.dev_idx],
+                                    {recv_peer_slot * node_row_blocks + shard_rb + h, red_idx},
+                                    inputs_arrived[stage], (uint16_t)(1 << ctarank), 0);
+                            } else {
+                                tma::cluster::load_async(
+                                    inputs[stage].A[h], G.A_local,
+                                    {row_idx + h, red_idx},
+                                    inputs_arrived[stage], (uint16_t)(1 << ctarank), 0);
+                            }
+                        }
+                    } else {
+                        tma::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs));
+                        #pragma unroll
+                        for (int h = 0; h < globals::ROW_BLOCKS_PER_TASK; h++) {
+                            if (is_remote) {
+                                tma::load_async(inputs[stage].A[h], G.A_recv[G.dev_idx],
+                                                {recv_peer_slot * node_row_blocks + shard_rb + h, red_idx},
+                                                inputs_arrived[stage]);
+                            } else {
+                                tma::load_async(inputs[stage].A[h], G.A_local,
+                                                {row_idx + h, red_idx}, inputs_arrived[stage]);
+                            }
                         }
                     }
 #else
+                    tma::expect_bytes(inputs_arrived[stage], sizeof(globals::pipeline_inputs));
                     #pragma unroll
                     for (int i = 0; i < 2; i++) {
                         if (is_remote) {
@@ -575,7 +632,18 @@ __device__ inline void fused_comp_sm(const globals& G) {
                         }
                     }
 #endif
-                    tma::load_async(inputs[stage].B, G.B, {red_idx, col_idx}, inputs_arrived[stage]);
+                    // B is (N, K): tile row selects this CTA's column slab.
+#ifdef MKERNEL_TCGEN05
+                    if constexpr (config::CLUSTER_SIZE > 1) {
+                        tma::cluster::load_async(
+                            inputs[stage].B, G.B,
+                            {col_idx * config::CLUSTER_SIZE + ctarank, red_idx},
+                            inputs_arrived[stage], (uint16_t)(1 << ctarank), 0);
+                    } else
+#endif
+                    tma::load_async(inputs[stage].B, G.B,
+                                    {col_idx * config::CLUSTER_SIZE + ctarank, red_idx},
+                                    inputs_arrived[stage]);
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
 #ifdef AG_GEMM_TRACE
@@ -583,16 +651,23 @@ __device__ inline void fused_comp_sm(const globals& G) {
                             tr_stall, tr_pipe, clock64() - tr_c0);
 #endif
             }
+            AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_LOADER, 999);
         }
 #ifdef MKERNEL_TCGEN05
-        else if (warp_id == 2 && lane_id == 0) {
+        else if ((warp_id == 2 || (config::CLUSTER_SIZE > 1 && warp_id == 3))
+                 && lane_id == 0 && ctarank == 0) {
             // Blackwell MMA issuer. tcgen05 MMAs are issued by one thread and
             // accumulate in tensor memory, so this warp replaces the wgmma the
             // consumers used to run. It walks the same task order as the loader
             // and consumers — including the identical remote-skip — so the
             // input pipeline stays in lockstep.
-            for (int pair_id = comp_idx; pair_id < total_pairs; pair_id += G.num_comp_sms) {
-                const int shard_step = pair_id / pairs_per_shard;
+            //
+            // At CLUSTER_SIZE 2 the MMA spans the CTA pair: A is split by rows
+            // (each CTA keeps its own 128 accumulator rows) and B by columns,
+            // so only the leader issues, one warp per accumulator, and both
+            // CTAs' operands feed it.
+            for (int pair_id = cluster_id; pair_id < total_cluster_tasks; pair_id += num_clusters) {
+                const int shard_step = pair_id / clusters_per_shard;
                 const int shard_rank = ag_gemm_shard_rank_for_step(
                     G.node_idx, G.num_nodes, shard_step);
                 if (shard_rank != G.node_idx && G.debug_skip_remote_compute != 0) {
@@ -600,49 +675,82 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 }
                 // Tensor memory must be drained before the accumulate=0 MMA
                 // overwrites it.
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_MMA, pair_id);
                 using acc_t = tt<float, globals::ROW_BLOCK, globals::COL_BLOCK>;
-                #pragma unroll
-                for (int h = 0; h < globals::ROW_BLOCKS_PER_TASK; h++) {
-                    wait(tmem_free[h], get_phasebit<1>(phasebits, h));
-                    update_phasebit<1>(phasebits, h);
+                if constexpr (config::CLUSTER_SIZE > 1) {
+                    // One accumulator per MMA warp, so warp 2 is released as
+                    // soon as accumulator 0 is drained cluster-wide.
+                    const int acc = warp_id - 2;
+                    tma::cluster::wait(tmem_free[acc], get_phasebit<1>(phasebits, acc));
+                    update_phasebit<1>(phasebits, acc);
+                } else {
+                    #pragma unroll
+                    for (int h = 0; h < globals::ROW_BLOCKS_PER_TASK; h++) {
+                        wait(tmem_free[h], get_phasebit<1>(phasebits, h));
+                        update_phasebit<1>(phasebits, h);
+                    }
                 }
                 auto d0 = d_tt_pool.template subtile<acc_t>(0, 0);
                 auto d1 = d_tt_pool.template subtile<acc_t>(0, globals::COL_BLOCK);
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
-                    wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_MMA_K, red_idx * 8 + 1);
+                    if constexpr (config::CLUSTER_SIZE > 1) {
+                        // One expect per MMA warp; together the two account for
+                        // the six tile loads (three per CTA) the loaders
+                        // redirected at the leader's barrier.
+                        tma::cluster::expect(inputs_arrived[stage],
+                                             inputs[0].A[0], inputs[0].A[1], inputs[0].B);
+                        tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    } else {
+                        wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    }
                     update_phasebit<0>(phasebits, stage);
+                    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_MMA_K, red_idx * 8 + 2);
                     // mm_AB zeroes the accumulator, mma_AB accumulates onto it.
                     // The semaphore fires once the MMA has consumed the shared
                     // operands, releasing the stage back to the loader.
                     // Two MMAs off one B tile. Only the second carries the
                     // semaphore: tcgen05.commit covers every MMA issued before
                     // it, so one commit releases the stage once both have read.
-                    if (red_idx == 0) {
-                        warp::mm_AB (d0, inputs[stage].A[0], inputs[stage].B);
-                        warp::mm_AB (d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
+                    if constexpr (config::CLUSTER_SIZE > 1) {
+                        // commit<2> multicasts, so each CTA's inputs_finished
+                        // sees both MMAs and its loader is released in step.
+                        auto d = (warp_id == 2) ? d0 : d1;
+                        if (red_idx == 0)
+                            warp::mm2_ABt (d, inputs[stage].A[warp_id - 2],
+                                           inputs[stage].B, inputs_finished[stage]);
+                        else
+                            warp::mma2_ABt(d, inputs[stage].A[warp_id - 2],
+                                           inputs[stage].B, inputs_finished[stage]);
+                    } else if (red_idx == 0) {
+                        warp::mm_ABt (d0, inputs[stage].A[0], inputs[stage].B);
+                        warp::mm_ABt (d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
                     } else {
-                        warp::mma_AB(d0, inputs[stage].A[0], inputs[stage].B);
-                        warp::mma_AB(d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
+                        warp::mma_ABt(d0, inputs[stage].A[0], inputs[stage].B);
+                        warp::mma_ABt(d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
                     }
                     stage = (stage + 1) % globals::PIPELINE_STAGES;
                 }
-                kittens::tensor_commit<1>(mma_done);
+                kittens::tensor_commit<config::CLUSTER_SIZE>(mma_done);
             }
+            AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_MMA, 999);
         }
 #endif
         else if (warp_id == 1 && lane_id == 0) {
             // TMA store warp — same super-tile-swizzled task order as loader
-            for (int pair_id = comp_idx; pair_id < total_pairs; pair_id += G.num_comp_sms) {
+            for (int pair_id = cluster_id; pair_id < total_cluster_tasks; pair_id += num_clusters) {
                 // decode_comp_task varies rb fastest within a band, so flat and
                 // flat+1 are adjacent row blocks at the same column. SUPER_M and
                 // final_rows are both even, so flat=2k never straddles a band or
                 // the super/tail boundary, and rb comes out even - which also
                 // puts the pair inside one 256-row intra block, leaving the
                 // per-K-strip barrier waits below untouched.
-                const int shard_step = pair_id / pairs_per_shard;
+                const int shard_step = pair_id / clusters_per_shard;
                 const int shard_rank = ag_gemm_shard_rank_for_step(
                     G.node_idx, G.num_nodes, shard_step);
-                const int shard_task_id = 2 * (pair_id - shard_step * pairs_per_shard);
+                const int shard_task_id =
+                    globals::ROW_BLOCKS_PER_CLUSTER * (pair_id - shard_step * clusters_per_shard)
+                  + globals::ROW_BLOCKS_PER_TASK * ctarank;
                 const comp_task t = decode_comp_task(
                     shard_task_id, super_rows, final_rows, super_blocks, col_blocks,
                     num_node_blocks);
@@ -652,6 +760,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 if (shard_rank != G.node_idx && G.debug_skip_remote_compute != 0) {
                     continue;
                 }
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, pair_id * 8 + 1);
 
 #ifdef MKERNEL_TCGEN05
                 // One staging tile for four 64-row halves (two row blocks x two
@@ -663,14 +772,17 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     #pragma unroll
                     for (int hs = 0; hs < 2; hs++) {
                         wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+                        AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, (h * 2 + hs) * 8 + 2);
                         update_phasebit<0>(phasebits, 0);
                         tma::store_async(G.C, outputs.C, {(row_idx + h) * 2 + hs, col_idx});
                         // store_async_wait waits for the global commit (not just
                         // smem reuse safety like read_wait). At large M,
                         // store-in-flight can race with downstream reads of C.
                         tma::store_async_wait();
+                        AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, (h * 2 + hs) * 8 + 3);
                         if (++sub == 2 * globals::ROW_BLOCKS_PER_TASK) arrive(outputs_finished);
                         else                                           arrive(outputs_free);
+                        AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, (h * 2 + hs) * 8 + 4);
                     }
                 }
 #else
@@ -683,14 +795,15 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 arrive(outputs_finished);
 #endif
             }
+            AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, 999);
         }
     } else {
         // Consumer warpgroups: WGMMA — same tile count, same CTA-stride
         warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
 
 #ifdef MKERNEL_TCGEN05
-        for (int pair_id = comp_idx; pair_id < total_pairs; pair_id += G.num_comp_sms) {
-            const int shard_step = pair_id / pairs_per_shard;
+        for (int pair_id = cluster_id; pair_id < total_cluster_tasks; pair_id += num_clusters) {
+            const int shard_step = pair_id / clusters_per_shard;
 #else
         for (int task_id = comp_idx; task_id < total_blocks; task_id += G.num_comp_sms) {
             const int shard_step = task_id / num_node_blocks;
@@ -700,6 +813,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
             if (shard_rank != G.node_idx && G.debug_skip_remote_compute != 0) {
                 continue;
             }
+            AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, pair_id * 8 + 1);
             rt_fl<globals::ROW_BLOCK / 8, globals::COL_BLOCK> C_accum;
 #ifdef MKERNEL_TCGEN05
             // Blackwell consumers do no MMA. They wait for the tensor-memory
@@ -716,6 +830,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
             // One signal covers both accumulators: tcgen05.commit fires only
             // after every MMA issued before it has completed.
             wait(mma_done, get_phasebit<0>(phasebits, 0));
+            AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, pair_id * 8 + 2);
             update_phasebit<0>(phasebits, 0);
 
             #pragma unroll
@@ -726,9 +841,16 @@ __device__ inline void fused_comp_sm(const globals& G) {
                                      trow, globals::COL_BLOCK * h));
                 kittens::tensor_load_wait();
                 group<8>::sync(3);
+                AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, pair_id * 8 + 3);
                 // Registers hold this accumulator, so tensor memory is free
                 // even though the stores are still ahead.
-                warpgroup::arrive(tmem_free[h]);
+                if constexpr (config::CLUSTER_SIZE > 1) {
+                    // The accumulator lives on the leader, so release it there.
+                    if (warp_id == 0 && lane_id == 0)
+                        tma::cluster::arrive(tmem_free[h], 0, 1);
+                } else {
+                    warpgroup::arrive(tmem_free[h]);
+                }
 
                 // The single staging tile takes one 64-row half at a time.
                 // Under the group<8> tmem layout warps {0,1,4,5} own rows < 64
@@ -745,6 +867,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                         wait(outputs_free, get_phasebit<0>(phasebits, 1));
                         update_phasebit<0>(phasebits, 1);
                     }
+                    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, (h * 2 + hs) * 8 + 4);
                     if (trow / 64 == hs) {
                         auto dst = outputs.C.template subtile<globals::ROW_BLOCK / 8,
                                                               globals::COL_BLOCK>(
@@ -752,6 +875,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
                         warp::store(dst, C_accum);
                     }
                     group<8>::sync(4);
+                    AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, (h * 2 + hs) * 8 + 5);
                     if (warpgroup_id == 0 && warp_id == 0 && lane_id == 0)
                         arrive(outputs_arrived);
                 }
@@ -774,6 +898,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
             warpgroup::arrive(outputs_arrived);
 #endif
         }
+        AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, 999);
     }
 }
 
@@ -804,11 +929,26 @@ __device__ inline void grid_sync_at_epoch(const globals& G) {
 __device__ inline void barrier_reset(const globals& G);
 
 __device__ inline void fused_kernel(const globals& G) {
+#ifdef MKERNEL_TCGEN05
+    // Cluster-wide: every CTA's semaphores must exist before a peer redirects a
+    // transaction or an arrival at them. Both this and the allocator's
+    // destructor are cluster-scope, so they sit outside the role dispatch --
+    // a CTA that skipped them would strand its cluster partner on the barrier.
+    if constexpr (config::CLUSTER_SIZE > 1) everyone::tma::cluster::sync();
+    tensor_allocator<1, config::CLUSTER_SIZE> tm_alloc{};
+    if (blockIdx.x < G.num_intra_comm) {
+        intra_comm_sm(G);
+    } else {
+        fused_comp_sm(G, tm_alloc);
+    }
+#else
     if (blockIdx.x < G.num_intra_comm) {
         intra_comm_sm(G);
     } else {
         fused_comp_sm(G);
     }
+#endif
+    if (threadIdx.x == 0) AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_END, 1);
 
     // Inline the iter-end barrier reset so it shares the kernel launch
     // rather than incurring a separate cudaLaunchKernel. Grid-sync first
@@ -818,7 +958,9 @@ __device__ inline void fused_kernel(const globals& G) {
         return;
     }
     grid_sync_at_epoch(G);
+    if (threadIdx.x == 0) AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_END, 2);
     barrier_reset(G);
+    if (threadIdx.x == 0) AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_END, 3);
 }
 
 __device__ inline void barrier_reset(const globals& G) {
@@ -860,7 +1002,12 @@ __device__ inline void barrier_reset(const globals& G) {
         barrier_all(G.barrier, {0, 1023, 1023}, G.dev_idx);
 }
 
+#if defined(MKERNEL_TCGEN05) && defined(AG_GEMM_CLUSTER2)
 __global__ __launch_bounds__(config::NUM_THREADS, 1)
+__cluster_dims__(config::CLUSTER_SIZE, 1, 1)
+#else
+__global__ __launch_bounds__(config::NUM_THREADS, 1)
+#endif
 void ag_gemm_fused_kernel_stub(const __grid_constant__ globals G) {
     fused_kernel(G);
 }
@@ -939,6 +1086,9 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
         side_stream_inited = true;
     }
 
+    // Clusters are launched whole.
+    const unsigned int cluster_grid =
+        active_sms - active_sms % (unsigned int)config::CLUSTER_SIZE;
     const int prologue_blocks = G.num_intra_comm > 0 ? G.num_intra_comm : 1;
     // Single-node runs have no peers, so there are no RDMA work requests to
     // post. Skipping is not just an optimisation: the caller has no session,
@@ -948,7 +1098,7 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
         (std::getenv("AG_GEMM_SKIP_PROLOGUE") != nullptr &&
          std::getenv("AG_GEMM_SKIP_PROLOGUE")[0] == '1');
     if (skip_prologue) {
-        ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
+        ag_gemm_fused_kernel_stub<<<cluster_grid, config::NUM_THREADS,
                                     dynamic_shared_memory, stream>>>(G);
         return;
     }
@@ -965,7 +1115,7 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
     if (prologue_main_stream) {
         ag_gemm_phase0_prologue_kernel<<<prologue_blocks, WARP_THREADS, 0,
                                          stream>>>(G);
-        ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
+        ag_gemm_fused_kernel_stub<<<cluster_grid, config::NUM_THREADS,
                                     dynamic_shared_memory, stream>>>(G);
         return;
     }
@@ -977,7 +1127,7 @@ void launch_fused_ag_gemm(const globals& G, unsigned int active_sms) {
     ag_gemm_phase0_prologue_kernel<<<prologue_blocks, WARP_THREADS, 0,
                                      prologue_stream>>>(G);
     // Launch main kernel — does NOT wait on prologue.
-    ag_gemm_fused_kernel_stub<<<active_sms, config::NUM_THREADS,
+    ag_gemm_fused_kernel_stub<<<cluster_grid, config::NUM_THREADS,
                                 dynamic_shared_memory, stream>>>(G);
 }
 
