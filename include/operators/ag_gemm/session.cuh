@@ -196,24 +196,24 @@ pybind11::list get_proxy_timelines_py() {
 static void ag_trace_reset_py() {
     int zero = 0;
     MKERNEL_CUDACHECK(cudaMemcpyToSymbol(
-        ag_gemm_multinode::trace::g_count, &zero, sizeof(int)));
+        mkernel::trace::g_count, &zero, sizeof(int)));
 }
 
 // Returns an (n, FIELDS) int64 CPU tensor; columns are the fields of
-// ag_gemm_multinode::trace::rec, in declaration order.
+// mkernel::trace::rec, in declaration order.
 static at::Tensor ag_trace_read_py() {
     int n = 0;
     MKERNEL_CUDACHECK(cudaMemcpyFromSymbol(
-        &n, ag_gemm_multinode::trace::g_count, sizeof(int)));
-    const bool overflowed = n > ag_gemm_multinode::trace::MAX_RECS;
-    if (overflowed) n = ag_gemm_multinode::trace::MAX_RECS;
+        &n, mkernel::trace::g_count, sizeof(int)));
+    const bool overflowed = n > mkernel::trace::MAX_RECS;
+    if (overflowed) n = mkernel::trace::MAX_RECS;
     if (n < 0) n = 0;
-    auto out = at::empty({n, ag_gemm_multinode::trace::FIELDS},
+    auto out = at::empty({n, mkernel::trace::FIELDS},
                          at::TensorOptions().dtype(at::kLong));
     if (n > 0) {
         MKERNEL_CUDACHECK(cudaMemcpyFromSymbol(
-            out.data_ptr(), ag_gemm_multinode::trace::g_recs,
-            (size_t)n * sizeof(ag_gemm_multinode::trace::rec), 0,
+            out.data_ptr(), mkernel::trace::g_recs,
+            (size_t)n * sizeof(mkernel::trace::rec), 0,
             cudaMemcpyDeviceToHost));
     }
     if (overflowed) {
@@ -229,13 +229,13 @@ static at::Tensor ag_trace_progress_py() {
     static cudaStream_t s = nullptr;
     if (s == nullptr)
         MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    const int n = ag_gemm_multinode::trace::MAX_CTAS *
-                  ag_gemm_multinode::trace::ROLE_SLOTS;
-    auto out = at::empty({ag_gemm_multinode::trace::MAX_CTAS,
-                          ag_gemm_multinode::trace::ROLE_SLOTS},
+    const int n = mkernel::trace::MAX_CTAS *
+                  mkernel::trace::ROLE_SLOTS;
+    auto out = at::empty({mkernel::trace::MAX_CTAS,
+                          mkernel::trace::ROLE_SLOTS},
                          at::TensorOptions().dtype(at::kInt));
     MKERNEL_CUDACHECK(cudaMemcpyFromSymbolAsync(
-        out.data_ptr(), ag_gemm_multinode::trace::g_progress,
+        out.data_ptr(), mkernel::trace::g_progress,
         (size_t)n * sizeof(int), 0, cudaMemcpyDeviceToHost, s));
     MKERNEL_CUDACHECK(cudaStreamSynchronize(s));
     return out;

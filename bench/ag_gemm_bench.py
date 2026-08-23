@@ -332,7 +332,7 @@ def main():
         # execution, so this reports where each warp role got stuck.
         if os.environ.get("AG_GEMM_HANG_PROBE") == "1" and hasattr(mod, "trace_progress"):
             import numpy as np
-            NAMES = ["gather", "loader", "loader_k", "mma", "store", "consumer", "gath_ph", "mma_k", "end"]
+            NAMES = ["gather", "loader", "mma", "store", "consumer", "end"]
             reset_state(); epoch += 1
             if not intra_only: mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.1)
@@ -353,20 +353,10 @@ def main():
                     else:
                         print(f"    {nm:9s} : n={nz.size:3d} min={nz.min():5d} "
                               f"max={nz.max():5d} median={int(np.median(nz)):5d}", flush=True)
-                for si, nm in ((2, "loader_k"), (7, "mma_k"), (4, "store"), (5, "consumer")):
-                    col = p[:, si]; nz = col[col != 0]
-                    if nz.size:
-                        print(f"    {nm} decoded: k={nz.min()//8}..{nz.max()//8} "
-                              f"codes={sorted(set((nz % 8).tolist()))}", flush=True)
                 import collections
-                ec = collections.Counter(p[:, 8].tolist())
+                ec = collections.Counter(p[:, 5].tolist())
                 print(f"    END slot histogram (0=not reached 1=role done "
                       f"2=grid-synced 3=reset done): {dict(ec)}", flush=True)
-                gp = p[:, 6]; gp = gp[gp != 0]
-                if gp.size:
-                    print(f"    gather phase codes: {sorted(set(gp.tolist()))} "
-                          f"(1=in task 2=pre-signal 3=post-signal 4=loop done 5=gate passed)",
-                          flush=True)
             sys.stdout.flush()
             os._exit(0)
 

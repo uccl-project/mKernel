@@ -80,7 +80,7 @@ __device__ inline void compute_tile_impl(
             const unsigned long long tr_t0 = trace::now_ns();
             const unsigned long long tr_c0 = clock64();
             unsigned long long tr_a = 0;
-            MKERNEL_TRACE_MARK(::gemm_rs_multinode::trace::SLOT_LOADER, ready_idx);
+            MKERNEL_TRACE_MARK(trace::SLOT_LOADER, ready_idx);
 #endif
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                 MKERNEL_TRACE_TICK_BEGIN(tr_w);
@@ -137,7 +137,7 @@ __device__ inline void compute_tile_impl(
             const unsigned long long tr_t0 = trace::now_ns();
             const unsigned long long tr_c0 = clock64();
             unsigned long long tr_a = 0, tr_b = 0;
-            MKERNEL_TRACE_MARK(::gemm_rs_multinode::trace::SLOT_MMA, ready_idx);
+            MKERNEL_TRACE_MARK(trace::SLOT_MMA, ready_idx);
 #endif
             MKERNEL_TRACE_TICK_BEGIN(tr_wt);
             tma::cluster::wait(tmem_free[acc], get_phasebit<1>(phasebits, acc));
@@ -178,7 +178,7 @@ __device__ inline void compute_tile_impl(
             const unsigned long long tr_t0 = trace::now_ns();
             const unsigned long long tr_c0 = clock64();
             unsigned long long tr_a = 0, tr_b = 0;
-            MKERNEL_TRACE_MARK(::gemm_rs_multinode::trace::SLOT_STORE, ready_idx);
+            MKERNEL_TRACE_MARK(trace::SLOT_STORE, ready_idx);
 #endif
             int sub = 0;
             #pragma unroll

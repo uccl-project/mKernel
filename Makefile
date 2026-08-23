@@ -90,82 +90,45 @@ COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 # Failed-experiment flags are NOT defined here (HYBRID, MERGED_COMM,
 # PUSH_NVL_FANOUT, DISPATCH_DONATE_INTER_SEND, ACTIVITY_TRACE, etc.) so
 # their #ifdef branches stay disabled.
-# AG_GEMM_TRACE=1 turns on the per-task activity trace (device-side %globaltimer
-# + clock64 records, read back via trace_read()). Profiling only -- it perturbs
-# timing slightly and costs 4 MB of static device memory.
-AG_GEMM_TRACE ?= 0
-# AG_GEMM_ROWPERM=1 orders compute's row blocks to match phase-1's production
-# order (see decode_comp_task). Perf change only -- it is a bijection.
+# ag_gemm build flags. Each name below becomes -DAG_GEMM_<name> when set to 1.
+# The first group defaults on for GPU=blackwell, the second is always off --
+# either profiling-only or a measured-and-rejected experiment kept per this
+# repository's convention of leaving failed experiments behind disabled #ifdefs.
+#
+#   ROWPERM             order compute's row blocks to match phase-1's production
+#                       order (see decode_comp_task). A bijection: perf only.
+#   FASTPOLL            skip the per-K-strip readiness poll once phase 1 has
+#                       completed on every device.
+#   CLUSTER2            2-CTA tcgen05 clusters -- A split by rows across the
+#                       pair, B by columns, one MMA warp per accumulator on the
+#                       leader. Requires num_intra_comm to be even.
+#
+#   TRACE               per-task activity trace + live progress array.
+#   EPILOGUE_READ_WAIT  let the epilogue's TMA store retire in the background
+#                       instead of blocking on the global commit. Worth 0.6% at
+#                       M=32768, noise elsewhere -- not worth the race the
+#                       inter-node path would face, which single-node can't test.
+#   DOUBLE_OUTPUT       two epilogue staging tiles instead of one. Neutral:
+#                       M=16384 0.996 -> 0.986, M=32768 6.518 -> 6.563.
+#   ROWPOLL             per-row completion counter on the unused barrier plane 1,
+#                       so a task drops its 256 per-K polls once its own row is
+#                       done. Worse everywhere (M=32768 6.495 -> 6.748): the
+#                       signal is a cross-GPU multimem atomic and all 256 tasks
+#                       of a row contend on one address, costing gather more
+#                       than the saved polls buy compute.
+AG_GEMM_BLACKWELL_FLAGS := ROWPERM FASTPOLL CLUSTER2
+AG_GEMM_OPT_IN_FLAGS    := TRACE EPILOGUE_READ_WAIT DOUBLE_OUTPUT ROWPOLL
 ifeq ($(GPU),blackwell)
-AG_GEMM_ROWPERM ?= 1
-else
-AG_GEMM_ROWPERM ?= 0
+$(foreach f,$(AG_GEMM_BLACKWELL_FLAGS),$(eval AG_GEMM_$(f) ?= 1))
 endif
-DEFS_ag_gemm        :=
-ifeq ($(AG_GEMM_TRACE),1)
-DEFS_ag_gemm        += -DAG_GEMM_TRACE
-endif
-ifeq ($(AG_GEMM_ROWPERM),1)
-DEFS_ag_gemm        += -DAG_GEMM_ROWPERM
-endif
-# AG_GEMM_FASTPOLL=1 lets compute skip the per-K-strip readiness poll once
-# phase-1 has completed on every device.
-ifeq ($(GPU),blackwell)
-AG_GEMM_FASTPOLL ?= 1
-else
-AG_GEMM_FASTPOLL ?= 0
-endif
-ifeq ($(AG_GEMM_FASTPOLL),1)
-DEFS_ag_gemm        += -DAG_GEMM_FASTPOLL
-endif
-# AG_GEMM_OWNSHARD=1 skips the readiness wait for rows this device owns, whose
-# bytes are already in place before phase 1 runs. MEASURED SLOWER (M=32768
-# 6.556 -> 6.612 ms, M=16384 1.043 -> 1.081): letting those CTAs run ahead
-# breaks the lockstep tile order that the multicast read sharing depends on.
-# Kept off by repository convention for failed experiments.
-# AG_GEMM_CLUSTER2=1 runs the compute path as 2-CTA tcgen05 clusters: A split
-# by rows across the pair, B by columns, one MMA warp per accumulator on the
-# leader. Default on for GPU=blackwell.
-ifeq ($(GPU),blackwell)
-AG_GEMM_CLUSTER2 ?= 1
-else
-AG_GEMM_CLUSTER2 ?= 0
-endif
-ifeq ($(AG_GEMM_CLUSTER2),1)
-DEFS_ag_gemm        += -DAG_GEMM_CLUSTER2
-endif
-# Override the pipeline depth (default: 4 with clusters, 3 without).
+$(foreach f,$(AG_GEMM_BLACKWELL_FLAGS) $(AG_GEMM_OPT_IN_FLAGS),$(eval AG_GEMM_$(f) ?= 0))
+DEFS_ag_gemm := $(foreach f,$(AG_GEMM_BLACKWELL_FLAGS) $(AG_GEMM_OPT_IN_FLAGS),\
+                  $(if $(filter 1,$(AG_GEMM_$(f))),-DAG_GEMM_$(f)))
+# Pipeline depth. Default 3; 4 is 1.5% better at M=16384 and 1.7% worse at
+# M=32768, so the default follows the larger shape.
 AG_GEMM_STAGES ?=
 ifneq ($(AG_GEMM_STAGES),)
-DEFS_ag_gemm        += -DAG_GEMM_PIPELINE_STAGES=$(AG_GEMM_STAGES)
-endif
-# AG_GEMM_EPILOGUE_READ_WAIT=1 lets the epilogue's TMA store retire in the
-# background instead of blocking each sub-round on the global commit.
-AG_GEMM_EPILOGUE_READ_WAIT ?= 0
-ifeq ($(AG_GEMM_EPILOGUE_READ_WAIT),1)
-DEFS_ag_gemm        += -DAG_GEMM_EPILOGUE_READ_WAIT
-endif
-# AG_GEMM_ROWPOLL=1 gives each intra row a completion counter on the unused
-# barrier plane 1, so a compute task can skip its per-K-strip readiness polls as
-# soon as its own row is complete -- much earlier than the global flag, which
-# waits for the slowest GPU. MEASURED SLOWER at every shape (M=32768 6.495 ->
-# 6.748 ms, M=4096 0.173 -> 0.228): the extra signal is a cross-GPU multimem
-# atomic and all 256 tasks of a row hit the same address, so the contention
-# costs gather more than the saved polls buy compute. Off by repository
-# convention for failed experiments.
-AG_GEMM_ROWPOLL ?= 0
-ifeq ($(AG_GEMM_ROWPOLL),1)
-DEFS_ag_gemm        += -DAG_GEMM_ROWPOLL
-endif
-# AG_GEMM_DOUBLE_OUTPUT=1 gives the epilogue two staging tiles instead of one.
-# Measured neutral; see the comment on OUTPUT_BUFFERS.
-AG_GEMM_DOUBLE_OUTPUT ?= 0
-ifeq ($(AG_GEMM_DOUBLE_OUTPUT),1)
-DEFS_ag_gemm        += -DAG_GEMM_DOUBLE_OUTPUT
-endif
-AG_GEMM_OWNSHARD ?= 0
-ifeq ($(AG_GEMM_OWNSHARD),1)
-DEFS_ag_gemm        += -DAG_GEMM_OWNSHARD
+DEFS_ag_gemm += -DAG_GEMM_PIPELINE_STAGES=$(AG_GEMM_STAGES)
 endif
 # Arrival-flag layout is now a runtime flag (SessionConfig.use_arrival_queue);
 # gemm_ar's session shim sets it to true. No compile-time switch needed.
