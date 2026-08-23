@@ -504,6 +504,18 @@ void entrypoint(
         std::atoi(std::getenv("AG1_ADAPTIVE_COMM_SMS")) != 0) {
         if (M >= 32768) adaptive_comm_sms = std::min(num_comm_sms, adaptive_cap_large_m);
         else if (M >= 16384) adaptive_comm_sms = std::min(num_comm_sms, 32);
+#ifdef MKERNEL_TCGEN05
+        // Re-tuned for Blackwell. The Hopper caps below starve gather at small
+        // M, where a trace shows compute doing 11.6% useful work and waiting
+        // 69.5% -- there is not enough compute to hide the gather behind, so
+        // shortening gather is what matters, not returning CTAs to compute.
+        // Measured (gather CTAs -> ms, 30-iter medians):
+        //   M=4096    4:0.170   8:0.136  16:0.121  32:0.129
+        //   M=8192    8:0.373  16:0.324  32:0.316  48:0.353
+        // The value below is halved into num_intra_comm.
+        else if (M <= 4096) adaptive_comm_sms = std::min(num_comm_sms, 32);
+        else if (M <= 8192) adaptive_comm_sms = std::min(num_comm_sms, 64);
+#else
         // Small-M: at M<=4K intra-gather has only local_row_blocks=2 rows per
         // rank with col_blocks=2 (K=256/128), so 4 total intra tasks. Under
         // MERGE+EARLY_SEND extra intra CTAs sit idle but steal from compute.
@@ -511,6 +523,7 @@ void entrypoint(
         // At M<=8K, keep enough intra CTAs to cover the small number of
         // gather tasks while returning idle CTAs to compute.
         else if (M <= 8192) adaptive_comm_sms = std::min(num_comm_sms, 32);
+#endif
     }
     int num_intra_comm = (num_intra_comm_override > 0)
         ? num_intra_comm_override

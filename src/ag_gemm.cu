@@ -952,10 +952,24 @@ __device__ inline void fused_kernel(const globals& G) {
     if (G.debug_skip_reset != 0) {
         return;
     }
+#ifdef AG_GEMM_TRACE
+    // Role 2 records the kernel tail: a = ticks in grid_sync (waiting for this
+    // GPU's stragglers), the rest is barrier_reset plus the 8-GPU barrier.
+    const unsigned long long tail_t0 = trace::now_ns();
+    const unsigned long long tail_c0 = clock64();
+    unsigned long long tail_sync = 0;
+#endif
+    MKERNEL_TRACE_TICK_BEGIN(tail_w);
     grid_sync_at_epoch(G);
+    MKERNEL_TRACE_TICK_END(tail_sync, tail_w);
     if (threadIdx.x == 0) MKERNEL_TRACE_MARK(trace::SLOT_END, 2);
     barrier_reset(G);
     if (threadIdx.x == 0) MKERNEL_TRACE_MARK(trace::SLOT_END, 3);
+#ifdef AG_GEMM_TRACE
+    if (threadIdx.x == 0)
+        trace::emit(2, blockIdx.x, tail_t0, trace::now_ns(),
+                    tail_sync, 0ull, clock64() - tail_c0);
+#endif
 }
 
 __device__ inline void barrier_reset(const globals& G) {
