@@ -417,6 +417,57 @@ __device__ inline void gemm_rs_slice_super_m_decode(
     row_idx = slice_idx * row_blocks_per_slice + super_rows + rb_in_tail;
 }
 
+// Cluster-unit super-tile decode (GEMM_RS_SUPER_M, default 8), mirroring
+// ThunderKittens' get_task_idx. Consecutive cluster tasks vary the cluster ROW
+// within a band of SUPER_M and only then the column, so the concurrently
+// running clusters occupy a compact block of the (row, col) space and share
+// both A and B in L2. The previous order varied the column fastest across the
+// whole range, which is what left the MMA warp blocked on operands 53% of the
+// time at M=32768.
+//
+// The device rotation is preserved, just expressed globally instead of by
+// slice: device d starts (total / NUM_DEVICES) cluster tasks into the sequence,
+// so the GPUs work on different row ranges and their reduce-scatter store_adds
+// land on different peers. Ownership itself is derived from row_idx downstream,
+// so it follows automatically.
+#ifndef GEMM_RS_SUPER_M
+#define GEMM_RS_SUPER_M 8
+#endif
+// Set to 0 to force the old column-fastest order everywhere.
+#ifndef GEMM_RS_SUPERTILE_ENABLED
+#define GEMM_RS_SUPERTILE_ENABLED 1
+#endif
+template<typename G>
+__device__ inline void gemm_rs_decode_cluster_task(
+    int cluster_task_id, int row_blocks_per_slice, int col_blocks, int dev_idx,
+    int& row_idx, int& col_idx
+) {
+    constexpr int RBC = G::ROW_BLOCKS_PER_CLUSTER;
+    constexpr int SUPER = GEMM_RS_SUPER_M;
+    const int cluster_rows = (row_blocks_per_slice * G::NUM_DEVICES) / RBC;
+    const int total = cluster_rows * col_blocks;
+
+    int t = cluster_task_id + dev_idx * (total / G::NUM_DEVICES);
+    if (t >= total) t -= total;
+
+    const int super_rows = (cluster_rows / SUPER) * SUPER;
+    const int band_tiles = SUPER * col_blocks;
+    int cr, cc;
+    if (t < super_rows * col_blocks) {
+        const int band = t / band_tiles;
+        const int w    = t - band * band_tiles;
+        cr = band * SUPER + (w % SUPER);
+        cc = w / SUPER;
+    } else {
+        const int rem = t - super_rows * col_blocks;
+        const int fr  = cluster_rows - super_rows;   // > 0 on this branch
+        cr = super_rows + rem % fr;
+        cc = rem / fr;
+    }
+    row_idx = cr * RBC;
+    col_idx = cc;
+}
+
 // Dispatcher: compile-time selection of tile visit order (matches gemm_ar's gemm_ar_decode_comp_task).
 template <typename G>
 __device__ inline void gemm_rs_decode_comp_task(

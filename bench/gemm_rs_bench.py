@@ -350,7 +350,12 @@ def main():
             import numpy as np
             os.makedirs(trace_out, exist_ok=True)
             start_iter()
-            dist.barrier(); time.sleep(0.1)
+            dist.barrier()
+            # Steady state, not a cold start: without these the traced launch
+            # begins on an idle GPU at 120 MHz and measures the clock ramp.
+            for _ in range(8):
+                run_once()
+            torch.cuda.synchronize()
             mod.trace_reset()
             run_once(); torch.cuda.synchronize()
             recs = mod.trace_read().numpy()

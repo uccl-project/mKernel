@@ -1164,6 +1164,20 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         const int ctarank    = cluster_ctarank();
         const int cluster_id = (int)blockIdx.x / config::CLUSTER_SIZE;
         const int num_clusters = I.num_comp_sms / config::CLUSTER_SIZE;
+        // Banded ordering pays only once the row space is deep enough to hold
+        // several bands; below that the column-fastest order already wraps into
+        // the next row and covers a compact block by itself. Measured, cluster
+        // rows (= bands x SUPER_M) against the supertile's delta:
+        //   M=4096   8 rows / 1 band  +2%      M=8192  16 /  2  ~0%
+        //   M=16384 32 rows / 4 bands +6%      M=24576 48 /  6  -6%
+        //   M=32768 64 rows / 8 bands -8%
+        // The crossover sits between 4 and 6 bands; it was not localised
+        // further, so the threshold is the measurement, not a derivation.
+        const int cluster_rows_total =
+            (row_blocks_per_slice * intra_globals::NUM_DEVICES)
+            / intra_globals::ROW_BLOCKS_PER_CLUSTER;
+        const bool use_supertile = GEMM_RS_SUPERTILE_ENABLED &&
+                                   (cluster_rows_total >= 6 * GEMM_RS_SUPER_M);
         for (int pair_id = cluster_id; pair_id < num_cluster_tasks; pair_id += num_clusters) {
             const int round_pair = pair_id / tiles_per_round;
             const int within     = pair_id - round_pair * tiles_per_round;
@@ -1173,6 +1187,13 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         for (int task_id = (int)blockIdx.x; task_id < num_blocks; task_id += I.num_comp_sms) {
 #endif
             int row_idx, col_idx;
+#ifdef MKERNEL_TCGEN05
+            if (use_supertile)
+                gemm_rs_decode_cluster_task<intra_globals>(pair_id, row_blocks_per_slice,
+                                                           col_blocks, I.dev_idx,
+                                                           row_idx, col_idx);
+            else
+#endif
             gemm_rs_decode_comp_task<intra_globals>(task_id, row_blocks_per_slice,
                                                col_blocks, I.dev_idx,
                                                row_idx, col_idx);

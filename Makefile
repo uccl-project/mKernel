@@ -138,6 +138,16 @@ DEFS_gemm_rs        :=
 ifeq ($(GEMM_RS_TRACE),1)
 DEFS_gemm_rs        += -DGEMM_RS_TRACE
 endif
+# GEMM_RS_SUPERTILE=1 issues cluster tasks in a SUPER_M-banded order (see
+# gemm_rs_decode_cluster_task) instead of column-fastest.
+GEMM_RS_SUPERTILE ?= 1
+ifeq ($(GEMM_RS_SUPERTILE),0)
+DEFS_gemm_rs        += -DGEMM_RS_SUPERTILE_ENABLED=0
+endif
+GEMM_RS_SUPER_M ?=
+ifneq ($(GEMM_RS_SUPER_M),)
+DEFS_gemm_rs        += -DGEMM_RS_SUPER_M=$(GEMM_RS_SUPER_M)
+endif
 # Override the prefetch depth (default 4, the most that fits in 226 KB).
 GEMM_RS_STAGES ?=
 ifneq ($(GEMM_RS_STAGES),)
