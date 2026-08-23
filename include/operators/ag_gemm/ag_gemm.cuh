@@ -22,6 +22,10 @@
  * The distributed A buffer is DMA-BUF-registered for RDMA (no staging copy).
  */
 
+#ifdef AG_GEMM_TRACE
+#define MKERNEL_ACTIVITY_TRACE
+#endif
+#include "common/mkernel_activity_trace.cuh"
 #include "common/types.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
@@ -47,6 +51,19 @@ using namespace kittens;
 #endif
 
 namespace ag_gemm_multinode {
+
+#ifdef AG_GEMM_TRACE
+// Records: a=ticks blocked on gather readiness, b=ticks blocked on the compute
+// pipeline. Progress slots hold the task a role last started, or DONE once it
+// drains its loop; SLOT_END is 1 role done, 2 grid-synced, 3 reset.
+namespace trace {
+using namespace ::mkernel::trace;
+static constexpr unsigned long long ROLE_GATHER = 0, ROLE_COMPUTE = 1;
+static constexpr int SLOT_GATHER = 0, SLOT_LOADER = 1, SLOT_MMA = 2,
+                     SLOT_STORE = 3, SLOT_CONSUMER = 4, SLOT_END = 5;
+static constexpr int DONE = 999999;
+}
+#endif
 
 struct config {
 #if defined(MKERNEL_TCGEN05) && defined(AG_GEMM_CLUSTER2)
@@ -92,15 +109,11 @@ struct globals {
     // Three stages keep the producer/consumer pipeline deep enough while
     // leaving more shared memory headroom than a four-stage pipeline.
 #ifdef MKERNEL_TCGEN05
-    // A stage carries two A tiles (one per row block of the pair) plus the
-    // shared B tile. At CLUSTER_SIZE 1 that is 16+16+32 = 64 KB, and with
-    // outputs on their own 32 KB allocation only 3 stages fit in 226 KB.
-    // At CLUSTER_SIZE 2 each CTA holds half of B, so a stage is 48 KB and a
-    // fourth stage would fit (4x48 + 32 = 224 KB). Measured, medians of 3:
-    //   M=16384   3 stages 0.984 ms   4 stages 0.969 ms   (4 is 1.5% better)
-    //   M=32768   3 stages 6.496 ms   4 stages 6.609 ms   (4 is 1.7% worse)
-    // The two shapes disagree, so the default follows the larger one. Override
-    // with AG_GEMM_STAGES=4 when tuning for medium M.
+    // A stage is two A tiles plus B: 64 KB at CLUSTER_SIZE 1, 48 KB at 2 (each
+    // CTA holds half of B). A 4th stage fits at CLUSTER_SIZE 2 but the shapes
+    // disagree on whether it helps -- medians of 3, 3 vs 4 stages: M=16384
+    // 0.984 / 0.969, M=32768 6.496 / 6.609 -- so the default follows the larger
+    // shape. AG_GEMM_STAGES overrides.
 #ifndef AG_GEMM_PIPELINE_STAGES
 #define AG_GEMM_PIPELINE_STAGES 3
 #endif
@@ -199,12 +212,10 @@ struct globals {
     // One staging tile: the four 64-row halves of the pair go out in sequence,
     // which is what lets outputs have their own allocation instead of aliasing
     // the last input stage and gating the loader.
-    // At CLUSTER_SIZE 2 a stage is 48 KB, so 3 stages plus TWO 32 KB staging
-    // tiles fit in 226 KB. Double-buffering them lets the consumers stage the
-    // next 64-row half while the store warp is still draining the previous one,
-    // instead of strictly ping-ponging through a single tile. Measured neutral
-    // (medians of 3: M=16384 0.996 -> 0.986 ms, M=32768 6.518 -> 6.563), so it
-    // is off by default; AG_GEMM_DOUBLE_OUTPUT=1 turns it on.
+    // Two staging tiles let the consumers fill the next 64-row half while the
+    // store warp drains the previous, instead of ping-ponging one. Fits at
+    // CLUSTER_SIZE 2 (3x48 + 2x32 = 208 KB) but measured neutral (M=16384
+    // 0.996 -> 0.986, M=32768 6.518 -> 6.563), so off unless asked.
 #if defined(AG_GEMM_DOUBLE_OUTPUT)
     static constexpr int OUTPUT_BUFFERS = (config::CLUSTER_SIZE > 1) ? 2 : 1;
 #else

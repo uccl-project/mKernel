@@ -90,32 +90,17 @@ COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 # Failed-experiment flags are NOT defined here (HYBRID, MERGED_COMM,
 # PUSH_NVL_FANOUT, DISPATCH_DONATE_INTER_SEND, ACTIVITY_TRACE, etc.) so
 # their #ifdef branches stay disabled.
-# ag_gemm build flags. Each name below becomes -DAG_GEMM_<name> when set to 1.
-# The first group defaults on for GPU=blackwell, the second is always off --
-# either profiling-only or a measured-and-rejected experiment kept per this
-# repository's convention of leaving failed experiments behind disabled #ifdefs.
-#
-#   ROWPERM             order compute's row blocks to match phase-1's production
-#                       order (see decode_comp_task). A bijection: perf only.
-#   FASTPOLL            skip the per-K-strip readiness poll once phase 1 has
-#                       completed on every device.
-#   CLUSTER2            2-CTA tcgen05 clusters -- A split by rows across the
-#                       pair, B by columns, one MMA warp per accumulator on the
-#                       leader. Requires num_intra_comm to be even.
-#
-#   TRACE               per-task activity trace + live progress array.
-#   EPILOGUE_READ_WAIT  let the epilogue's TMA store retire in the background
-#                       instead of blocking on the global commit. Worth 0.6% at
-#                       M=32768, noise elsewhere -- not worth the race the
-#                       inter-node path would face, which single-node can't test.
-#   DOUBLE_OUTPUT       two epilogue staging tiles instead of one. Neutral:
-#                       M=16384 0.996 -> 0.986, M=32768 6.518 -> 6.563.
-#   ROWPOLL             per-row completion counter on the unused barrier plane 1,
-#                       so a task drops its 256 per-K polls once its own row is
-#                       done. Worse everywhere (M=32768 6.495 -> 6.748): the
-#                       signal is a cross-GPU multimem atomic and all 256 tasks
-#                       of a row contend on one address, costing gather more
-#                       than the saved polls buy compute.
+# ag_gemm flags: each name becomes -DAG_GEMM_<name> when 1. First group is on
+# by default for GPU=blackwell, second is opt-in -- profiling, or measured and
+# rejected but kept behind a disabled #ifdef as this repository does. Numbers
+# and reasoning for the rejected ones are in README_B300.md.
+#   ROWPERM             consume rows in phase-1's production order
+#   FASTPOLL            drop per-K readiness polls once phase 1 is globally done
+#   CLUSTER2            2-CTA tcgen05 clusters (needs num_intra_comm even)
+#   TRACE               per-task activity trace + live progress array
+#   EPILOGUE_READ_WAIT  don't block the epilogue on the global commit (+0.6%)
+#   DOUBLE_OUTPUT       two epilogue staging tiles (neutral)
+#   ROWPOLL             per-row readiness counter (worse: atomic contention)
 AG_GEMM_BLACKWELL_FLAGS := ROWPERM FASTPOLL CLUSTER2
 AG_GEMM_OPT_IN_FLAGS    := TRACE EPILOGUE_READ_WAIT DOUBLE_OUTPUT ROWPOLL
 ifeq ($(GPU),blackwell)

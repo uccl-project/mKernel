@@ -25,7 +25,6 @@
  *   include/operators/ag_gemm/session.cuh
  */
 #include "operators/ag_gemm/ag_gemm.cuh"
-#include "operators/ag_gemm/ag_gemm_trace.cuh"
 
 namespace ag_gemm_multinode {
 
@@ -288,23 +287,13 @@ __device__ inline comp_task decode_comp_task(int task_id,
         t.col_idx = rem / fr_safe;
     }
 #ifdef AG_GEMM_ROWPERM
-    // Match the order compute consumes rows to the order phase-1 produces them.
-    //
-    // Each GPU gathers only its own 1/8 shard -- intra rows [d*L, d*L+L) in
-    // row-major order -- and all 8 GPUs run concurrently. So readiness sweeps
-    // the intra-row space as {0, L, 2L, ...}, then {1, L+1, 2L+1, ...}: the
-    // j-th row of every owner becomes available at roughly the same time.
-    // The unpermuted task order instead walks rows 0,1,2,... so the first wave
-    // of compute CTAs asks for 140 consecutive rows, of which only 8 (one per
-    // owner) can possibly be ready. Measured: 86-92% of compute-CTA time is
-    // spent stalled for the first 3.3 ms.
-    //
-    // Relabelling row r as (r % NUM_DEVICES) * L + (r / NUM_DEVICES) makes the
-    // k-th row block consumed the k-th row block produced. It is a bijection,
-    // so every tile is still computed exactly once; only the order changes.
-    // It is also independent of dev_idx, so all GPUs keep walking tiles in
-    // lockstep -- the multicast read sharing that made device rotation a
-    // regression is preserved.
+    // Consume rows in the order phase-1 produces them. Each GPU gathers only
+    // its own shard -- rows [d*L, d*L+L) in order, all GPUs concurrently -- so
+    // readiness sweeps {0, L, 2L, ...} then {1, L+1, ...}, while the unpermuted
+    // order asks for 0,1,2,... of which only one row per owner can be ready.
+    // Relabelling r as (r % NUM_DEVICES) * L + r / NUM_DEVICES is a bijection
+    // and independent of dev_idx, so the lockstep order that multicast read
+    // sharing depends on survives. Worth 25% at M=32768.
     if (!t.is_remote) {
         const int node_row_blocks = super_rows + final_rows;
         const int total_intra     = node_row_blocks / 2;
@@ -651,16 +640,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
 #ifdef MKERNEL_TCGEN05
         else if ((warp_id == 2 || (config::CLUSTER_SIZE > 1 && warp_id == 3))
                  && lane_id == 0 && ctarank == 0) {
-            // Blackwell MMA issuer. tcgen05 MMAs are issued by one thread and
-            // accumulate in tensor memory, so this warp replaces the wgmma the
-            // consumers used to run. It walks the same task order as the loader
-            // and consumers — including the identical remote-skip — so the
-            // input pipeline stays in lockstep.
-            //
-            // At CLUSTER_SIZE 2 the MMA spans the CTA pair: A is split by rows
-            // (each CTA keeps its own 128 accumulator rows) and B by columns,
-            // so only the leader issues, one warp per accumulator, and both
-            // CTAs' operands feed it.
+            // Blackwell MMA issuer: tcgen05 accumulates in tensor memory, so
+            // one thread issues what the consumers' wgmma used to do. Walks the
+            // same task order (and remote-skip) as loader and consumers.
+            // At CLUSTER_SIZE 2 the MMA spans the pair -- A split by rows, B by
+            // columns -- so only the leader issues, one warp per accumulator.
             for (int pair_id = cluster_id; pair_id < total_cluster_tasks; pair_id += num_clusters) {
                 const int shard_step = pair_id / clusters_per_shard;
                 const int shard_rank = ag_gemm_shard_rank_for_step(

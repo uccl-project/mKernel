@@ -31,6 +31,10 @@
  * with fine-grained per-tile handoff between each phase.
  */
 
+#ifdef GEMM_RS_TRACE
+#define MKERNEL_ACTIVITY_TRACE
+#endif
+#include "common/mkernel_activity_trace.cuh"
 #include "common/types.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
@@ -58,6 +62,19 @@ using namespace kittens;
 #endif
 
 namespace gemm_rs_multinode {
+
+#ifdef GEMM_RS_TRACE
+// One record per task per warp role. a/b are the two tick counters each role
+// assigns meaning to; the machinery is in common/mkernel_activity_trace.cuh.
+namespace trace {
+using namespace ::mkernel::trace;
+// LOADER a=blocked on inputs_finished. MMA a=blocked on inputs_arrived,
+// b=blocked on tmem_free. STORE a=blocked on outputs_arrived, b=in the
+// cross-GPU store_add.
+static constexpr unsigned long long ROLE_LOADER = 0, ROLE_MMA = 1, ROLE_STORE = 2;
+static constexpr int SLOT_LOADER = 0, SLOT_MMA = 1, SLOT_STORE = 2, SLOT_END = 3;
+}
+#endif
 
 // ============================================================================
 // Config
@@ -124,18 +141,15 @@ struct intra_globals {
     // the last stage, so 4 stages is 208 KB of the 227 KB budget -- the same
     // shape and depth upstream's b200 kernel runs.
     //
-    // This was 3 while B was full width; the 2-CTA split halved the B tile and
-    // bought the stage back. Depth is now measurable (GEMM_RS_STAGES) and at
-    // M=32768 it is past its knee: 2 stages 8.484 ms, 3 stages 6.444 (-24%),
-    // 4 stages 6.240 (-3.2%). A fifth would be worth ~1% and does not fit.
+    // This was 3 while B was full width; the 2-CTA split bought the stage back.
+    // Depth is past its knee at M=32768: 2 stages 8.484 ms, 3 stages 6.444,
+    // 4 stages 6.240. A fifth is worth ~1% and does not fit.
     //
-    // An earlier version of this comment claimed the remaining 1.2x gap to
-    // upstream *was* prefetch depth. The activity trace says otherwise: the MMA
-    // issue warp spends 54% of its time blocked on inputs_arrived even at depth
-    // 4, and since more depth does not help, that is a bandwidth/locality
-    // problem, not a latency one. 51.5 GB of operand reads against a 537 MB
-    // cold footprint is 96x reuse for L2 to absorb, which points at task order
-    // rather than at this constant.
+    // It is NOT where the remaining gap to upstream lives, despite what this
+    // comment used to claim: the trace shows the MMA warp blocked on
+    // inputs_arrived 54% of the time even at depth 4, and more depth does not
+    // help -- so it is bandwidth/locality (96x reuse for L2 to absorb), which
+    // points at task order rather than at this constant.
 #ifndef GEMM_RS_PIPELINE_STAGES
 #define GEMM_RS_PIPELINE_STAGES 4
 #endif

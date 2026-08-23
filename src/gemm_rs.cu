@@ -29,7 +29,6 @@
  *   include/operators/gemm_rs/session.cuh
  */
 #include "operators/gemm_rs/gemm_rs.cuh"
-#include "operators/gemm_rs/gemm_rs_trace.cuh"
 
 namespace gemm_rs_multinode {
 
