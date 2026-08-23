@@ -343,6 +343,23 @@ def main():
             run_once(); torch.cuda.synchronize()
             dist.barrier()
 
+        # GEMM_RS_TRACE_OUT=<dir>: capture one traced iteration (needs a build
+        # with GEMM_RS_TRACE=1) and dump the raw records per rank.
+        trace_out = os.environ.get("GEMM_RS_TRACE_OUT")
+        if trace_out and getattr(mod, "trace_enabled", lambda: False)():
+            import numpy as np
+            os.makedirs(trace_out, exist_ok=True)
+            start_iter()
+            dist.barrier(); time.sleep(0.1)
+            mod.trace_reset()
+            run_once(); torch.cuda.synchronize()
+            recs = mod.trace_read().numpy()
+            np.save(os.path.join(trace_out, f"gemm_rs_trace_M{m}_rank{dist.get_rank()}.npy"), recs)
+            if is_chief:
+                print(f"[gemm_rs-trace] M={m} records/rank={recs.shape[0]} -> {trace_out}",
+                      flush=True)
+            dist.barrier()
+
         samples = []
         # Per-iter inter-node sync is the default: gemm_rs advances a fresh epoch
         # each iter, which deadlocks the proxy without a per-iter barrier+settle.

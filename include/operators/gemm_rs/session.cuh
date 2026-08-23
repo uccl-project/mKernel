@@ -100,6 +100,52 @@ int64_t get_recv_buf_ptr_py() { return internode::py::get_recv_buf_ptr(g_session
 
 #include <torch/csrc/utils/pybind.h>
 
+#ifdef GEMM_RS_TRACE
+// ---------------------------------------------------------------------------
+// Activity-trace readback (GEMM_RS_TRACE builds only)
+// ---------------------------------------------------------------------------
+static void gemm_rs_trace_reset_py() {
+    int zero = 0;
+    MKERNEL_CUDACHECK(cudaMemcpyToSymbol(mkernel::trace::g_count, &zero, sizeof(int)));
+}
+
+// (n, FIELDS) int64 CPU tensor; columns are the fields of mkernel::trace::rec.
+static at::Tensor gemm_rs_trace_read_py() {
+    int n = 0;
+    MKERNEL_CUDACHECK(cudaMemcpyFromSymbol(&n, mkernel::trace::g_count, sizeof(int)));
+    const bool overflowed = n > mkernel::trace::MAX_RECS;
+    if (overflowed) n = mkernel::trace::MAX_RECS;
+    if (n < 0) n = 0;
+    auto out = at::empty({n, mkernel::trace::FIELDS},
+                         at::TensorOptions().dtype(at::kLong));
+    if (n > 0) {
+        MKERNEL_CUDACHECK(cudaMemcpyFromSymbol(
+            out.data_ptr(), mkernel::trace::g_recs,
+            (size_t)n * sizeof(mkernel::trace::rec), 0, cudaMemcpyDeviceToHost));
+    }
+    if (overflowed)
+        fprintf(stderr, "[gemm_rs trace] buffer overflowed; records were dropped\n");
+    return out;
+}
+
+// Live progress, readable while the kernel is still running: the copy engines
+// are independent of SM execution, so an async copy on a non-blocking stream
+// returns even when every CTA is spinning on a barrier.
+static at::Tensor gemm_rs_trace_progress_py() {
+    static cudaStream_t s = nullptr;
+    if (s == nullptr)
+        MKERNEL_CUDACHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    const int n = mkernel::trace::MAX_CTAS * mkernel::trace::ROLE_SLOTS;
+    auto out = at::empty({mkernel::trace::MAX_CTAS, mkernel::trace::ROLE_SLOTS},
+                         at::TensorOptions().dtype(at::kInt));
+    MKERNEL_CUDACHECK(cudaMemcpyFromSymbolAsync(
+        out.data_ptr(), mkernel::trace::g_progress, (size_t)n * sizeof(int), 0,
+        cudaMemcpyDeviceToHost, s));
+    MKERNEL_CUDACHECK(cudaStreamSynchronize(s));
+    return out;
+}
+#endif  // GEMM_RS_TRACE
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
     m.def("create_session", &create_session_py,
@@ -118,6 +164,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("peer_ips") = std::vector<std::string>{},
           pybind11::arg("peer_tcp_ports") = std::vector<int>{});
     m.def("destroy_session", &destroy_session_py);
+#ifdef GEMM_RS_TRACE
+    m.def("trace_reset", &gemm_rs_trace_reset_py);
+    m.def("trace_read", &gemm_rs_trace_read_py);
+    m.def("trace_progress", &gemm_rs_trace_progress_py);
+    m.def("trace_enabled", []() { return true; });
+#else
+    m.def("trace_enabled", []() { return false; });
+#endif
     m.def("set_epoch", &set_epoch_py);
     m.def("prepare_epoch", &prepare_epoch_py);
     m.def("commit_epoch", &commit_epoch_py);

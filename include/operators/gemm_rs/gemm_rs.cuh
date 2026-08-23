@@ -129,9 +129,12 @@ struct intra_globals {
     // kernel and upstream request identical bytes (51.5 GB) for identical
     // FLOPs, and upstream is 1.2x faster, so the gap is prefetch depth keeping
     // the tensor cores fed rather than anything about memory traffic.
-    static constexpr int PIPELINE_STAGES = 4;
+#ifndef GEMM_RS_PIPELINE_STAGES
+#define GEMM_RS_PIPELINE_STAGES 4
+#endif
+    static constexpr int PIPELINE_STAGES = GEMM_RS_PIPELINE_STAGES;
 #else
-    static constexpr int PIPELINE_STAGES = 4;
+    static constexpr int PIPELINE_STAGES = GEMM_RS_PIPELINE_STAGES;
 #endif
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;

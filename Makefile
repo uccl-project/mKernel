@@ -176,7 +176,18 @@ DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE
 DEFS_dispatch_gemm_blackwell := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
 DEFS_dispatch_gemm_warp_specialization := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
 DEFS_ring_attention :=
+# GEMM_RS_TRACE=1 turns on the per-task activity trace (records + live progress
+# array). Profiling only.
+GEMM_RS_TRACE ?= 0
 DEFS_gemm_rs        :=
+ifeq ($(GEMM_RS_TRACE),1)
+DEFS_gemm_rs        += -DGEMM_RS_TRACE
+endif
+# Override the prefetch depth (default 4, the most that fits in 226 KB).
+GEMM_RS_STAGES ?=
+ifneq ($(GEMM_RS_STAGES),)
+DEFS_gemm_rs        += -DGEMM_RS_PIPELINE_STAGES=$(GEMM_RS_STAGES)
+endif
 DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 
 # === Build targets ===

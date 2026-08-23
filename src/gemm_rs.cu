@@ -29,6 +29,7 @@
  *   include/operators/gemm_rs/session.cuh
  */
 #include "operators/gemm_rs/gemm_rs.cuh"
+#include "operators/gemm_rs/gemm_rs_trace.cuh"
 
 namespace gemm_rs_multinode {
 
@@ -75,8 +76,16 @@ __device__ inline void compute_tile_impl(
             wait(outputs_finished, get_phasebit<1>(phasebits, G::PIPELINE_STAGES));
             update_phasebit<1>(phasebits, G::PIPELINE_STAGES);
 #endif
+#ifdef GEMM_RS_TRACE
+            const unsigned long long tr_t0 = trace::now_ns();
+            const unsigned long long tr_c0 = clock64();
+            unsigned long long tr_a = 0;
+            MKERNEL_TRACE_MARK(::gemm_rs_multinode::trace::SLOT_LOADER, ready_idx);
+#endif
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
+                MKERNEL_TRACE_TICK_BEGIN(tr_w);
                 wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                MKERNEL_TRACE_TICK_END(tr_a, tr_w);
                 update_phasebit<1>(phasebits, stage);
 #ifdef MKERNEL_TCGEN05
                 // Every CTA loads its own slice (mask = 1 << ctarank) but points
@@ -105,6 +114,10 @@ __device__ inline void compute_tile_impl(
 #endif
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
+#ifdef GEMM_RS_TRACE
+            trace::emit(trace::ROLE_LOADER, ready_idx, tr_t0, trace::now_ns(),
+                        tr_a, 0ull, clock64() - tr_c0);
+#endif
         }
 #ifdef MKERNEL_TCGEN05
         else if ((w_id == 2 || w_id == 3) && l_id == 0 && ctarank == 0) {
@@ -120,7 +133,15 @@ __device__ inline void compute_tile_impl(
             // accumulate=0 MMA overwrites it. Per-accumulator, so the warp
             // owning acc 0 is released as soon as acc 0's registers are read,
             // without waiting on the rest of the epilogue.
+#ifdef GEMM_RS_TRACE
+            const unsigned long long tr_t0 = trace::now_ns();
+            const unsigned long long tr_c0 = clock64();
+            unsigned long long tr_a = 0, tr_b = 0;
+            MKERNEL_TRACE_MARK(::gemm_rs_multinode::trace::SLOT_MMA, ready_idx);
+#endif
+            MKERNEL_TRACE_TICK_BEGIN(tr_wt);
             tma::cluster::wait(tmem_free[acc], get_phasebit<1>(phasebits, acc));
+            MKERNEL_TRACE_TICK_END(tr_b, tr_wt);
             update_phasebit<1>(phasebits, acc);
 
             for (int red_idx = 0; red_idx < num_iters; red_idx++) {
@@ -128,7 +149,9 @@ __device__ inline void compute_tile_impl(
                 // tile loads (three per CTA) that the loaders redirected here.
                 tma::cluster::expect(inputs_arrived[stage],
                                      inputs[0].A[0], inputs[0].A[1], inputs[0].B);
+                MKERNEL_TRACE_TICK_BEGIN(tr_wi);
                 tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
+                MKERNEL_TRACE_TICK_END(tr_a, tr_wi);
                 update_phasebit<0>(phasebits, stage);
                 // commit<2> multicasts, so each CTA's inputs_finished sees both
                 // MMAs and its loader is released in step with the leader.
@@ -139,6 +162,10 @@ __device__ inline void compute_tile_impl(
                 stage = (stage + 1) % G::PIPELINE_STAGES;
             }
             kittens::tensor_commit<2>(mma_done);
+#ifdef GEMM_RS_TRACE
+            trace::emit(trace::ROLE_MMA, ready_idx, tr_t0, trace::now_ns(),
+                        tr_a, tr_b, clock64() - tr_c0);
+#endif
         }
 #endif
         else if (w_id == 1 && l_id == 0) {
@@ -147,6 +174,12 @@ __device__ inline void compute_tile_impl(
             // halves), drained in sequence. outputs_free hands the tile back to
             // the consumers between sub-rounds; outputs_finished closes the
             // task after the last one.
+#ifdef GEMM_RS_TRACE
+            const unsigned long long tr_t0 = trace::now_ns();
+            const unsigned long long tr_c0 = clock64();
+            unsigned long long tr_a = 0, tr_b = 0;
+            MKERNEL_TRACE_MARK(::gemm_rs_multinode::trace::SLOT_STORE, ready_idx);
+#endif
             int sub = 0;
             #pragma unroll
             for (int h = 0; h < G::ROW_BLOCKS_PER_TASK; h++) {
@@ -160,8 +193,11 @@ __device__ inline void compute_tile_impl(
                     local_row_idx_at_owner_fuse * col_blocks_local_fuse + col_idx;
                 #pragma unroll
                 for (int hs = 0; hs < 2; hs++) {
+                    MKERNEL_TRACE_TICK_BEGIN(tr_wo);
                     wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+                    MKERNEL_TRACE_TICK_END(tr_a, tr_wo);
                     update_phasebit<0>(phasebits, 0);
+                    MKERNEL_TRACE_TICK_BEGIN(tr_ws);
                     // workspace is only ever read back by the inter-node
                     // reduce path (fused_comm_tile_impl). With no session that
                     // path never launches, so the copy is dead work - half the
@@ -172,11 +208,16 @@ __device__ inline void compute_tile_impl(
                     tma::store_add_async(Gv.staging[owner_dev_idx_fuse], outputs.C,
                                          {2 * global_tile_idx_owner_fuse + hs, 0});
                     tma::store_async_read_wait();
+                    MKERNEL_TRACE_TICK_END(tr_b, tr_ws);
                     if (++sub == 2 * G::ROW_BLOCKS_PER_TASK) arrive(outputs_finished);
                     else                                      arrive(outputs_free);
                 }
                 signal_ready(Gv.ready, ready_idx + (2 * ctarank + h) * col_blocks);
             }
+#ifdef GEMM_RS_TRACE
+            trace::emit(trace::ROLE_STORE, ready_idx, tr_t0, trace::now_ns(),
+                        tr_a, tr_b, clock64() - tr_c0);
+#endif
 #else
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
             update_phasebit<0>(phasebits, 0);
