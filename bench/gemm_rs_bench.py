@@ -365,29 +365,45 @@ def main():
         # each iter, which deadlocks the proxy without a per-iter barrier+settle.
         # MKERNEL_BENCH_NO_SYNC=1 (or MKERNEL_BENCH_LEGACY_SYNC=0) forces the
         # NCCL-style back-to-back path.
-        legacy_sync = os.environ.get("MKERNEL_BENCH_NO_SYNC") != "1"
-        if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "0":
-            legacy_sync = False
+        # MKERNEL_BENCH_TIMING selects the methodology, and means the same thing
+        # in ag_gemm_bench.py. Default "batch" matches ThunderKittens' harness
+        # (common.py:benchmark_no_l2_clear): warm up, then N back-to-back kernel
+        # launches inside one event pair, divided by N -- no per-iteration host
+        # work, no barrier, no sync. "periter" brackets each launch separately
+        # and resets between, which leaves idle gaps that let the GPU boost and
+        # is therefore NOT comparable to TK.
+        #
+        # In batch mode the timed loop deliberately produces wrong values: this
+        # kernel's epilogue store_adds into staging, so without the per-iteration
+        # zero the results accumulate. Correctness is verified separately below,
+        # on one clean iteration. Keeping the two coupled is what made these
+        # numbers incomparable in the first place.
+        timing_mode = os.environ.get("MKERNEL_BENCH_TIMING", "batch")
+        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "1": timing_mode = "batch"
+        if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1": timing_mode = "periter"
+        legacy_sync = (timing_mode != "batch")
         if not legacy_sync:
-            # No-sync (steady-state): per-iter reset_state + epoch bump (which
-            # internally syncs the proxy-side via set_epoch) but skip the
-            # per-iter dist.barrier + sleep + cuda.synchronize + elapsed_time
-            # readout. Defer event-pair elapsed_time to the end (mirrors
-            # gemm_ar's GEMM_AR_STEADY_STATE_BENCH path).
-            samples_pairs = []
-            for _ in range(args.iters):
-                start_iter()
-                # NO dist.barrier + sleep here — that's the sync this fix removes.
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
-                s.record(); run_once(); e.record()
-                samples_pairs.append((s, e))
+            n_iters = max(args.iters, 32)
+            start_iter()
+            dist.barrier(); time.sleep(0.05)
+            for _ in range(3):          # warm up, as TK does
+                run_once()
+            torch.cuda.synchronize(); dist.barrier()
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            for _ in range(n_iters):
+                run_once()
+            e.record()
             torch.cuda.synchronize()
-            dist.barrier()
-            samples = [s.elapsed_time(e) for (s, e) in samples_pairs]
+            avg_ms = s.elapsed_time(e) / n_iters
+            samples = [avg_ms] * args.iters
             if is_chief:
-                print(f"[gemm_rs-nosync] M={m} samples={[f'{x:.4f}' for x in samples]}",
-                      flush=True)
+                print(f"[gemm_rs-batch] M={m} N={n_iters} avg={avg_ms:.4f} ms", flush=True)
+            dist.barrier()
+            # One clean iteration so the correctness check below sees valid state.
+            start_iter(); dist.barrier()
+            run_once(); torch.cuda.synchronize(); dist.barrier()
         else:
             for _ in range(args.iters):
                 start_iter()
