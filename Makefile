@@ -101,6 +101,12 @@ COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 #   EPILOGUE_READ_WAIT  don't block the epilogue on the global commit (+0.6%)
 #   DOUBLE_OUTPUT       two epilogue staging tiles (neutral)
 #   ROWPOLL             per-row readiness counter (worse: atomic contention)
+# Row blocks per CTA per task: 2 (default) shares one B tile between two MMAs,
+# 1 doubles the task count. AG_GEMM_RBPT=1 to try the latter.
+AG_GEMM_RBPT ?=
+ifneq ($(AG_GEMM_RBPT),)
+DEFS_ag_gemm_extra := -DAG_GEMM_RBPT=$(AG_GEMM_RBPT)
+endif
 AG_GEMM_BLACKWELL_FLAGS := ROWPERM FASTPOLL CLUSTER2
 AG_GEMM_OPT_IN_FLAGS    := TRACE EPILOGUE_READ_WAIT DOUBLE_OUTPUT ROWPOLL
 ifeq ($(GPU),blackwell)
@@ -115,6 +121,7 @@ AG_GEMM_STAGES ?=
 ifneq ($(AG_GEMM_STAGES),)
 DEFS_ag_gemm += -DAG_GEMM_PIPELINE_STAGES=$(AG_GEMM_STAGES)
 endif
+DEFS_ag_gemm += $(DEFS_ag_gemm_extra)
 # Arrival-flag layout is now a runtime flag (SessionConfig.use_arrival_queue);
 # gemm_ar's session shim sets it to true. No compile-time switch needed.
 DEFS_gemm_ar        :=

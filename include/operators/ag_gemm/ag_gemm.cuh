@@ -200,7 +200,25 @@ struct globals {
 #ifdef MKERNEL_TCGEN05
     // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks sharing a single
     // B tile; that sharing doubles the FLOPs per byte of B read.
-    static constexpr int ROW_BLOCKS_PER_TASK = 2;          // per CTA
+    // Row blocks a CTA computes per task. 2 lets one B tile feed two MMAs,
+    // halving the operand bytes per FLOP; 1 doubles the task count, which is
+    // what small M is short of. Measured (medians of 3, AG_GEMM_RBPT):
+    //   M=4096   1: 0.108   2: 0.117   -> 1 wins by 8%
+    //   M=8192   1: 0.332   2: 0.313
+    //   M=16384  1: 1.215   2: 0.981
+    //   M=32768  1: 8.670   2: 6.576   -> 1 loses by 32%
+    // Only the smallest shape is task-starved enough to pay for the lost reuse,
+    // so the default stays 2. Making this per-shape would mean a runtime value
+    // where the tile types, semaphore counts and epilogue rounds all read a
+    // compile-time constant -- not worth 8% at one shape.
+#ifndef AG_GEMM_RBPT
+#define AG_GEMM_RBPT 2
+#endif
+    static constexpr int ROW_BLOCKS_PER_TASK = AG_GEMM_RBPT;   // per CTA
+    // At CLUSTER_SIZE 2 the leader runs one MMA warp per accumulator; at 1 a
+    // single warp issues them all. The input semaphores are counted per warp.
+    static constexpr int NUM_MMA_WARPS =
+        (config::CLUSTER_SIZE > 1) ? ROW_BLOCKS_PER_TASK : 1;
     // A cluster's CTAs walk one task together, covering this many row blocks.
     static constexpr int ROW_BLOCKS_PER_CLUSTER =
         ROW_BLOCKS_PER_TASK * config::CLUSTER_SIZE;

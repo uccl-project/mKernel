@@ -366,11 +366,11 @@ __device__ inline void fused_comp_sm(const globals& G) {
         #pragma unroll
         for (int i = 0; i < globals::PIPELINE_STAGES; ++i) {
             // One expect() per MMA warp on the leader CTA.
-            init_semaphore(inputs_arrived[i], 0, config::CLUSTER_SIZE);
+            init_semaphore(inputs_arrived[i], 0, globals::NUM_MMA_WARPS);
 #ifdef MKERNEL_TCGEN05
             // Blackwell: the tcgen05 MMA releases the stage (one commit per
             // MMA warp), instead of 8 consumer warps each arriving after wgmma.
-            init_semaphore(inputs_finished[i], 0, config::CLUSTER_SIZE);
+            init_semaphore(inputs_finished[i], 0, globals::NUM_MMA_WARPS);
 #else
             init_semaphore(inputs_finished[i], 0, 8);
 #endif
@@ -381,7 +381,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
         init_semaphore(outputs_finished, 0, 1);
 #ifdef MKERNEL_TCGEN05
         // One commit per MMA warp; at CLUSTER_SIZE 1 the single warp issues both.
-        init_semaphore(mma_done,     0, config::CLUSTER_SIZE);
+        init_semaphore(mma_done,     0, globals::NUM_MMA_WARPS);
         #pragma unroll
         for (int i = 0; i < globals::OUTPUT_BUFFERS; ++i)
             init_semaphore(outputs_free[i], 0, 1);   // one per epilogue sub-round
@@ -638,7 +638,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
             MKERNEL_TRACE_MARK(trace::SLOT_LOADER, trace::DONE);
         }
 #ifdef MKERNEL_TCGEN05
-        else if ((warp_id == 2 || (config::CLUSTER_SIZE > 1 && warp_id == 3))
+        else if (warp_id >= 2 && warp_id < 2 + globals::NUM_MMA_WARPS
                  && lane_id == 0 && ctarank == 0) {
             // Blackwell MMA issuer: tcgen05 accumulates in tensor memory, so
             // one thread issues what the consumers' wgmma used to do. Walks the
@@ -670,14 +670,24 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     }
                 }
                 auto d0 = d_tt_pool.template subtile<acc_t>(0, 0);
-                auto d1 = d_tt_pool.template subtile<acc_t>(0, globals::COL_BLOCK);
+                auto d1 = d_tt_pool.template subtile<acc_t>(
+                    0, globals::COL_BLOCK * (globals::ROW_BLOCKS_PER_TASK - 1));
                 for (int red_idx = 0; red_idx < num_iters; red_idx++) {
                     if constexpr (config::CLUSTER_SIZE > 1) {
                         // One expect per MMA warp; together the two account for
                         // the six tile loads (three per CTA) the loaders
                         // redirected at the leader's barrier.
-                        tma::cluster::expect(inputs_arrived[stage],
-                                             inputs[0].A[0], inputs[0].A[1], inputs[0].B);
+                        // Both CTAs point their transactions at the leader's
+                        // barrier, so the expects must add up to the whole
+                        // cluster's bytes: CLUSTER_SIZE x (RBPT A tiles + B).
+                        // NUM_MMA_WARPS warps share that, one expect each.
+                        if constexpr (globals::ROW_BLOCKS_PER_TASK == 2)
+                            tma::cluster::expect(inputs_arrived[stage],
+                                                 inputs[0].A[0], inputs[0].A[1], inputs[0].B);
+                        else
+                            tma::cluster::expect(inputs_arrived[stage],
+                                                 inputs[0].A[0], inputs[0].B,
+                                                 inputs[0].A[0], inputs[0].B);
                         tma::cluster::wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
                     } else {
                         wait(inputs_arrived[stage], get_phasebit<0>(phasebits, stage));
@@ -692,13 +702,20 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     if constexpr (config::CLUSTER_SIZE > 1) {
                         // commit<2> multicasts, so each CTA's inputs_finished
                         // sees both MMAs and its loader is released in step.
-                        auto d = (warp_id == 2) ? d0 : d1;
+                        auto d = (warp_id == 2) ? d0 : d1;   // d1 == d0 when RBPT == 1
                         if (red_idx == 0)
                             warp::mm2_ABt (d, inputs[stage].A[warp_id - 2],
                                            inputs[stage].B, inputs_finished[stage]);
                         else
                             warp::mma2_ABt(d, inputs[stage].A[warp_id - 2],
                                            inputs[stage].B, inputs_finished[stage]);
+                    } else if constexpr (globals::ROW_BLOCKS_PER_TASK == 1) {
+                        if (red_idx == 0)
+                            warp::mm_ABt (d0, inputs[stage].A[0], inputs[stage].B,
+                                          inputs_finished[stage]);
+                        else
+                            warp::mma_ABt(d0, inputs[stage].A[0], inputs[stage].B,
+                                          inputs_finished[stage]);
                     } else if (red_idx == 0) {
                         warp::mm_ABt (d0, inputs[stage].A[0], inputs[stage].B);
                         warp::mm_ABt (d1, inputs[stage].A[1], inputs[stage].B, inputs_finished[stage]);
