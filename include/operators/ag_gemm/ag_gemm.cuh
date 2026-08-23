@@ -199,7 +199,18 @@ struct globals {
     // One staging tile: the four 64-row halves of the pair go out in sequence,
     // which is what lets outputs have their own allocation instead of aliasing
     // the last input stage and gating the loader.
-    struct pipeline_outputs { C_tile C; };
+    // At CLUSTER_SIZE 2 a stage is 48 KB, so 3 stages plus TWO 32 KB staging
+    // tiles fit in 226 KB. Double-buffering them lets the consumers stage the
+    // next 64-row half while the store warp is still draining the previous one,
+    // instead of strictly ping-ponging through a single tile. Measured neutral
+    // (medians of 3: M=16384 0.996 -> 0.986 ms, M=32768 6.518 -> 6.563), so it
+    // is off by default; AG_GEMM_DOUBLE_OUTPUT=1 turns it on.
+#if defined(AG_GEMM_DOUBLE_OUTPUT)
+    static constexpr int OUTPUT_BUFFERS = (config::CLUSTER_SIZE > 1) ? 2 : 1;
+#else
+    static constexpr int OUTPUT_BUFFERS = 1;
+#endif
+    struct pipeline_outputs { C_tile C[OUTPUT_BUFFERS]; };
 #else
     struct pipeline_outputs { C_tile C[2]; };
 #endif

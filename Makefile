@@ -139,6 +139,30 @@ AG_GEMM_STAGES ?=
 ifneq ($(AG_GEMM_STAGES),)
 DEFS_ag_gemm        += -DAG_GEMM_PIPELINE_STAGES=$(AG_GEMM_STAGES)
 endif
+# AG_GEMM_EPILOGUE_READ_WAIT=1 lets the epilogue's TMA store retire in the
+# background instead of blocking each sub-round on the global commit.
+AG_GEMM_EPILOGUE_READ_WAIT ?= 0
+ifeq ($(AG_GEMM_EPILOGUE_READ_WAIT),1)
+DEFS_ag_gemm        += -DAG_GEMM_EPILOGUE_READ_WAIT
+endif
+# AG_GEMM_ROWPOLL=1 gives each intra row a completion counter on the unused
+# barrier plane 1, so a compute task can skip its per-K-strip readiness polls as
+# soon as its own row is complete -- much earlier than the global flag, which
+# waits for the slowest GPU. MEASURED SLOWER at every shape (M=32768 6.495 ->
+# 6.748 ms, M=4096 0.173 -> 0.228): the extra signal is a cross-GPU multimem
+# atomic and all 256 tasks of a row hit the same address, so the contention
+# costs gather more than the saved polls buy compute. Off by repository
+# convention for failed experiments.
+AG_GEMM_ROWPOLL ?= 0
+ifeq ($(AG_GEMM_ROWPOLL),1)
+DEFS_ag_gemm        += -DAG_GEMM_ROWPOLL
+endif
+# AG_GEMM_DOUBLE_OUTPUT=1 gives the epilogue two staging tiles instead of one.
+# Measured neutral; see the comment on OUTPUT_BUFFERS.
+AG_GEMM_DOUBLE_OUTPUT ?= 0
+ifeq ($(AG_GEMM_DOUBLE_OUTPUT),1)
+DEFS_ag_gemm        += -DAG_GEMM_DOUBLE_OUTPUT
+endif
 AG_GEMM_OWNSHARD ?= 0
 ifeq ($(AG_GEMM_OWNSHARD),1)
 DEFS_ag_gemm        += -DAG_GEMM_OWNSHARD

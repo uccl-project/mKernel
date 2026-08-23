@@ -89,6 +89,16 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 // exactly one intra worker under the round-robin stripe.
                 AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER_PH, 2);
                 signal_all(G.barrier, {0, global_row_idx, col_idx}, 1);
+#ifdef AG_GEMM_ROWPOLL
+                // Plane 1 is otherwise unused: one counter per intra row.
+                // Reaching col_blocks means every K chunk of that row is
+                // published, which lets a compute task skip its per-chunk
+                // polls entirely. Workers are strided across the flat
+                // (row, col) space, so they finish a row's columns out of
+                // order -- only the full count is a sound inference, not a
+                // prefix.
+                signal_all(G.barrier, {1, global_row_idx, 0}, 1);
+#endif
                 AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_GATHER_PH, 3);
 #ifdef AG_GEMM_TRACE
                 trace::emit(trace::ROLE_GATHER, task_id, tr_t0, trace::now_ns(),
@@ -358,7 +368,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
 
     __shared__ semaphore inputs_arrived[globals::PIPELINE_STAGES];
     __shared__ semaphore inputs_finished[globals::PIPELINE_STAGES];
-    __shared__ semaphore outputs_arrived;
+    __shared__ semaphore outputs_arrived[globals::OUTPUT_BUFFERS];
     __shared__ semaphore outputs_finished;
 #ifdef MKERNEL_TCGEN05
     // mma_done : MMA warp -> consumers, "tensor-memory accumulator is complete"
@@ -366,7 +376,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
     // outputs_free: store warp -> consumers, between epilogue sub-rounds.
     __shared__ semaphore mma_done;
     __shared__ semaphore tmem_free[ROW_BLOCKS_PER_TASK];
-    __shared__ semaphore outputs_free;
+    __shared__ semaphore outputs_free[globals::OUTPUT_BUFFERS];
 #endif
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -381,12 +391,16 @@ __device__ inline void fused_comp_sm(const globals& G) {
             init_semaphore(inputs_finished[i], 0, 8);
 #endif
         }
-        init_semaphore(outputs_arrived, 0, 1);   // one signal per sub-round
+        #pragma unroll
+        for (int i = 0; i < globals::OUTPUT_BUFFERS; ++i)
+            init_semaphore(outputs_arrived[i], 0, 1);   // one signal per sub-round
         init_semaphore(outputs_finished, 0, 1);
 #ifdef MKERNEL_TCGEN05
         // One commit per MMA warp; at CLUSTER_SIZE 1 the single warp issues both.
         init_semaphore(mma_done,     0, config::CLUSTER_SIZE);
-        init_semaphore(outputs_free, 0, 1);   // one per epilogue sub-round
+        #pragma unroll
+        for (int i = 0; i < globals::OUTPUT_BUFFERS; ++i)
+            init_semaphore(outputs_free[i], 0, 1);   // one per epilogue sub-round
         #pragma unroll
         for (int i = 0; i < ROW_BLOCKS_PER_TASK; ++i)
             init_semaphore(tmem_free[i], 0, 2 * config::CLUSTER_SIZE);   // warpgroups x CTAs
@@ -542,6 +556,19 @@ __device__ inline void fused_comp_sm(const globals& G) {
                         &G.barrier[G.dev_idx][{0, 1023, 1020}]) >= gather_done_target;
                 }
 #endif
+#ifdef AG_GEMM_ROWPOLL
+                // A task's own row is complete long before the last GPU has
+                // finished gathering, so this fires far earlier than the global
+                // all_gathered flag: one load instead of 256.
+                bool row_ready = all_gathered;
+                if (!row_ready && !is_remote) {
+                    const int intra_cols = G.A.cols() / (globals::RED_BLOCK * 2);
+                    row_ready = comm::atomic_u32::relaxed_load_s32_sys(
+                        &G.barrier[G.dev_idx][{1, row_idx / 2, 0}]) >= intra_cols;
+                }
+#else
+                const bool row_ready = all_gathered;
+#endif
                 AG_TRACE_STALL_BEGIN(tr_w1);
                 wait(outputs_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
                 AG_TRACE_STALL_END(tr_pipe, tr_w1);
@@ -552,14 +579,10 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     // Per-K-strip wait on plane 0. Each intra col_chunk
                     // covers 2 compute K-strips, so wait when crossing the
                     // boundary.
-#if defined(AG_GEMM_FASTPOLL) && defined(AG_GEMM_OWNSHARD)
-                    if (!is_remote && !all_gathered && !own_shard && (red_idx & 1) == 0) {
-#elif defined(AG_GEMM_FASTPOLL)
-                    if (!is_remote && !all_gathered && (red_idx & 1) == 0) {
-#elif defined(AG_GEMM_OWNSHARD)
-                    if (!is_remote && !own_shard && (red_idx & 1) == 0) {
+#ifdef AG_GEMM_OWNSHARD
+                    if (!is_remote && !row_ready && !own_shard && (red_idx & 1) == 0) {
 #else
-                    if (!is_remote && (red_idx & 1) == 0) {
+                    if (!is_remote && !row_ready && (red_idx & 1) == 0) {
 #endif
                         AG_TRACE_STALL_BEGIN(tr_w2);
                         wait(G.barrier, {0, row_idx / 2, red_idx / 2},
@@ -771,22 +794,42 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 for (int h = 0; h < globals::ROW_BLOCKS_PER_TASK; h++) {
                     #pragma unroll
                     for (int hs = 0; hs < 2; hs++) {
-                        wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+                        const int buf = (h * 2 + hs) % globals::OUTPUT_BUFFERS;
+                        wait(outputs_arrived[buf], get_phasebit<0>(phasebits, buf));
                         AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, (h * 2 + hs) * 8 + 2);
-                        update_phasebit<0>(phasebits, 0);
-                        tma::store_async(G.C, outputs.C, {(row_idx + h) * 2 + hs, col_idx});
+                        update_phasebit<0>(phasebits, buf);
+                        tma::store_async(G.C, outputs.C[buf], {(row_idx + h) * 2 + hs, col_idx});
+#ifdef AG_GEMM_EPILOGUE_READ_WAIT
+                        // read_wait only guarantees the TMA has drained the
+                        // staging tile, which is all the sub-round needs to
+                        // reuse it; the global commit is left in flight and the
+                        // kernel-end sync retires it. gemm_rs uses this form.
+                        tma::store_async_read_wait();
+#else
                         // store_async_wait waits for the global commit (not just
                         // smem reuse safety like read_wait). At large M,
                         // store-in-flight can race with downstream reads of C.
                         tma::store_async_wait();
+#endif
                         AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, (h * 2 + hs) * 8 + 3);
-                        if (++sub == 2 * globals::ROW_BLOCKS_PER_TASK) arrive(outputs_finished);
-                        else                                           arrive(outputs_free);
+                        // A buffer only needs an explicit release if the
+                        // consumers come back to it inside this task, which is
+                        // OUTPUT_BUFFERS sub-rounds later. Beyond that,
+                        // outputs_finished covers it: this warp stores in order
+                        // and read_waits each one, so by the time it closes the
+                        // task every earlier buffer has drained.
+                        const int sub_idx = h * 2 + hs;
+                        ++sub;
+                        if (sub == 2 * globals::ROW_BLOCKS_PER_TASK)
+                            arrive(outputs_finished);
+                        else if (sub_idx + globals::OUTPUT_BUFFERS
+                                 < 2 * globals::ROW_BLOCKS_PER_TASK)
+                            arrive(outputs_free[buf]);
                         AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_STORE, (h * 2 + hs) * 8 + 4);
                     }
                 }
 #else
-                wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+                wait(outputs_arrived[0], get_phasebit<0>(phasebits, 0));
                 update_phasebit<0>(phasebits, 0);
                 #pragma unroll
                 for (int i = 0; i < 2; i++)
@@ -858,26 +901,31 @@ __device__ inline void fused_comp_sm(const globals& G) {
                 // the eight warps write; the others just ride the barrier.
                 #pragma unroll
                 for (int hs = 0; hs < 2; hs++) {
-                    if (h == 0 && hs == 0) {
+                    const int sub = h * 2 + hs;
+                    const int buf = sub % globals::OUTPUT_BUFFERS;
+                    if (sub == 0) {
                         // First sub-round of the task waits on the previous
                         // one. The <1> half starts signalled, so task 0 passes.
+                        // It also implies every buffer is drained, which is why
+                        // sub-rounds 1..OUTPUT_BUFFERS-1 need no wait at all --
+                        // that is the whole point of the extra buffer.
                         wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                         update_phasebit<1>(phasebits, 0);
-                    } else {
-                        wait(outputs_free, get_phasebit<0>(phasebits, 1));
-                        update_phasebit<0>(phasebits, 1);
+                    } else if (sub >= globals::OUTPUT_BUFFERS) {
+                        wait(outputs_free[buf], get_phasebit<0>(phasebits, 1 + buf));
+                        update_phasebit<0>(phasebits, 1 + buf);
                     }
                     AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, (h * 2 + hs) * 8 + 4);
                     if (trow / 64 == hs) {
-                        auto dst = outputs.C.template subtile<globals::ROW_BLOCK / 8,
-                                                              globals::COL_BLOCK>(
+                        auto dst = outputs.C[buf].template subtile<globals::ROW_BLOCK / 8,
+                                                                   globals::COL_BLOCK>(
                                        {(trow % 64) / (globals::ROW_BLOCK / 8), 0});
                         warp::store(dst, C_accum);
                     }
                     group<8>::sync(4);
                     AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, (h * 2 + hs) * 8 + 5);
                     if (warpgroup_id == 0 && warp_id == 0 && lane_id == 0)
-                        arrive(outputs_arrived);
+                        arrive(outputs_arrived[buf]);
                 }
             }
 #else
@@ -895,7 +943,7 @@ __device__ inline void fused_comp_sm(const globals& G) {
             group<8>::sync(3);
             warpgroup::store(outputs.C[warpgroup_id], C_accum);
             warpgroup::sync(warpgroup_id + 1);
-            warpgroup::arrive(outputs_arrived);
+            warpgroup::arrive(outputs_arrived[0]);
 #endif
         }
         AG_TRACE_MARK(::ag_gemm_multinode::trace::SLOT_CONSUMER, 999);
@@ -978,6 +1026,11 @@ __device__ inline void barrier_reset(const globals& G) {
         int c = i % num_cols;
         G.barrier[G.dev_idx][{0, r, c}] = 0;
     }
+#ifdef AG_GEMM_ROWPOLL
+    for (int i = offset; i < num_rows; i += stride) {
+        G.barrier[G.dev_idx][{1, i, 0}] = 0;
+    }
+#endif
     const int total_p2 = num_rows * (G.num_nodes - 1) *
         (G.remote_ready_per_col != 0 ? num_cols : 1);
     for (int i = offset; i < total_p2; i += stride) {
