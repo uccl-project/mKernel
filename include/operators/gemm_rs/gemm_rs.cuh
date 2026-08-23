@@ -125,10 +125,17 @@ struct intra_globals {
     // shape and depth upstream's b200 kernel runs.
     //
     // This was 3 while B was full width; the 2-CTA split halved the B tile and
-    // bought the stage back. Measurement says that matters: at M=32768 this
-    // kernel and upstream request identical bytes (51.5 GB) for identical
-    // FLOPs, and upstream is 1.2x faster, so the gap is prefetch depth keeping
-    // the tensor cores fed rather than anything about memory traffic.
+    // bought the stage back. Depth is now measurable (GEMM_RS_STAGES) and at
+    // M=32768 it is past its knee: 2 stages 8.484 ms, 3 stages 6.444 (-24%),
+    // 4 stages 6.240 (-3.2%). A fifth would be worth ~1% and does not fit.
+    //
+    // An earlier version of this comment claimed the remaining 1.2x gap to
+    // upstream *was* prefetch depth. The activity trace says otherwise: the MMA
+    // issue warp spends 54% of its time blocked on inputs_arrived even at depth
+    // 4, and since more depth does not help, that is a bandwidth/locality
+    // problem, not a latency one. 51.5 GB of operand reads against a 537 MB
+    // cold footprint is 96x reuse for L2 to absorb, which points at task order
+    // rather than at this constant.
 #ifndef GEMM_RS_PIPELINE_STAGES
 #define GEMM_RS_PIPELINE_STAGES 4
 #endif
