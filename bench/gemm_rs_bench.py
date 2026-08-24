@@ -122,10 +122,6 @@ def parse_args():
     return p.parse_args()
 
 
-# The Blackwell (tcgen05) build takes B as (N, K); the Hopper build takes (K, N).
-TCGEN05 = os.environ.get("MKERNEL_TCGEN05", "1") == "1"
-
-
 def main():
     args = parse_args()
     rank = int(os.environ["RANK"])
@@ -151,14 +147,10 @@ def main():
 
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        if NUM_NODES == 1:
-            # Single-node (intra-only): no RDMA session is opened, so no peer.
-            peer_ip = "127.0.0.1"
-        else:
-            peer_node = 1 if node_idx == 0 else 0
-            peer_ip = os.environ.get(f"NODE{peer_node}_IP")
-            if not peer_ip:
-                raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -196,10 +188,7 @@ def main():
         torch.manual_seed(42 + global_gpu_idx)
         torch.cuda.manual_seed(42 + global_gpu_idx)
         A = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
-        # The Blackwell path issues the MMA as ABt, so it takes B N-major.
-        # Keep one logical B and hand the kernel whichever layout it wants.
-        B_ref = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
-        B = B_ref.t().contiguous() if TCGEN05 else B_ref
+        B = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
 
         workspace = mod.DistBuffer(
             (m, n), dtype=torch.bfloat16,
@@ -261,32 +250,20 @@ def main():
             fifo_cap *= 2
 
         dist.barrier()
-        # Single-node (intra-only) runs never touch the network: with
-        # n_send == n_reduce == 0 the kernel takes its intra_only_debug path,
-        # leaves runtime_state as nullptr, and ignores every session-derived
-        # pointer below. Opening an RDMA session would just fail on a host with
-        # no usable HCA, so skip it entirely.
-        intra_only = (NUM_NODES == 1)
-        if intra_only:
-            fifo = (0, 0, 0, 0, 0)
-            arrival_ptr = 0
-            recv_ptr = 0
-        else:
-            peer_ips = get_peer_ips(node_idx, NUM_NODES)
-            mod.create_session(
-                node_idx, peer_ip, tcp_port,
-                staging_buf.data_ptr(), staging_bytes,
-                recv_bytes, total_inter_tiles, fifo_cap, local_rank,
-                peer_ips=peer_ips,
-                peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
-            )
-            fifo = mod.get_fifo_handles()
-            arrival_ptr = mod.get_arrival_flags_ptr()
-            recv_ptr = mod.get_recv_buf_ptr()
+        peer_ips = get_peer_ips(node_idx, NUM_NODES)
+        mod.create_session(
+            node_idx, peer_ip, tcp_port,
+            staging_buf.data_ptr(), staging_bytes,
+            recv_bytes, total_inter_tiles, fifo_cap, local_rank,
+            peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
+        )
+        fifo = mod.get_fifo_handles()
+        arrival_ptr = mod.get_arrival_flags_ptr()
+        recv_ptr = mod.get_recv_buf_ptr()
 
         epoch = 1
-        if not intra_only:
-            mod.set_epoch(epoch)
+        mod.set_epoch(epoch)
         dist.barrier(); time.sleep(0.5)
 
         use_acquire_poll, reduce_poll_sleep_ns = poll_tuning(m)
@@ -297,14 +274,12 @@ def main():
             workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
             barrier.data_.zero_(); ready_chunk.data_.zero_()
             staging_dbuf.data_.zero_()
-            if not intra_only and hasattr(mod, "zero_recv_buf"):
+            if hasattr(mod, "zero_recv_buf"):
                 mod.zero_recv_buf()
 
         def advance_epoch(next_epoch: int):
             # Queue-mode arrivals carry packed work, not an epoch value. Keep
             # all nodes quiesced before any rank clears arrival slots.
-            if intra_only:
-                return
             if use_prepare_epoch:
                 mod.prepare_epoch()
                 dist.barrier()
@@ -391,21 +366,6 @@ def main():
                 _p99 = _ss[min(_n - 1, int(0.99 * _n))]
                 print(f"[gemm_rs-dist] M={m} n={_n} min={_ss[0]:.3f} "
                       f"med={_med:.3f} p99={_p99:.3f} max={_ss[-1]:.3f}", flush=True)
-        if intra_only:
-            # Intra-only runs stop after the NVLink reduce-scatter: the result
-            # is the cross-GPU store_add accumulation in `staging`, and the
-            # reduce CTAs that would normally publish `output` never launch.
-            # Undo the chunk-major staging view so the checks below can run
-            # unchanged. Host entrypoint lays tile (rb, cb) out at
-            # (rb*CB + cb)*128 rows of 256 columns.
-            RB = m_local // ROW_BLOCK
-            CB = n // COL_BLOCK
-            output.data_.copy_(
-                staging_buf.reshape(RB, CB, ROW_BLOCK, COL_BLOCK)
-                           .permute(0, 2, 1, 3)
-                           .reshape(m_local, n)
-            )
-
         C_ref = None
         for target_lr in range(world_size):
             row_lo = target_lr * m_local
@@ -414,7 +374,7 @@ def main():
             # all 8 local GPUs in the node, then reduce the owning local-rank
             # slice across nodes.
             # Keep on GPU so the NCCL backend can all_reduce/all_gather it.
-            ref_slice = torch.matmul(A[row_lo:row_hi], B_ref)
+            ref_slice = torch.matmul(A[row_lo:row_hi], B)
             dist.all_reduce(
                 ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
             )

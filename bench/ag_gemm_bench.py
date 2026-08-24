@@ -54,10 +54,6 @@ DEFAULT_SHAPES = (
 # at small M (NCCL has minimal launch overhead and beats the fused path there
 # unless we cut the comm-CTA budget). The 64-sms default oversubscribes comm
 # CTAs at medium M where the GEMM wave count is lower.
-# The Blackwell (tcgen05) build takes B as (N, K)? No - ag_gemm keeps its
-# layout. This flag only gates the Hopper-tuned comm-SM table below.
-TCGEN05 = os.environ.get("MKERNEL_TCGEN05", "1") == "1"
-
 SMS_PER_SHAPE = {4096: 8, 6144: 8, 8192: 8, 12288: 8, 16384: 8,
                  24576: 8, 49152: 8, 65536: 8, 57344: 8, 73728: 8}
 
@@ -114,14 +110,10 @@ def main():
     is_chief = (local_rank == 0 and node_idx == 0)
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        if NUM_NODES == 1:
-            # Single-node (intra-only): no RDMA session is opened, so no peer.
-            peer_ip = "127.0.0.1"
-        else:
-            peer_node = 1 if node_idx == 0 else 0
-            peer_ip = os.environ.get(f"NODE{peer_node}_IP")
-            if not peer_ip:
-                raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+        peer_node = 1 if node_idx == 0 else 0
+        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        if not peer_ip:
+            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -150,20 +142,9 @@ def main():
             INTRA_OVERRIDE[base_n] = int(os.environ[env_key])
             if is_chief:
                 print(f"[ag_gemm] env override {env_key}={os.environ[env_key]}", flush=True)
-    default_num_comm_sms = args.num_comm_sms
     for base_n in shapes:
         # Per-shape num_comm_sms override (small-M overhead reduction).
-        # Reset first: this used to mutate args and never restore it, so a shape
-        # absent from the table inherited the previous shape's value. That made
-        # M=32768 run with 8 comm CTAs instead of 64 in any multi-shape sweep,
-        # worth about 24% on that shape.
-        args.num_comm_sms = default_num_comm_sms
-        # The table above is Hopper tuning. On Blackwell the tcgen05 compute
-        # path is fast enough that the intra-node all-gather becomes the
-        # critical path, and 8 comm CTAs starve it: measured 0.551 -> 0.325 ms
-        # at M=8192 and 2.238 -> 1.348 at M=16384 going from 8 to 32, flat
-        # beyond. Keep the 64 default there.
-        if base_n in SMS_PER_SHAPE and not TCGEN05:
+        if base_n in SMS_PER_SHAPE:
             args.num_comm_sms = SMS_PER_SHAPE[base_n]
             if is_chief:
                 print(f"[ag_gemm] M={base_n}: per-shape num_comm_sms={args.num_comm_sms}",
@@ -182,12 +163,7 @@ def main():
         assert M % ROW_BLOCK == 0 and K % RED_BLOCK == 0 and N % COL_BLOCK == 0
         os.environ.pop("AG_GEMM_ROW_STRIDE_BYTES", None)
         n_peers = NUM_NODES - 1
-        ring_recv_banks = max(1, n_peers)
-        # Single-node: no peers, so the ring receive area is empty. Allocate one
-        # A_comm_tile of rows anyway — the host entrypoint clamps to the same
-        # floor so its TMA descriptors are constructible. The kernel never
-        # reads it (every task decodes to the local shard when NUM_NODES == 1).
-        recv_rows = max(ROW_BLOCK * 2, M_node * n_peers * ring_recv_banks)
+        ring_recv_banks = n_peers
 
         if is_chief:
             print(f"\n[ag_gemm] M={M} K={K} N={N} M_node={M_node} M_local={M_local}", flush=True)
@@ -239,14 +215,14 @@ def main():
             a_rdma_src.data_.zero_()
             a_rdma_src.data_[start_row:start_row + M_local].copy_(A_local)
 
-        a_recv_tk = mod.DistBuffer((recv_rows, K), dtype=torch.bfloat16,
+        a_recv_tk = mod.DistBuffer((M_node * n_peers * ring_recv_banks, K), dtype=torch.bfloat16,
             local_rank=local_rank, local_world_size=world_size, multicast=True)
         a_recv_tk.data_.zero_()
 
         a_recv_rdma = None
         if is_peermem_backing(target_backing):
             a_recv_rdma = make_dist_buffer(
-                mod, (recv_rows, K),
+                mod, (M_node * n_peers * ring_recv_banks, K),
                 dtype=torch.bfloat16,
                 local_rank=local_rank, local_world_size=world_size,
                 multicast=False, backing=target_backing)
@@ -274,32 +250,21 @@ def main():
         send_buf_size = recv_buf_bytes
         # A_recv is registered as MR0 (src_view=0) so received shards can be
         # forwarded to the next node after phase-2 republishes them.
-        # Single-node runs never leave the node: with NUM_NODES == 1 every
-        # compute task decodes to the local shard, the ring all-gather runs
-        # zero hops, and no session-derived pointer is dereferenced. Opening an
-        # RDMA session would just fail on a host with no usable HCA.
-        intra_only = (NUM_NODES == 1)
-        if intra_only:
-            fifo = (0, 0, 0, 0, 0)
-            arrival_ptr = 0
-            recv_ptr = 0
-        else:
-            peer_ips = get_peer_ips(node_idx, NUM_NODES)
-            mod.create_session(
-                node_idx, peer_ip, tcp_port,
-                send_buf_ptr, send_buf_size, recv_buf_bytes,
-                recv_buf_chunks, fifo_cap, local_rank,
-                clocal_buf_ptr=a_tk_ptr, clocal_buf_size=a_half_bytes,
-                peer_ips=peer_ips,
-                peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
-            )
-            fifo = mod.get_fifo_handles()
-            arrival_ptr = mod.get_arrival_flags_ptr()
-            recv_ptr = mod.get_recv_buf_ptr()
+        peer_ips = get_peer_ips(node_idx, NUM_NODES)
+        mod.create_session(
+            node_idx, peer_ip, tcp_port,
+            send_buf_ptr, send_buf_size, recv_buf_bytes,
+            recv_buf_chunks, fifo_cap, local_rank,
+            clocal_buf_ptr=a_tk_ptr, clocal_buf_size=a_half_bytes,
+            peer_ips=peer_ips,
+            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
+        )
+        fifo = mod.get_fifo_handles()
+        arrival_ptr = mod.get_arrival_flags_ptr()
+        recv_ptr = mod.get_recv_buf_ptr()
 
         epoch = 1
-        if not intra_only:
-            mod.set_epoch(epoch)
+        mod.set_epoch(epoch)
         dist.barrier(); time.sleep(0.5)
 
         def reset_state():
@@ -325,8 +290,7 @@ def main():
             )
 
         for wi in range(args.warmup):
-            reset_state(); epoch += 1
-            if not intra_only: mod.set_epoch(epoch)
+            reset_state(); epoch += 1; mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.1)
             run_once(); torch.cuda.synchronize()
             dist.barrier()
@@ -348,8 +312,7 @@ def main():
             # an inter-iter set_epoch that would re-issue prepare_epoch's
             # drain_proxy + barrier (which is itself a sync). We reuse a single
             # epoch across the back-to-back run; reset_state restores buffers.
-            reset_state(); epoch += 1
-            if not intra_only: mod.set_epoch(epoch)
+            reset_state(); epoch += 1; mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.05)
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
@@ -367,8 +330,7 @@ def main():
             dist.barrier()
         else:
             for _ in range(args.iters):
-                reset_state(); epoch += 1
-                if not intra_only: mod.set_epoch(epoch)
+                reset_state(); epoch += 1; mod.set_epoch(epoch)
                 dist.barrier(); time.sleep(0.05)
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
@@ -396,13 +358,11 @@ def main():
 
         if os.environ.get("MKERNEL_INVARIANT_DETERMINISTIC", "0") == "1":
             torch.cuda.synchronize(); dist.barrier(); time.sleep(0.1)
-            reset_state(); epoch += 1
-            if not intra_only: mod.set_epoch(epoch)
+            reset_state(); epoch += 1; mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.05)
             run_once(); torch.cuda.synchronize()
             det_out_a = C.detach().clone()
-            reset_state(); epoch += 1
-            if not intra_only: mod.set_epoch(epoch)
+            reset_state(); epoch += 1; mod.set_epoch(epoch)
             dist.barrier(); time.sleep(0.05)
             run_once(); torch.cuda.synchronize()
             det_out_b = C.detach().clone()
