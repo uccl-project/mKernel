@@ -19,17 +19,19 @@
 #include "dist/local_tensor.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
+#include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 
 namespace gemm_ar_intranode_blackwell {
 struct fused_globals;
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G);
 
-struct config {
+template <int _NUM_COMP_SM>
+struct config_t {
     static constexpr int NUM_BLOCKS = 148;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
-    static constexpr int NUM_COMP_SM = 128;
+    static constexpr int NUM_COMP_SM = _NUM_COMP_SM;
     static constexpr int NUM_COMM_SM = NUM_BLOCKS - NUM_COMP_SM;
     // NOTE: I can just use a single warpgroup for both the consumer, producer and the epilogue
     // Maybe I can also save some SMs just for all-reduce?
@@ -90,6 +92,9 @@ struct config {
     static constexpr uint32_t PHASE_BITS_INIT = (1u << PHASE_BIT_MMA_FINISH) |
         (((1u << CONSUMER_WARPS) - 1) << PHASE_BIT_EPILOGUE_FINISHED);
 };
+
+constexpr int _DEFAULT_NUM_COMP_SM = 128;
+using config = config_t<_DEFAULT_NUM_COMP_SM>;
 
 enum GemmToArSignalStrategy {
     PUSH = 0,  // write to host buffer to signal completion
@@ -205,12 +210,32 @@ void entrypoint(const at::Tensor& A,
     fused_globals G =
         gemm_ar_blackwell_make_globals(A, B, C, barrier, C_final, dev_idx, M, N, K, epoch);
 
-    if (M <= 2048) {
-        launch_fused_gemm_ar_blackwell<4, 32>(G);
-    } else if (M <= 4096) {
-        launch_fused_gemm_ar_blackwell<4, 64>(G);
-    } else {
-        launch_fused_gemm_ar_blackwell<8, 64>(G);
+    // int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM
+    switch (M) {
+        case (2048): {
+            launch_fused_gemm_ar_blackwell<4, 16, GemmToArSignalStrategy::PULL, 108>(G);
+            break;
+        }
+        case (4096): {
+            launch_fused_gemm_ar_blackwell<4, 16, GemmToArSignalStrategy::PULL, 108>(G);
+            break;
+        }
+        case (8192): {
+            launch_fused_gemm_ar_blackwell<8, 16, GemmToArSignalStrategy::PULL, 100>(G);
+            break;
+        }
+        case (16384): {
+            launch_fused_gemm_ar_blackwell<8, 16, GemmToArSignalStrategy::PULL, 100>(G);
+            break;
+        }
+        case (32768): {
+            // 43 is the maximum unroll factor here because
+            // Number of 4 byte register lds (128*256 / 2)
+            // Number of oeprations per thread = (128*256 / 2) / 384 = 42.67 (so any higher has no
+            // effect)
+            launch_fused_gemm_ar_blackwell<8, 43, GemmToArSignalStrategy::PUSH, 140>(G);
+            break;
+        }
     }
 }
 };  // namespace gemm_ar_intranode_blackwell

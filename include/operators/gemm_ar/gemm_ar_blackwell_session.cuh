@@ -13,6 +13,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("C"),
           pybind11::arg("barrier"),
           pybind11::arg("C_final"),
-          pybind11::arg("epoch"),
-          pybind11::arg("gemm_to_ar_signal_strategy"));
+          pybind11::arg("epoch"));
 }

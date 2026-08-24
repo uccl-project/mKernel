@@ -18,7 +18,7 @@
 #include "common/tk_common_util.cuh"
 #include "common/tk_types_register_rt.cuh"
 #include "common/tk_types_shared_st.cuh"
-#include "common/tk_types_tensor_tensor.cuh"
+#include "common/tk_types_tensor.cuh"
 #include "common/types.cuh"
 #include "dist/dbuf_buffer_bridge.cuh"
 #include "dist/distributed_buffer.cuh"
@@ -54,8 +54,9 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
+    using config = config_t<_NUM_COMP_SM>;
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
     const int warpgroup_id = warpgroupid();
@@ -276,8 +277,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
 
                 // give each warp its own view of tmem
                 fused_globals::C_tt_tile tmem[1];
-                tmem[0] = tm_alloc.allocate<fused_globals::C_tt_tile>(consumer_id *
-                                                                      fused_globals::COL_BLOCK);
+                tmem[0] = tm_alloc.template allocate<fused_globals::C_tt_tile>(
+                    consumer_id * fused_globals::COL_BLOCK);
 
                 int input_stage_id = 0;
                 for (int iter = cluster_idx; iter < num_tiles_total; iter += num_comp_clusters) {
@@ -288,8 +289,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     } else {
         warpgroup::increase_registers<config::EPILOGUE_REGISTERS>();
         fused_globals::C_tt_tile tmem[1];
-        tmem[0] =
-            tm_alloc.allocate<fused_globals::C_tt_tile>(warpgroup_id * fused_globals::COL_BLOCK);
+        tmem[0] = tm_alloc.template allocate<fused_globals::C_tt_tile>(warpgroup_id *
+                                                                       fused_globals::COL_BLOCK);
 
         for (int tile_id = cluster_idx; tile_id < num_tiles_total; tile_id += num_comp_clusters) {
             // this returns an index in the 512 * 256 tile
@@ -343,8 +344,9 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base);
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
+    using config = config_t<_NUM_COMP_SM>;
     const int iter_gate_value = G.epoch * config::NUM_DEVICES;
 
     // we would like to handle tiles on a 128*256 basis, so the for loop should go based on that
@@ -439,23 +441,24 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
-    if (blockIdx.x < config::NUM_COMP_SM) {
-        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+    if (blockIdx.x < _NUM_COMP_SM) {
+        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY, _NUM_COMP_SM>(G);
     } else {
-        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, _NUM_COMP_SM>(
+            G);
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY, _NUM_COMP_SM>(G);
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY, int _NUM_COMP_SM>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -463,8 +466,10 @@ void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     constexpr int num_threads = config::NUM_THREADS;
     constexpr int grid = config::NUM_BLOCKS;
 
-    auto this_kernel =
-        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>;
+    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH,
+                                                 AR_UNROLL,
+                                                 GEMM_TO_AR_SIGNAL_STRATEGY,
+                                                 _NUM_COMP_SM>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
