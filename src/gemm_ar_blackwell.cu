@@ -54,7 +54,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
     return {(supergroup_idx & 1) ? num_rows - row_idx - 1 : row_idx, col_idx};
 };
 
-template <int SUPERGROUP_WIDTH>
+template <int SUPERGROUP_WIDTH, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -66,8 +66,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         G.C_dist[G.dev_idx].prefetch_tma<fused_globals::C_tile>();
     }
 
-    // Each TMA load loads 2 128 * 64 A tiiles and 64 * 256 B tile
-    // These tiles will then participate in 2CTA MMA, to produce a 256 * 256 tile per SM
     const int num_row_tiles = G.M / (fused_globals::ROW_BLOCK * config::NUM_CLUSTERS);
     const int num_col_tiles = G.N / fused_globals::COL_BLOCK;
     const int num_tiles_total = num_row_tiles * num_col_tiles;
@@ -251,9 +249,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         phasebits ^= (1 << (config::PHASE_BIT_EPILOGUE_READY + warpgroup_id));
     };
 
-    // Row tiles are A_tile/C_tile sized (ROW_BLOCK / CONSUMER_WARPS rows), so a
-    // cluster block spans NUM_CLUSTERS * CONSUMER_WARPS of them: this CTA owns
-    // the CONSUMER_WARPS tiles starting here, one per consumer.
     const int cta_row_tile_base = cta_rank * config::CONSUMER_WARPS;
 
     // producer + consumers share the tail warpgroup(s)
@@ -292,7 +287,6 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         }
     } else {
         warpgroup::increase_registers<config::EPILOGUE_REGISTERS>();
-        // give each warpgroup its own view of tmem
         fused_globals::C_tt_tile tmem[1];
         tmem[0] =
             tm_alloc.allocate<fused_globals::C_tt_tile>(warpgroup_id * fused_globals::COL_BLOCK);
@@ -311,11 +305,13 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                      warpgroup_id,
                      tile_id + num_comp_clusters >= num_tiles_total);
 
-            // TMA store visible in GMEM
             dist::tma::store_async_wait();
 
             // Along a vertical cluster block, CTA0 holds sub-rows 0,1 and CTA1
-            // holds 2,3
+            // holds 2,3. The comm side claims tiles by comm_row_idx == dev_idx %
+            // NUM_DEVICES_PER_TILE, i.e. device d all-reduces sub-row d of every
+            // cluster tile -- so the destination is the sub-row index itself,
+            // not a function of tile_id.
             const int device_to_signal = (c_row_tile % 4) + (tile_col_id % 2) * 4;
 
             // NOTE: there is no need to use a warpgroup::sync() here, becuase the thread issuing
@@ -323,10 +319,15 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // until the TMA wait is completed
             if (warpgroup::laneid() == 0) {
                 // https://github.com/NVIDIA/cutlass/issues/3117#issuecomment-5179892505
-                // only need a GPU scope, because the data only needs to be present in local L2
-                // for peer to read over nvlink
-                comm::atomic_u32::release_store_gpu(
-                    &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
+                if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
+                    dist::signal(
+                        G.comp_comm_barrier, {c_row_tile, tile_col_id}, device_to_signal, 1);
+                } else {
+                    // only need a GPU scope, because the data only needs to be present in local L2
+                    // for peer to read over nvlink
+                    comm::atomic_u32::release_store_gpu(
+                        &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
+                }
             }
         }
     }
@@ -342,7 +343,7 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
                                                   int row_base,
                                                   int col_base);
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
     const int iter_gate_value = G.epoch * config::NUM_DEVICES;
 
@@ -371,13 +372,24 @@ __device__ __forceinline__ void fused_intranode_sm(const fused_globals& G) {
         // not go through the L1 cache + signal from before is a release add operation
         const int actual_tile_row = tile_row_idx * NUM_DEVICES_PER_TILE + comm_row_idx;
         if (threadIdx.x == 0) {
-            int val;
-            do {
-                comm::multimem<int>::ld_reduce<comm::reduce_op::MIN, comm::memory_model::STRONG>(
-                    val,
-                    reinterpret_cast<const int*>(
-                        G.comp_comm_barrier.mc_ptr_at({actual_tile_row, tile_col_idx})));
-            } while (val < (int)G.epoch);
+            // only need a gpu scope load here, since we only need the data to be present in the
+            // local L2
+            if constexpr (GEMM_TO_AR_SIGNAL_STRATEGY == GemmToArSignalStrategy::PUSH) {
+                int val;
+                do {
+                    val = comm::atomic_u32::relaxed_load_s32_gpu(
+                        &G.comp_comm_barrier[G.dev_idx][{actual_tile_row, tile_col_idx}]);
+                } while (val < iter_gate_value);
+            } else {
+                int val;
+                do {
+                    comm::multimem<int>::ld_reduce<comm::reduce_op::MIN,
+                                                   comm::memory_model::STRONG>(
+                        val,
+                        reinterpret_cast<const int*>(
+                            G.comp_comm_barrier.mc_ptr_at({actual_tile_row, tile_col_idx})));
+                } while (val < (int)G.epoch);
+            }
         }
         __syncthreads();
 
@@ -427,36 +439,84 @@ __device__ __forceinline__ void pipelined_ar_tile(const fused_globals& G,
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __device__ __forceinline__ void fused_kernel(const fused_globals& G) {
     if (blockIdx.x < config::NUM_COMP_SM) {
-        fused_comp_sm<SUPERGROUP_WIDTH>(G);
+        fused_comp_sm<SUPERGROUP_WIDTH, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
     } else {
-        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL>(G);
+        fused_intranode_sm<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
     }
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 __global__ __cluster_dims__(config::NUM_CLUSTERS, 1, 1)
     __launch_bounds__(config::NUM_THREADS,
                       1) void gemm_ar_fused_kernel_stub(const __grid_constant__ fused_globals G) {
-    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL>(G);
+    fused_kernel<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>(G);
 }
 
-template <int SUPERGROUP_WIDTH, int AR_UNROLL>
+template <int SUPERGROUP_WIDTH, int AR_UNROLL, int GEMM_TO_AR_SIGNAL_STRATEGY>
 void launch_fused_gemm_ar_blackwell(const fused_globals& G) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     constexpr int smem_size = fused_globals::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = config::NUM_THREADS;
-    constexpr int grid = config::NUM_BLOCKS;  // set aside 20 SMs for comm
+    constexpr int grid = config::NUM_BLOCKS;
 
-    auto this_kernel = gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL>;
+    auto this_kernel =
+        gemm_ar_fused_kernel_stub<SUPERGROUP_WIDTH, AR_UNROLL, GEMM_TO_AR_SIGNAL_STRATEGY>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     this_kernel<<<grid, num_threads, smem_size, stream>>>(G);
+}
+
+namespace ar_detail {
+template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
+__device__ __forceinline__ void ar_unroll_cached(const fused_globals::C_distributed_tensor& C_dist,
+                                                 const fused_globals::C_final_tensor& C_final,
+                                                 int row_base,
+                                                 int col_base) {
+    constexpr int UNITS_PER_ROW = SUBTILE_N / 2;            // 128
+    constexpr int TOTAL_UNITS = SUBTILE_M * UNITS_PER_ROW;  // 16384
+    constexpr int NT = config::NUM_THREADS;
+    constexpr int BATCH = AR_UNROLL * NT;
+
+    for (int base = threadIdx.x; base < TOTAL_UNITS; base += BATCH) {
+        comm::bf16_2* ld_ptrs[AR_UNROLL];
+        comm::bf16_2* st_ptrs[AR_UNROLL];
+        uint32_t tmps[AR_UNROLL];
+
+        // Consecutive threads take consecutive bf16_2 units, so each warp's
+        // requests coalesce into contiguous 128B chunks.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            const int j = base + u * config::NUM_THREADS;
+            if (j < TOTAL_UNITS) {
+                const int r = row_base + j / UNITS_PER_ROW;
+                const int c = col_base + (j % UNITS_PER_ROW) * 2;
+                ld_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_dist.mc_ptr_at({r, c}));
+                st_ptrs[u] = reinterpret_cast<comm::bf16_2*>(C_final.mc_ptr_at({r, c}));
+            }
+        }
+
+        // All loads before any store — this is the whole point of the helper.
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::ld_reduce_add_weak_bits_no_clobber(tmps[u],
+                                                                                 ld_ptrs[u]);
+            }
+        }
+
+#pragma unroll
+        for (int u = 0; u < AR_UNROLL; u++) {
+            if (base + u * config::NUM_THREADS < TOTAL_UNITS) {
+                comm::multimem<comm::bf16_2>::st_weak_bits_no_clobber(st_ptrs[u], tmps[u]);
+            }
+        }
+    }
 }
 
 template <int AR_UNROLL, int SUBTILE_M, int SUBTILE_N>
@@ -508,6 +568,7 @@ __device__ __forceinline__ void ar_unroll_ld_cached(
         }
     }
 }
+};  // namespace ar_detail
 };  // namespace gemm_ar_intranode_blackwell
 
 #include "operators/gemm_ar/gemm_ar_blackwell_session.cuh"
