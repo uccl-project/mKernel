@@ -478,6 +478,28 @@ __device__ inline void gemm_rs_decode_comp_task(
                                        G::NUM_DEVICES, dev_idx, row_idx, col_idx);
 }
 
+// Single entry point for the cluster-task loop: picks the ordering and, on the
+// column-fastest path, does the cluster-index -> task-id remap that order needs
+// (a cluster's ROW_BLOCKS_PER_CLUSTER row blocks sit at stride tiles_per_round,
+// so the base task id is the round expanded by the cluster height). Keeping the
+// remap here means the super-tile path does not compute it and throw it away.
+template<typename G>
+__device__ inline void gemm_rs_decode_cluster(
+    int cluster_task_id, int row_blocks_per_slice, int col_blocks, int dev_idx,
+    int tiles_per_round, bool use_supertile, int& row_idx, int& col_idx
+) {
+    if (use_supertile) {
+        gemm_rs_decode_cluster_task<G>(cluster_task_id, row_blocks_per_slice,
+                                       col_blocks, dev_idx, row_idx, col_idx);
+    } else {
+        const int round_pair = cluster_task_id / tiles_per_round;
+        const int within     = cluster_task_id - round_pair * tiles_per_round;
+        gemm_rs_decode_comp_task<G>(
+            round_pair * G::ROW_BLOCKS_PER_CLUSTER * tiles_per_round + within,
+            row_blocks_per_slice, col_blocks, dev_idx, row_idx, col_idx);
+    }
+}
+
 // Compute -> intra-RS ready signalling. Default is per-tile (batch=1): each
 // compute tile writes 1 to ready[task_id]. With GEMM_RS_COMPUTE_SIGNAL_BATCH=N>1
 // tiles are grouped in consecutive N-ID runs; each tile atomic-adds 1 to the

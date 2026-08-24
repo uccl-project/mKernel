@@ -17,6 +17,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
 from common import (  # noqa: E402
+    benchmark_batch,
     check_close,
     check_deterministic_rerun,
     compare_named_results,
@@ -25,6 +26,7 @@ from common import (  # noqa: E402
     get_peer_ports,
     is_peermem_backing,
     make_dist_buffer,
+    resolve_timing_mode,
     rdma_backing,
     rdma_policy_label,
 )
@@ -400,41 +402,21 @@ def main():
         # MKERNEL_BENCH_TIMING selects the methodology, and means the same thing
         # in gemm_rs_bench.py. See the comment there; "batch" (default) matches
         # ThunderKittens' harness, "periter" does not.
-        timing_mode = os.environ.get("MKERNEL_BENCH_TIMING", "batch")
-        if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1": timing_mode = "periter"
-        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0": timing_mode = "periter"
-        legacy_sync = (timing_mode != "batch")
-        if NUM_NODES > 2:
-            legacy_sync = True
-        if not legacy_sync:
-            n_iters = max(args.iters, 32)
-            # Pre-flip enough epochs so all N iters have unique epochs without
-            # an inter-iter set_epoch that would re-issue prepare_epoch's
-            # drain_proxy + barrier (which is itself a sync). We reuse a single
-            # epoch across the back-to-back run; reset_state restores buffers.
+        def start_iter():
+            nonlocal epoch
             reset_state(); epoch += 1
             if not intra_only: mod.set_epoch(epoch)
-            dist.barrier(); time.sleep(0.05)
-            for _ in range(3):          # warm up, as TK does
-                run_once()
-            torch.cuda.synchronize(); dist.barrier()
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            for _ in range(n_iters):
-                run_once()
-            e.record()
-            torch.cuda.synchronize()
-            avg_ms = s.elapsed_time(e) / n_iters
+
+        legacy_sync = (resolve_timing_mode() != "batch") or NUM_NODES > 2
+        if not legacy_sync:
+            n_iters = max(args.iters, 32)
+            avg_ms = benchmark_batch(run_once, start_iter, n_iters)
             samples = [avg_ms] * args.iters  # reuse downstream reduce path
             if is_chief:
                 print(f"[ag_gemm-batch] M={M} N={n_iters} avg={avg_ms:.4f} ms",
                       flush=True)
-            dist.barrier()
             # One clean iteration so the correctness check below sees valid state.
-            reset_state(); epoch += 1
-            if not intra_only: mod.set_epoch(epoch)
-            dist.barrier()
+            start_iter(); dist.barrier()
             run_once(); torch.cuda.synchronize(); dist.barrier()
         else:
             for _ in range(args.iters):

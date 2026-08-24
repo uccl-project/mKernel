@@ -170,6 +170,53 @@ def maybe_print_rank_values(label: str, value: float) -> None:
         print(f"[rank-times] {label}: {rank_ms}", flush=True)
 
 
+def resolve_timing_mode() -> str:
+    """"batch" (default) or "periter". Both benches read this the same way.
+
+    batch matches ThunderKittens' harness (common.py:benchmark_no_l2_clear):
+    warm up, then N back-to-back launches inside one event pair, divided by N.
+    periter brackets each launch and resets between, which leaves idle gaps that
+    let the GPU boost -- not comparable to TK, in either direction.
+    """
+    mode = os.environ.get("MKERNEL_BENCH_TIMING", "batch")
+    # Back-compat with the two older flags, whose senses were opposite.
+    if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1":
+        mode = "periter"
+    if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "0":
+        mode = "periter"
+    if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "1":
+        mode = "batch"
+    return mode
+
+
+def benchmark_batch(launch: Callable[[], None], reset: Callable[[], None],
+                    n_iters: int, warmup: int = 3) -> float:
+    """Average ms per launch over n_iters back-to-back launches.
+
+    One event pair spans the whole batch, so no per-iteration host work lands
+    inside the measurement. The timed loop leaves device state dirty by design
+    -- a kernel that accumulates into its output needs the reset that this
+    deliberately skips -- so callers that verify correctness must run one clean
+    iteration afterwards.
+    """
+    reset()
+    dist.barrier()
+    time.sleep(0.05)
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+    dist.barrier()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(n_iters):
+        launch()
+    end.record()
+    torch.cuda.synchronize()
+    dist.barrier()
+    return start.elapsed_time(end) / n_iters
+
+
 def avg_then_max(samples: list[float], label: str = "") -> float:
     """Benchmark timing: local average, then max over all ranks."""
     local = sum(samples) / len(samples) if samples else float("nan")

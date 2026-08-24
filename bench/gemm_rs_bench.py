@@ -20,11 +20,13 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
 from common import (  # noqa: E402
+    benchmark_batch,
     check_close,
     compare_named_results,
     get_peer_ips,
     get_peer_ports,
     make_dist_buffer,
+    resolve_timing_mode,
     rdma_backing,
     rdma_policy_label,
 )
@@ -370,42 +372,18 @@ def main():
         # each iter, which deadlocks the proxy without a per-iter barrier+settle.
         # MKERNEL_BENCH_NO_SYNC=1 (or MKERNEL_BENCH_LEGACY_SYNC=0) forces the
         # NCCL-style back-to-back path.
-        # MKERNEL_BENCH_TIMING selects the methodology, and means the same thing
-        # in ag_gemm_bench.py. Default "batch" matches ThunderKittens' harness
-        # (common.py:benchmark_no_l2_clear): warm up, then N back-to-back kernel
-        # launches inside one event pair, divided by N -- no per-iteration host
-        # work, no barrier, no sync. "periter" brackets each launch separately
-        # and resets between, which leaves idle gaps that let the GPU boost and
-        # is therefore NOT comparable to TK.
-        #
         # In batch mode the timed loop deliberately produces wrong values: this
         # kernel's epilogue store_adds into staging, so without the per-iteration
         # zero the results accumulate. Correctness is verified separately below,
         # on one clean iteration. Keeping the two coupled is what made these
         # numbers incomparable in the first place.
-        timing_mode = os.environ.get("MKERNEL_BENCH_TIMING", "batch")
-        if os.environ.get("MKERNEL_BENCH_NO_SYNC") == "1": timing_mode = "batch"
-        if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "1": timing_mode = "periter"
-        legacy_sync = (timing_mode != "batch")
+        legacy_sync = (resolve_timing_mode() != "batch")
         if not legacy_sync:
             n_iters = max(args.iters, 32)
-            start_iter()
-            dist.barrier(); time.sleep(0.05)
-            for _ in range(3):          # warm up, as TK does
-                run_once()
-            torch.cuda.synchronize(); dist.barrier()
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            for _ in range(n_iters):
-                run_once()
-            e.record()
-            torch.cuda.synchronize()
-            avg_ms = s.elapsed_time(e) / n_iters
+            avg_ms = benchmark_batch(run_once, start_iter, n_iters)
             samples = [avg_ms] * args.iters
             if is_chief:
                 print(f"[gemm_rs-batch] M={m} N={n_iters} avg={avg_ms:.4f} ms", flush=True)
-            dist.barrier()
             # One clean iteration so the correctness check below sees valid state.
             start_iter(); dist.barrier()
             run_once(); torch.cuda.synchronize(); dist.barrier()

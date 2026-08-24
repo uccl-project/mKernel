@@ -1179,24 +1179,17 @@ __device__ inline void fused_kernel(const fused_globals &G) {
         const bool use_supertile = GEMM_RS_SUPERTILE_ENABLED &&
                                    (cluster_rows_total >= 6 * GEMM_RS_SUPER_M);
         for (int pair_id = cluster_id; pair_id < num_cluster_tasks; pair_id += num_clusters) {
-            const int round_pair = pair_id / tiles_per_round;
-            const int within     = pair_id - round_pair * tiles_per_round;
-            const int task_id    = round_pair * intra_globals::ROW_BLOCKS_PER_CLUSTER * tiles_per_round
-                                 + within;
+            int row_idx, col_idx;
+            gemm_rs_decode_cluster<intra_globals>(pair_id, row_blocks_per_slice, col_blocks,
+                                                  I.dev_idx, tiles_per_round, use_supertile,
+                                                  row_idx, col_idx);
 #else
         for (int task_id = (int)blockIdx.x; task_id < num_blocks; task_id += I.num_comp_sms) {
-#endif
             int row_idx, col_idx;
-#ifdef MKERNEL_TCGEN05
-            if (use_supertile)
-                gemm_rs_decode_cluster_task<intra_globals>(pair_id, row_blocks_per_slice,
-                                                           col_blocks, I.dev_idx,
-                                                           row_idx, col_idx);
-            else
-#endif
             gemm_rs_decode_comp_task<intra_globals>(task_id, row_blocks_per_slice,
                                                col_blocks, I.dev_idx,
                                                row_idx, col_idx);
+#endif
             const int ready_idx = row_idx * col_blocks + col_idx;
 #ifdef MKERNEL_TCGEN05
             const int row_idx_base = row_idx;
