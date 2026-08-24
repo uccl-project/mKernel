@@ -74,14 +74,16 @@ struct tensor_allocator {
                 "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32  [%0], %1;\n"
             ::  "l"(reinterpret_cast<uint64_t>(&shared_addr)), "n"(cols)
             );
+            asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n");
         } else {
             asm volatile(
                 "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32  [%0], %1;\n"
                 ::  "l"(reinterpret_cast<uint64_t>(&shared_addr)), "n"(cols)
             );
+            // The relinquish must match the alloc granularity: ptxas rejects a
+            // function that mixes .cta_group::1 and .cta_group::2.
             asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;\n");
         }
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n");
     }
 
     template<ducks::tt::full TT>

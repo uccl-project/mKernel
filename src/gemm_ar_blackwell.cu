@@ -89,6 +89,8 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     __shared__ semaphore epilogue_tmem_finished[config::CONSUMER_WARPS];
     __shared__ semaphore tmem_finished;
 
+    // Published by warp 0 to hand the allocated TMEM base to the rest of the CTA.
+    __shared__ uint32_t tmem_addr;
     tensor_allocator<1, config::NUM_CLUSTERS> tm_alloc{};
 
     // combined phasebits, one bit per barrier array (see the PHASE_BIT_*
@@ -116,6 +118,17 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
         // signal tmem done
         init_semaphore(tmem_finished, 1);
     }
+
+    if (warp_id == 1) {
+        tm_alloc.provision(tmem_addr);
+    }
+
+    // Order the alloc against the barrier that publishes tmem_addr, then give
+    // every thread its own copy of the base address.
+    tensor_before_thread_sync();
+    __syncthreads();
+    tensor_after_thread_sync();
+    tm_alloc.set_addr(tmem_addr);
 
     // flush to ensure the mbarriers are visible
     everyone::tma::cluster::sync();
@@ -336,7 +349,16 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             }
         }
 
-        if (group<8>::warpid() == 0) {
+        // Every epilogue warp has to be done reading TMEM before this CTA tells
+        // its peer it is finished: warp 0 falling out of the tile loop says
+        // nothing about warps 1..EPILOGUE_WARPS-1, and the dealloc below frees
+        // the whole CTA pair's allocation. Barrier 0 is __syncthreads and
+        // 1..EPILOGUE_WARPGROUPS are the per-warpgroup epilogue barriers, so
+        // this takes the next free id.
+        tensor_before_thread_sync();
+        group<config::EPILOGUE_WARPS>::sync(config::EPILOGUE_WARPGROUPS + 1);
+
+        if (group<config::EPILOGUE_WARPS>::warpid() == 0) {
             if (elect_warp_leader()) {
                 tma::cluster::arrive(tmem_finished, 1 - cta_rank);
             }

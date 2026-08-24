@@ -46,6 +46,13 @@ struct config_t {
     static constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
     static constexpr int NUM_CLUSTERS = 2;
 
+    // TMEM is allocated/freed with tcgen05 .cta_group::2, so a cluster has to be
+    // wholly comp or wholly comm. A cluster straddling the split would leave one
+    // CTA waiting on a peer that never allocates.
+    static_assert(NUM_BLOCKS % NUM_CLUSTERS == 0, "The grid must be a whole number of clusters");
+    static_assert(NUM_COMP_SM % NUM_CLUSTERS == 0,
+                  "The comp/comm split must fall on a cluster boundary");
+
     static constexpr int PRODUCER_WARP_ID = EPILOGUE_WARPS;
     static constexpr int FIRST_CONSUMER_WARP_ID = PRODUCER_WARP_ID + PRODUCER_WARPS;
 
