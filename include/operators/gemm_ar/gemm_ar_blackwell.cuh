@@ -200,8 +200,7 @@ void entrypoint(const at::Tensor& A,
                 dist::ParallelBuffer& C,
                 dist::ParallelBuffer& barrier,
                 dist::ParallelBuffer& C_final,
-                const int epoch,
-                int gemm_to_ar_signal_strategy) {
+                const int epoch) {
     const int dev_idx = C.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 

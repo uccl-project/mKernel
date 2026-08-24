@@ -88,7 +88,7 @@ template<bool ACCUMULATE,
          ducks::st_descriptor::input B>
 __device__ static inline void mma_ABt(
     D &d, const A &a, const B &b, semaphore &inputs_finished) {
-    mma<ACCUMULATE, false>(d, a, b, inputs_finished);
+    tcgen05_bf16::mma<ACCUMULATE, false>(d, a, b, inputs_finished);
 }
 
 template<bool ACCUMULATE,
@@ -97,7 +97,7 @@ template<bool ACCUMULATE,
          ducks::st_descriptor::input B>
 __device__ static inline void mma_AB(
     D &d, const A &a, const B &b, semaphore &inputs_finished) {
-    mma<ACCUMULATE, true>(d, a, b, inputs_finished);
+    tcgen05_bf16::mma<ACCUMULATE, true>(d, a, b, inputs_finished);
 }
 
 } // namespace tcgen05_bf16

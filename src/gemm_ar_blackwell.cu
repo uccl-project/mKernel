@@ -87,6 +87,7 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
     __shared__ semaphore mma_finish[fused_globals::PIPELINE_STAGES];
     __shared__ semaphore epilogue_ready[config::CONSUMER_WARPS];
     __shared__ semaphore epilogue_tmem_finished[config::CONSUMER_WARPS];
+    __shared__ semaphore tmem_finished;
 
     tensor_allocator<1, config::NUM_CLUSTERS> tm_alloc{};
 
@@ -111,6 +112,9 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
             // broadcasted back to the mma thread to signal that tmem is ready
             init_semaphore(epilogue_tmem_finished[c], WARPGROUP_WARPS * config::NUM_CLUSTERS, 0);
         }
+
+        // signal tmem done
+        init_semaphore(tmem_finished, 1);
     }
 
     // flush to ensure the mbarriers are visible
@@ -330,6 +334,15 @@ __device__ __forceinline__ void fused_comp_sm(const fused_globals& G) {
                         &G.comp_comm_barrier[G.dev_idx][{c_row_tile, tile_col_id}], G.epoch);
                 }
             }
+        }
+
+        if (group<8>::warpid() == 0) {
+            if (elect_warp_leader()) {
+                tma::cluster::arrive(tmem_finished, 1 - cta_rank);
+            }
+            // Only reach here if we finish with our tmem. Other party as well
+            wait(tmem_finished, 0);
+            tm_alloc.deprovision();
         }
     }
 }
