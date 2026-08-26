@@ -1,9 +1,6 @@
 /**
  * @file
  * @brief Minimal Blackwell tensor-memory types used by BF16 tcgen05 GEMM.
- *
- * This deliberately implements CTA-group 1 only.  Cluster allocation and
- * scaled FP8/FP4 tensor-memory layouts can be added when a kernel needs them.
  */
 #pragma once
 

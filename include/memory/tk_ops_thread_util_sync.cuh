@@ -235,10 +235,7 @@ __device__ static inline void tensor_store_wait() {
     asm volatile("tcgen05.wait::st.sync.aligned;\n");
 }
 
-template<int NCTA>
 __device__ static inline void tensor_commit(semaphore &sem) {
-    static_assert(NCTA == 1,
-                  "the minimal mKernel Blackwell backend supports CTA-group 1 only");
     asm volatile(
         "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
         :: "l"(__cvta_generic_to_shared(&sem))

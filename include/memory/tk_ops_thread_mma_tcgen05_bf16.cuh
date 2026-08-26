@@ -79,7 +79,7 @@ __device__ static inline void mma(
 
     // Release this shared-memory stage only after all tcgen05 instructions
     // that reference it have completed.
-    tensor_commit<1>(inputs_finished);
+    tensor_commit(inputs_finished);
 }
 
 template<bool ACCUMULATE,
