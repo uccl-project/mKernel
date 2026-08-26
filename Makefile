@@ -33,6 +33,26 @@ else
     $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
 endif
 
+# === Target GPU ===
+#   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
+#   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
+GPU ?= hopper
+ifeq ($(GPU),blackwell)
+    ARCH              := -gencode arch=compute_103a,code=sm_103a
+    ARCH_DEFINES      := -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05
+    DEFAULT_CUDA_HOME := /usr/local/cuda-13.2
+    # conda forces a host compiler through NVCC_PREPEND_FLAGS/CXX on some boxes,
+    # which makes nvcc miss system headers; pin the system g++.
+    CCBIN             := -ccbin /usr/bin/g++
+else ifeq ($(GPU),hopper)
+    ARCH              := -gencode arch=compute_90a,code=sm_90a
+    ARCH_DEFINES      := -DKITTENS_HOPPER
+    DEFAULT_CUDA_HOME := /usr/local/cuda-12.9
+    CCBIN             :=
+else
+    $(error Unknown GPU=$(GPU). Use GPU=hopper or GPU=blackwell.)
+endif
+
 # === Tooling ===
 CUDA_HOME       ?= /usr/local/cuda
 CUDA_DRIVER_LIB ?= $(if $(CONDA_PREFIX),$(CONDA_PREFIX)/lib,/lib/x86_64-linux-gnu)

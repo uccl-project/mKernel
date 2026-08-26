@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda_fp4.h>   // for fp4e2m1* named by TK's tensor-memory headers (tcgen05 port)
 #include <string>
 #include <bit>
 
@@ -50,6 +51,23 @@ using fp8e5m2_2 = __nv_fp8x2_e5m2;
  * @brief 4-packed float8 floating-point type.
  */
 using fp8e4m3_4 = __nv_fp8x4_e4m3;
+// --- Added for the sm_103a tcgen05 port -----------------------------------
+// mKernel's original subset kept only the types the Hopper wgmma path needed.
+// TK's tensor-memory (tt) and tcgen05 headers name these, so they must exist
+// even though the bf16 gemm_rs path never instantiates them.
+using int8      = signed char;
+using uint8     = unsigned char;
+using int8_2    = char2;
+using int8_4    = char4;
+using uint8_2   = uchar2;
+using uint8_4   = uchar4;
+using fp8e8m0   = __nv_fp8_e8m0;
+using fp8e8m0_2 = __nv_fp8x2_e8m0;
+using fp8e8m0_4 = __nv_fp8x4_e8m0;
+using fp4e2m1   = __nv_fp4_e2m1;
+using fp4e2m1_2 = __nv_fp4x2_e2m1;
+using fp4e2m1_4 = __nv_fp4x4_e2m1;
+// --------------------------------------------------------------------------
 using fp8e5m2_4 = __nv_fp8x4_e5m2;
 
 

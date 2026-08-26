@@ -218,6 +218,9 @@ template<typename... Args>             inline constexpr uint32_t size_bytes     
 template<typename T, typename... Args> inline constexpr uint32_t size_bytes<T, Args...> = detail::size_info<T>::bytes + size_bytes<Args...>; // recursive case
 
 /* ----------   TCGEN05 synchronization  ---------- */
+// Vendored from ThunderKittens ops/thread/util/sync.cuh for the Blackwell
+// (sm_103a) tcgen05 port of gemm_rs. mKernel's original subset left this
+// section empty because only the Hopper wgmma path was kept.
 
 __device__ static inline void tensor_before_thread_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;\n");
