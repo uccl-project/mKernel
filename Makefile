@@ -150,10 +150,10 @@ plots:
 
 .PHONY: all dispatch-gemm-blackwell run-dispatch-gemm-blackwell clean bench check test-slot-math plots
 
-run_gemm_ar_blackwell : gemm_ar_blackwell
+run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
 
-gemm_ar_blackwell : $(BUILD)/libgemm_ar_blackwell.so
+gemm-ar-blackwell : $(BUILD)/libgemm_ar_blackwell.so
 
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
