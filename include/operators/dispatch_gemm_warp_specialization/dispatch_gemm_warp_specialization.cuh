@@ -21,10 +21,6 @@
 #include "dist/tma.cuh"
 #include "comm/comm.cuh"
 
-#ifdef PROFILE_TIMINGS
-#include "profiling/timings.cuh"
-#endif
-
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -35,39 +31,6 @@ using namespace kittens;
 #endif
 
 namespace moe_dispatch_gemm_warp_specialization {
-
-#ifdef PROFILE_TIMINGS
-enum TimingEvent : uint32_t {
-    EV_CTA_START = 0,
-    EV_CTA_END,
-    EV_DISPATCH_BEGIN,
-    EV_DISPATCH_END,
-    EV_EPILOGUE_BEGIN,
-    EV_EPILOGUE_END,
-    EV_TMA_PRODUCER_BEGIN,
-    EV_TMA_PRODUCER_END,
-    EV_MMA_ISSUER_BEGIN,
-    EV_MMA_ISSUER_END,
-    EV_DISPATCH_WAIT_BEGIN,
-    EV_DISPATCH_WAIT_END,
-    EV_DISPATCH_WORK_DONE,
-    EV_TMA_RING_WAIT_BEGIN,
-    EV_TMA_RING_WAIT_END,
-    EV_TMA_K_LOOP_BEGIN,
-    EV_TMA_K_LOOP_END,
-    EV_MMA_K_LOOP_BEGIN,
-    EV_MMA_K_LOOP_END,
-    EV_EPILOGUE_WAIT_BEGIN,
-    EV_EPILOGUE_WAIT_END,
-    EV_EPILOGUE_TASK_END,
-    EV_DISPATCH_GROUP_SYNC_DONE,
-    EV_DISPATCH_PUBLISH_DONE,
-    EV_DISPATCH_ROUND_SYNC_DONE,
-    // Summary-only events: timestamp stores an accumulated duration in ns.
-    EV_EPILOGUE_TMEM_WAIT_TOTAL,
-    EV_EPILOGUE_STORE_WAIT_TOTAL,
-};
-#endif
 
 // Four full-token buffers leave enough shared memory for the existing four-stage
 // BF16 tcgen05 pipeline. each H=7168 token uses one pull.
@@ -123,9 +86,6 @@ struct warp_specialization_globals {
     int num_ring_blocks;
     int num_local_experts;
     int num_sms;
-#ifdef PROFILE_TIMINGS
-    ::mkernel::timing::TimingRecord *timings;
-#endif
 
     struct pipeline_input {
         A_tile A;
@@ -146,9 +106,6 @@ inline void dispatch_gemm_warp_specialization_impl(
     at::Tensor &weights,
     at::Tensor &outputs,
     int num_sms
-#ifdef PROFILE_TIMINGS
-    , ::mkernel::timing::TimingRecord *timings = nullptr
-#endif
 ) {
     const int dev_idx = pre_tokens.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -231,44 +188,9 @@ inline void dispatch_gemm_warp_specialization_impl(
         .num_ring_blocks = static_cast<int>(num_ring_blocks),
         .num_local_experts = static_cast<int>(weights.size(0)),
         .num_sms = num_sms,
-#ifdef PROFILE_TIMINGS
-        .timings = timings,
-#endif
     };
     launch_warp_specialization(G, stream);
 }
-
-#ifdef PROFILE_TIMINGS
-inline void dispatch_gemm_warp_specialization_profile(
-    dist::ParallelBuffer &pre_tokens,
-    at::Tensor &ring_tokens,
-    at::Tensor &pull_dispatch_indices,
-    at::Tensor &ring_full_epoch,
-    at::Tensor &ring_empty_epoch,
-    at::Tensor &ring_done_tiles,
-    at::Tensor &row_block_to_expert,
-    at::Tensor &weights,
-    at::Tensor &outputs,
-    at::Tensor &timings,
-    int num_sms
-) {
-    const int64_t required_records =
-        static_cast<int64_t>(num_sms) * ::mkernel::timing::EVENTS_PER_BLOCK;
-    TORCH_CHECK(timings.is_cuda() && timings.is_contiguous() &&
-                    timings.scalar_type() == at::kLong,
-                "timings must be a contiguous CUDA int64 tensor");
-    TORCH_CHECK(timings.get_device() == pre_tokens.local_rank_,
-                "timings must be on the same device as pre_tokens");
-    TORCH_CHECK(timings.numel() >= required_records * 2,
-                "timings needs two int64 values per timing record");
-    dispatch_gemm_warp_specialization_impl(
-        pre_tokens, ring_tokens, pull_dispatch_indices,
-        ring_full_epoch, ring_empty_epoch, ring_done_tiles,
-        row_block_to_expert, weights, outputs, num_sms,
-        reinterpret_cast<::mkernel::timing::TimingRecord *>(
-            timings.data_ptr<int64_t>()));
-}
-#endif
 
 inline void dispatch_gemm_warp_specialization(
     dist::ParallelBuffer &pre_tokens,

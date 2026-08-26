@@ -20,7 +20,6 @@
 #include "memory/tk_ops_group_group.cuh"
 #include "dist/tma.cuh"
 #include "comm/comm.cuh"
-#include "profiling/timings.cuh"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -33,25 +32,6 @@ using namespace kittens;
 #endif
 
 namespace moe_dispatch_gemm_blackwell {
-
-#ifdef PROFILE_TIMINGS
-enum TimingEvent : uint32_t {
-    EV_CTA_START = 0,
-    EV_CTA_END,
-    EV_DISPATCH_SLICE_BEGIN,
-    EV_DISPATCH_PULL_DONE,
-    EV_DISPATCH_SLICE_DONE,
-    EV_GEMM_ROW_WAIT_BEGIN,
-    EV_GEMM_ROW_WAIT_DONE,
-    EV_GEMM_TMA_DONE,
-    EV_GEMM_COMPUTE_WAIT_BEGIN,
-    EV_GEMM_COMPUTE_BEGIN,
-    EV_GEMM_COMPUTE_DONE,
-    EV_GEMM_EPILOGUE_WAIT_BEGIN,
-    EV_GEMM_EPILOGUE_BEGIN,
-    EV_GEMM_EPILOGUE_DONE,
-};
-#endif
 
 // 16 * 7168 * sizeof(bf16) = 224 KiB, plus allocator alignment headroom.
 static constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
@@ -99,9 +79,6 @@ struct fused_globals {
     int num_local_experts;
     int num_dispatch_sms;
     int num_gemm_sms;
-#ifdef PROFILE_TIMINGS
-    ::mkernel::timing::TimingRecord *timings;
-#endif
 
     struct pipeline_input {
         A_tile A;
@@ -121,9 +98,6 @@ inline void dispatch_gemm_impl(
     at::Tensor &padded_tokens_per_expert,
     int num_dispatch_sms,
     int num_gemm_sms
-#ifdef PROFILE_TIMINGS
-    , ::mkernel::timing::TimingRecord *timings = nullptr
-#endif
 ) {
     const int dev_idx = pre_tokens.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
@@ -183,44 +157,9 @@ inline void dispatch_gemm_impl(
         .num_local_experts = static_cast<int>(weights.size(0)),
         .num_dispatch_sms = num_dispatch_sms,
         .num_gemm_sms = num_gemm_sms,
-#ifdef PROFILE_TIMINGS
-        .timings = timings,
-#endif
     };
     launch_fused(G, stream);
 }
-
-#ifdef PROFILE_TIMINGS
-inline void dispatch_gemm_profile(
-    dist::ParallelBuffer &pre_tokens,
-    at::Tensor &post_tokens,
-    at::Tensor &pull_dispatch_indices,
-    at::Tensor &row_ready,
-    at::Tensor &weights,
-    at::Tensor &outputs,
-    at::Tensor &padded_tokens_per_expert,
-    at::Tensor &timings,
-    int num_dispatch_sms,
-    int num_gemm_sms
-) {
-    const int64_t required_records =
-        static_cast<int64_t>(num_dispatch_sms + num_gemm_sms) *
-        ::mkernel::timing::EVENTS_PER_BLOCK;
-    TORCH_CHECK(timings.is_cuda() && timings.is_contiguous() &&
-                    timings.scalar_type() == at::kLong,
-                "timings must be a contiguous CUDA int64 tensor");
-    TORCH_CHECK(timings.get_device() == pre_tokens.local_rank_,
-                "timings must be on the same device as pre_tokens");
-    TORCH_CHECK(timings.numel() >= required_records * 2,
-                "timings needs two int64 values per timing record");
-    dispatch_gemm_impl(pre_tokens, post_tokens, pull_dispatch_indices,
-                       row_ready, weights, outputs,
-                       padded_tokens_per_expert, num_dispatch_sms,
-                       num_gemm_sms,
-                       reinterpret_cast<::mkernel::timing::TimingRecord *>(
-                           timings.data_ptr<int64_t>()));
-}
-#endif
 
 inline void dispatch_gemm(
     dist::ParallelBuffer &pre_tokens,

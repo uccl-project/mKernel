@@ -147,15 +147,13 @@ run-dispatch-gemm-blackwell: dispatch-gemm-blackwell
 
 DISPATCH_GEMM_BLACKWELL_HEADERS := \
 	include/operators/dispatch_gemm_blackwell/dispatch_gemm_blackwell.cuh \
-	include/operators/dispatch_gemm_blackwell/session.cuh \
-	include/profiling/timings.cuh
+	include/operators/dispatch_gemm_blackwell/session.cuh
 
 $(BUILD)/libdispatch_gemm_blackwell.so: $(DISPATCH_GEMM_BLACKWELL_HEADERS)
 
 DISPATCH_GEMM_WARP_SPECIALIZATION_HEADERS := \
 	include/operators/dispatch_gemm_warp_specialization/dispatch_gemm_warp_specialization.cuh \
-	include/operators/dispatch_gemm_warp_specialization/session.cuh \
-	include/profiling/timings.cuh
+	include/operators/dispatch_gemm_warp_specialization/session.cuh
 
 $(BUILD)/libdispatch_gemm_warp_specialization.so: $(DISPATCH_GEMM_WARP_SPECIALIZATION_HEADERS)
 
