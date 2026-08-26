@@ -1,11 +1,11 @@
 /**
- * @file dispatch_fc1_mega_blackwell.cu
- * @brief Persistent Mega-MoE-style dispatch + BF16 FC1 for Blackwell.
+ * @file dispatch_gemm_warp_specialization.cu
+ * @brief Persistent warp-specialized dispatch + BF16 FC1 for Blackwell.
  */
 
-#include "operators/dispatch_fc1_mega_blackwell/dispatch_fc1_mega_blackwell.cuh"
+#include "operators/dispatch_gemm_warp_specialization/dispatch_gemm_warp_specialization.cuh"
 
-namespace moe_dispatch_fc1_mega_blackwell {
+namespace moe_dispatch_gemm_warp_specialization {
 
 __device__ __forceinline__ void wait_epoch(int *ptr, uint32_t target) {
     uint32_t value = comm::atomic_u32::acquire_load_gpu(ptr);
@@ -17,37 +17,37 @@ __device__ __forceinline__ void wait_epoch(int *ptr, uint32_t target) {
 
 template <typename DispatchBuffers>
 __device__ inline void dispatch_warpgroup(
-    const mega_globals &G,
+    const warp_specialization_globals &G,
     DispatchBuffers &dispatch_buffers,
-    semaphore (&dispatch_arrived)[mega_globals::NUM_DISPATCH_WARPS]
+    semaphore (&dispatch_arrived)[warp_specialization_globals::NUM_DISPATCH_WARPS]
 ) {
     constexpr int NUM_CHUNKS =
-        mega_globals::H * static_cast<int>(sizeof(bf16)) /
-        mega_globals::PULL_BYTES;
+        warp_specialization_globals::H * static_cast<int>(sizeof(bf16)) /
+        warp_specialization_globals::PULL_BYTES;
     constexpr int UINT4S_PER_CHUNK =
-        mega_globals::PULL_BYTES / static_cast<int>(sizeof(uint4));
+        warp_specialization_globals::PULL_BYTES / static_cast<int>(sizeof(uint4));
 
     const int warp_idx = warpgroup::warpid();
     const int lane = warp::laneid();
     uint32_t barrier_phase = 0;
 
     const int dispatch_group_count =
-        G.num_sms / mega_globals::DISPATCH_CTAS_PER_BLOCK;
+        G.num_sms / warp_specialization_globals::DISPATCH_CTAS_PER_BLOCK;
     const int num_dispatch_ctas =
-        dispatch_group_count * mega_globals::DISPATCH_CTAS_PER_BLOCK;
+        dispatch_group_count * warp_specialization_globals::DISPATCH_CTAS_PER_BLOCK;
     if (static_cast<int>(blockIdx.x) >= num_dispatch_ctas)
         return;
     const int dispatch_cta_rank =
         static_cast<int>(blockIdx.x) %
-        mega_globals::DISPATCH_CTAS_PER_BLOCK;
+        warp_specialization_globals::DISPATCH_CTAS_PER_BLOCK;
     const int dispatch_warp_rank =
-        dispatch_cta_rank * mega_globals::NUM_DISPATCH_WARPS + warp_idx;
+        dispatch_cta_rank * warp_specialization_globals::NUM_DISPATCH_WARPS + warp_idx;
     constexpr int NUM_DISPATCH_GROUP_WARPS =
-        mega_globals::DISPATCH_CTAS_PER_BLOCK *
-        mega_globals::NUM_DISPATCH_WARPS;
+        warp_specialization_globals::DISPATCH_CTAS_PER_BLOCK *
+        warp_specialization_globals::NUM_DISPATCH_WARPS;
 
     for (int row_block = static_cast<int>(blockIdx.x) /
-                             mega_globals::DISPATCH_CTAS_PER_BLOCK;
+                             warp_specialization_globals::DISPATCH_CTAS_PER_BLOCK;
          row_block < G.num_row_blocks;
          row_block += dispatch_group_count) {
         const int slot = row_block % G.num_ring_blocks;
@@ -61,9 +61,9 @@ __device__ inline void dispatch_warpgroup(
         __syncwarp();
 
         for (int row_in_block = dispatch_warp_rank;
-             row_in_block < mega_globals::BLOCK_M;
+             row_in_block < warp_specialization_globals::BLOCK_M;
              row_in_block += NUM_DISPATCH_GROUP_WARPS) {
-            const int dst_row = row_block * mega_globals::BLOCK_M +
+            const int dst_row = row_block * warp_specialization_globals::BLOCK_M +
                                 row_in_block;
             const int src_gpu = G.pull_dispatch_indices[{dst_row, 0}];
             const int src_token = G.pull_dispatch_indices[{dst_row, 1}];
@@ -75,15 +75,15 @@ __device__ inline void dispatch_warpgroup(
                     if (lane == 0) {
                         auto &arrived = dispatch_arrived[warp_idx];
                         ::dist::tma::expect_bytes(
-                            arrived, mega_globals::PULL_BYTES);
+                            arrived, warp_specialization_globals::PULL_BYTES);
                         const bf16 *src =
                             G.pre_tokens[src_gpu].raw_ptr +
-                            static_cast<int64_t>(src_token) * mega_globals::H +
-                            chunk * (mega_globals::PULL_BYTES /
+                            static_cast<int64_t>(src_token) * warp_specialization_globals::H +
+                            chunk * (warp_specialization_globals::PULL_BYTES /
                                      static_cast<int>(sizeof(bf16)));
                         ::dist::tma::bulk_load_async(
                             &dispatch_buffers[warp_idx][0], src,
-                            mega_globals::PULL_BYTES, arrived);
+                            warp_specialization_globals::PULL_BYTES, arrived);
                         wait(arrived, barrier_phase);
                         barrier_phase ^= 1;
                     }
@@ -99,13 +99,13 @@ __device__ inline void dispatch_warpgroup(
 
                 if (lane == 0) {
                     bf16 *dst = G.ring_tokens.raw_ptr +
-                        static_cast<int64_t>(slot * mega_globals::BLOCK_M +
-                                             row_in_block) * mega_globals::H +
-                        chunk * (mega_globals::PULL_BYTES /
+                        static_cast<int64_t>(slot * warp_specialization_globals::BLOCK_M +
+                                             row_in_block) * warp_specialization_globals::H +
+                        chunk * (warp_specialization_globals::PULL_BYTES /
                                  static_cast<int>(sizeof(bf16)));
                     ::dist::tma::bulk_store_async(
                         dst, &dispatch_buffers[warp_idx][0],
-                        mega_globals::PULL_BYTES);
+                        warp_specialization_globals::PULL_BYTES);
                     ::dist::tma::store_async_wait();
                 }
                 __syncwarp();
@@ -123,48 +123,48 @@ __device__ inline void dispatch_warpgroup(
     }
 }
 
-__global__ __launch_bounds__(mega_globals::THREADS, 1)
-void mega_kernel(const __grid_constant__ mega_globals G) {
+__global__ __launch_bounds__(warp_specialization_globals::THREADS, 1)
+void warp_specialized_kernel(const __grid_constant__ warp_specialization_globals G) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator allocator(&__shm[0]);
 
-    mega_globals::pipeline_input (&inputs)[mega_globals::NUM_STAGES] =
-        allocator.allocate<mega_globals::pipeline_input,
-                           mega_globals::NUM_STAGES>();
-    mega_globals::C_tile &C_smem =
-        allocator.allocate<mega_globals::C_tile>();
-    mega_globals::dispatch_chunk
-        (&dispatch_buffers)[mega_globals::NUM_DISPATCH_WARPS] =
-            allocator.allocate<mega_globals::dispatch_chunk,
-                               mega_globals::NUM_DISPATCH_WARPS>();
+    warp_specialization_globals::pipeline_input (&inputs)[warp_specialization_globals::NUM_STAGES] =
+        allocator.allocate<warp_specialization_globals::pipeline_input,
+                           warp_specialization_globals::NUM_STAGES>();
+    warp_specialization_globals::C_tile &C_smem =
+        allocator.allocate<warp_specialization_globals::C_tile>();
+    warp_specialization_globals::dispatch_chunk
+        (&dispatch_buffers)[warp_specialization_globals::NUM_DISPATCH_WARPS] =
+            allocator.allocate<warp_specialization_globals::dispatch_chunk,
+                               warp_specialization_globals::NUM_DISPATCH_WARPS>();
 
-    __shared__ semaphore inputs_arrived[mega_globals::NUM_STAGES];
-    __shared__ semaphore inputs_finished[mega_globals::NUM_STAGES];
-    __shared__ semaphore outputs_arrived[mega_globals::NUM_OUTPUT_STAGES];
-    __shared__ semaphore outputs_finished[mega_globals::NUM_OUTPUT_STAGES];
+    __shared__ semaphore inputs_arrived[warp_specialization_globals::NUM_STAGES];
+    __shared__ semaphore inputs_finished[warp_specialization_globals::NUM_STAGES];
+    __shared__ semaphore outputs_arrived[warp_specialization_globals::NUM_OUTPUT_STAGES];
+    __shared__ semaphore outputs_finished[warp_specialization_globals::NUM_OUTPUT_STAGES];
     __shared__ semaphore
-        dispatch_arrived[mega_globals::NUM_DISPATCH_WARPS];
+        dispatch_arrived[warp_specialization_globals::NUM_DISPATCH_WARPS];
     __shared__ uint32_t tmem_addr;
 
     if (threadIdx.x == 0) {
         #pragma unroll
-        for (int i = 0; i < mega_globals::NUM_STAGES; ++i) {
+        for (int i = 0; i < warp_specialization_globals::NUM_STAGES; ++i) {
             init_semaphore(inputs_arrived[i], 0, 1);
             init_semaphore(inputs_finished[i], 0, 1);
         }
         #pragma unroll
-        for (int i = 0; i < mega_globals::NUM_OUTPUT_STAGES; ++i) {
+        for (int i = 0; i < warp_specialization_globals::NUM_OUTPUT_STAGES; ++i) {
             init_semaphore(outputs_arrived[i], 0, 1);
             init_semaphore(outputs_finished[i], 0, 1);
         }
     }
-    if (threadIdx.x < mega_globals::NUM_DISPATCH_WARPS)
+    if (threadIdx.x < warp_specialization_globals::NUM_DISPATCH_WARPS)
         init_semaphore(dispatch_arrived[threadIdx.x], 0, 1);
     __syncthreads();
 
     tensor_allocator<1> tm_allocator;
-    using C_tmem = tt<float, mega_globals::BLOCK_M,
-                      mega_globals::BLOCK_N>;
+    using C_tmem = tt<float, warp_specialization_globals::BLOCK_M,
+                      warp_specialization_globals::BLOCK_N>;
     const int wg = warpgroup::groupid();
     const int warp_in_wg = warpgroup::warpid();
     const int lane = warp::laneid();
@@ -177,12 +177,12 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
     __syncthreads();
     tensor_after_thread_sync();
     tm_allocator.set_addr(tmem_addr);
-    C_tmem C_tm[mega_globals::NUM_OUTPUT_STAGES] = {
+    C_tmem C_tm[warp_specialization_globals::NUM_OUTPUT_STAGES] = {
         tm_allocator.allocate<C_tmem>(0),
-        tm_allocator.allocate<C_tmem>(mega_globals::BLOCK_N),
+        tm_allocator.allocate<C_tmem>(warp_specialization_globals::BLOCK_N),
     };
 
-    constexpr int COL_BLOCKS = mega_globals::I / mega_globals::BLOCK_N;
+    constexpr int COL_BLOCKS = warp_specialization_globals::I / warp_specialization_globals::BLOCK_N;
     const int num_tasks = G.num_row_blocks * COL_BLOCKS;
 
     if (wg == 0) {
@@ -193,7 +193,7 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
     } else if (wg == 1) {
         // GEMM epilogue warpgroup.
         int output_stage = 0;
-        int output_phase[mega_globals::NUM_OUTPUT_STAGES] = {0, 0};
+        int output_phase[warp_specialization_globals::NUM_OUTPUT_STAGES] = {0, 0};
 
         for (int task_id = static_cast<int>(blockIdx.x);
              task_id < num_tasks; task_id += G.num_sms) {
@@ -208,11 +208,11 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
 
             rt_bf<32, 32> C_reg;
             #pragma unroll
-            for (int n = 0; n < mega_globals::BLOCK_N / 32; ++n) {
+            for (int n = 0; n < warp_specialization_globals::BLOCK_N / 32; ++n) {
                 warpgroup::load_async(
                     C_reg,
                     C_tm[output_stage].template subtile<
-                        tt<float, mega_globals::BLOCK_M, 32>>(0, n * 32));
+                        tt<float, warp_specialization_globals::BLOCK_M, 32>>(0, n * 32));
                 tensor_load_wait();
                 tensor_before_thread_sync();
                 warpgroup::sync(1);
@@ -223,7 +223,7 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
                     ::dist::tma::store_async(
                         G.outputs, C_smem,
                         {row_block,
-                         col_block * (mega_globals::BLOCK_N / 32) + n});
+                         col_block * (warp_specialization_globals::BLOCK_N / 32) + n});
                     ::dist::tma::store_async_wait();
                 }
                 warpgroup::sync(1);
@@ -248,9 +248,9 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
     } else if (wg == 2 && warp_in_wg == 3 && lane == 0) {
         // A/B TMA producer. Tasks are row-major, matching dispatch order.
         int stage = 0;
-        int finished_phase[mega_globals::NUM_STAGES];
+        int finished_phase[warp_specialization_globals::NUM_STAGES];
         #pragma unroll
-        for (int i = 0; i < mega_globals::NUM_STAGES; ++i)
+        for (int i = 0; i < warp_specialization_globals::NUM_STAGES; ++i)
             finished_phase[i] = 1;
 
         for (int task_id = static_cast<int>(blockIdx.x);
@@ -265,34 +265,34 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
             wait_epoch(
                 &G.ring_full_epoch[slot],
                 (generation + 1) *
-                    mega_globals::DISPATCH_CTAS_PER_BLOCK);
+                    warp_specialization_globals::DISPATCH_CTAS_PER_BLOCK);
 
             #pragma unroll 1
-            for (int k = 0; k < mega_globals::H / mega_globals::BLOCK_K;
+            for (int k = 0; k < warp_specialization_globals::H / warp_specialization_globals::BLOCK_K;
                  ++k) {
                 wait(inputs_finished[stage], finished_phase[stage]);
                 finished_phase[stage] ^= 1;
                 ::dist::tma::expect_bytes(
                     inputs_arrived[stage],
-                    sizeof(mega_globals::pipeline_input));
+                    sizeof(warp_specialization_globals::pipeline_input));
                 ::dist::tma::load_async(
                     inputs[stage].A, G.ring_tokens,
                     {slot, k}, inputs_arrived[stage]);
                 ::dist::tma::load_async(
                     inputs[stage].B, G.weights,
                     {expert, k, col_block}, inputs_arrived[stage]);
-                stage = (stage + 1) % mega_globals::NUM_STAGES;
+                stage = (stage + 1) % warp_specialization_globals::NUM_STAGES;
             }
         }
     } else if (wg == 2 && warp_in_wg == 0 && lane == 0) {
         // tcgen05 issue thread.
         int stage = 0;
-        int arrived_phase[mega_globals::NUM_STAGES];
+        int arrived_phase[warp_specialization_globals::NUM_STAGES];
         #pragma unroll
-        for (int i = 0; i < mega_globals::NUM_STAGES; ++i)
+        for (int i = 0; i < warp_specialization_globals::NUM_STAGES; ++i)
             arrived_phase[i] = 0;
         int output_stage = 0;
-        int reuse_phase[mega_globals::NUM_OUTPUT_STAGES] = {1, 1};
+        int reuse_phase[warp_specialization_globals::NUM_OUTPUT_STAGES] = {1, 1};
 
         for (int task_id = static_cast<int>(blockIdx.x);
              task_id < num_tasks; task_id += G.num_sms) {
@@ -300,7 +300,7 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
             reuse_phase[output_stage] ^= 1;
 
             #pragma unroll 1
-            for (int k = 0; k < mega_globals::H / mega_globals::BLOCK_K;
+            for (int k = 0; k < warp_specialization_globals::H / warp_specialization_globals::BLOCK_K;
                  ++k) {
                 wait(inputs_arrived[stage], arrived_phase[stage]);
                 arrived_phase[stage] ^= 1;
@@ -313,7 +313,7 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
                                       inputs[stage].B,
                                       inputs_finished[stage]);
                 }
-                stage = (stage + 1) % mega_globals::NUM_STAGES;
+                stage = (stage + 1) % warp_specialization_globals::NUM_STAGES;
             }
             tensor_commit<1>(outputs_arrived[output_stage]);
             output_stage ^= 1;
@@ -325,16 +325,16 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
         tm_allocator.deprovision();
 }
 
-void launch_mega(const mega_globals &G, cudaStream_t stream) {
+void launch_warp_specialization(const warp_specialization_globals &G, cudaStream_t stream) {
     MKERNEL_CUDACHECK(cudaFuncSetAttribute(
-        mega_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        warp_specialized_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         DYNAMIC_SHARED_MEMORY));
-    mega_kernel<<<G.num_sms, mega_globals::THREADS,
+    warp_specialized_kernel<<<G.num_sms, warp_specialization_globals::THREADS,
                   DYNAMIC_SHARED_MEMORY, stream>>>(G);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 
-}  // namespace moe_dispatch_fc1_mega_blackwell
+}  // namespace moe_dispatch_gemm_warp_specialization
 
-#include "operators/dispatch_fc1_mega_blackwell/session.cuh"
+#include "operators/dispatch_gemm_warp_specialization/session.cuh"
 

@@ -1,8 +1,8 @@
 #pragma once
 
 /**
- * @file dispatch_fc1_mega_blackwell.cuh
- * @brief Mega-MoE-style NVLink dispatch + BF16 FC1 for Blackwell.
+ * @file dispatch_gemm_warp_specialization.cuh
+ * @brief warp-specialized NVLink dispatch + BF16 FC1 for Blackwell.
  *
  * Every resident CTA contains both a dispatch warpgroup and a tcgen05 GEMM
  * pipeline.  Dispatch streams remote rows through small per-warp shared-memory
@@ -21,6 +21,10 @@
 #include "dist/tma.cuh"
 #include "comm/comm.cuh"
 
+#ifdef PROFILE_TIMINGS
+#include "profiling/timings.cuh"
+#endif
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -30,13 +34,46 @@ using namespace kittens;
 #define INTRA_NUM_DEVICES 8
 #endif
 
-namespace moe_dispatch_fc1_mega_blackwell {
+namespace moe_dispatch_gemm_warp_specialization {
+
+#ifdef PROFILE_TIMINGS
+enum TimingEvent : uint32_t {
+    EV_CTA_START = 0,
+    EV_CTA_END,
+    EV_DISPATCH_BEGIN,
+    EV_DISPATCH_END,
+    EV_EPILOGUE_BEGIN,
+    EV_EPILOGUE_END,
+    EV_TMA_PRODUCER_BEGIN,
+    EV_TMA_PRODUCER_END,
+    EV_MMA_ISSUER_BEGIN,
+    EV_MMA_ISSUER_END,
+    EV_DISPATCH_WAIT_BEGIN,
+    EV_DISPATCH_WAIT_END,
+    EV_DISPATCH_WORK_DONE,
+    EV_TMA_RING_WAIT_BEGIN,
+    EV_TMA_RING_WAIT_END,
+    EV_TMA_K_LOOP_BEGIN,
+    EV_TMA_K_LOOP_END,
+    EV_MMA_K_LOOP_BEGIN,
+    EV_MMA_K_LOOP_END,
+    EV_EPILOGUE_WAIT_BEGIN,
+    EV_EPILOGUE_WAIT_END,
+    EV_EPILOGUE_TASK_END,
+    EV_DISPATCH_GROUP_SYNC_DONE,
+    EV_DISPATCH_PUBLISH_DONE,
+    EV_DISPATCH_ROUND_SYNC_DONE,
+    // Summary-only events: timestamp stores an accumulated duration in ns.
+    EV_EPILOGUE_TMEM_WAIT_TOTAL,
+    EV_EPILOGUE_STORE_WAIT_TOTAL,
+};
+#endif
 
 // Four full-token buffers leave enough shared memory for the existing four-stage
 // BF16 tcgen05 pipeline. each H=7168 token uses one pull.
 static constexpr int DYNAMIC_SHARED_MEMORY = 227 * 1024 - 1024;
 
-struct mega_globals {
+struct warp_specialization_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int H = TK_MOE_H;
     static constexpr int I = TK_MOE_I;
@@ -86,6 +123,9 @@ struct mega_globals {
     int num_ring_blocks;
     int num_local_experts;
     int num_sms;
+#ifdef PROFILE_TIMINGS
+    ::mkernel::timing::TimingRecord *timings;
+#endif
 
     struct pipeline_input {
         A_tile A;
@@ -93,9 +133,9 @@ struct mega_globals {
     };
 };
 
-void launch_mega(const mega_globals &G, cudaStream_t stream);
+void launch_warp_specialization(const warp_specialization_globals &G, cudaStream_t stream);
 
-inline void dispatch_fc1_mega_impl(
+inline void dispatch_gemm_warp_specialization_impl(
     dist::ParallelBuffer &pre_tokens,
     at::Tensor &ring_tokens,
     at::Tensor &pull_dispatch_indices,
@@ -105,12 +145,16 @@ inline void dispatch_fc1_mega_impl(
     at::Tensor &row_block_to_expert,
     at::Tensor &weights,
     at::Tensor &outputs,
-    int num_sms) {
+    int num_sms
+#ifdef PROFILE_TIMINGS
+    , ::mkernel::timing::TimingRecord *timings = nullptr
+#endif
+) {
     const int dev_idx = pre_tokens.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev_idx).stream();
 
-    TORCH_CHECK(pre_tokens.local_world_size_ == mega_globals::NUM_DEVICES,
+    TORCH_CHECK(pre_tokens.local_world_size_ == warp_specialization_globals::NUM_DEVICES,
                 "pre_tokens world size must match INTRA_NUM_DEVICES");
     TORCH_CHECK(pull_dispatch_indices.dim() == 2 &&
                 pull_dispatch_indices.size(1) == 2 &&
@@ -120,18 +164,18 @@ inline void dispatch_fc1_mega_impl(
 
     const int64_t num_output_tokens = pull_dispatch_indices.size(0);
     TORCH_CHECK(num_output_tokens > 0 &&
-                num_output_tokens % mega_globals::BLOCK_M == 0,
+                num_output_tokens % warp_specialization_globals::BLOCK_M == 0,
                 "M must be positive and padded to BLOCK_M=128");
-    const int64_t num_row_blocks = num_output_tokens / mega_globals::BLOCK_M;
+    const int64_t num_row_blocks = num_output_tokens / warp_specialization_globals::BLOCK_M;
 
     TORCH_CHECK(ring_tokens.dim() == 2 &&
-                ring_tokens.size(1) == mega_globals::H &&
-                ring_tokens.size(0) % mega_globals::BLOCK_M == 0 &&
+                ring_tokens.size(1) == warp_specialization_globals::H &&
+                ring_tokens.size(0) % warp_specialization_globals::BLOCK_M == 0 &&
                 ring_tokens.scalar_type() == at::kBFloat16 &&
                 ring_tokens.is_contiguous(),
                 "ring_tokens must be contiguous bf16 [RING_BLOCKS*128, H]");
     const int64_t num_ring_blocks =
-        ring_tokens.size(0) / mega_globals::BLOCK_M;
+        ring_tokens.size(0) / warp_specialization_globals::BLOCK_M;
     TORCH_CHECK(num_ring_blocks > 0,
                 "ring_tokens must contain at least one ring block");
 
@@ -151,33 +195,33 @@ inline void dispatch_fc1_mega_impl(
                 row_block_to_expert.is_contiguous(),
                 "row_block_to_expert must be contiguous int32 [M/128]");
     TORCH_CHECK(weights.dim() == 3 &&
-                weights.size(1) == mega_globals::H &&
-                weights.size(2) == mega_globals::I &&
+                weights.size(1) == warp_specialization_globals::H &&
+                weights.size(2) == warp_specialization_globals::I &&
                 weights.scalar_type() == at::kBFloat16 &&
                 weights.is_contiguous(),
                 "weights must be contiguous bf16 [E, H, I]");
     TORCH_CHECK(outputs.sizes() ==
                     at::IntArrayRef({num_output_tokens,
-                                     static_cast<int64_t>(mega_globals::I)}) &&
+                                     static_cast<int64_t>(warp_specialization_globals::I)}) &&
                 outputs.scalar_type() == at::kBFloat16 &&
                 outputs.is_contiguous(),
                 "outputs must be contiguous bf16 [M, I]");
     TORCH_CHECK(
-        num_sms >= mega_globals::DISPATCH_CTAS_PER_BLOCK &&
+        num_sms >= warp_specialization_globals::DISPATCH_CTAS_PER_BLOCK &&
         num_sms <= kittens::num_sms(dev_idx),
         "num_sms must cover one dispatch CTA group and not exceed the device");
 
-    mega_globals G{
+    warp_specialization_globals G{
         .pre_tokens = ::dist::distributed_tensor_from_buffer<
-            mega_globals::pre_tokens_tensor>(pre_tokens),
+            warp_specialization_globals::pre_tokens_tensor>(pre_tokens),
         .ring_tokens = ::dist::local_tensor_from_tensor<
-            mega_globals::ring_tokens_tensor>(ring_tokens),
+            warp_specialization_globals::ring_tokens_tensor>(ring_tokens),
         .pull_dispatch_indices = ::dist::local_tensor_from_tensor<
-            mega_globals::routes_tensor>(pull_dispatch_indices),
+            warp_specialization_globals::routes_tensor>(pull_dispatch_indices),
         .weights = ::dist::local_tensor_from_tensor<
-            mega_globals::weights_tensor>(weights),
+            warp_specialization_globals::weights_tensor>(weights),
         .outputs = ::dist::local_tensor_from_tensor<
-            mega_globals::outputs_tensor>(outputs),
+            warp_specialization_globals::outputs_tensor>(outputs),
         .ring_full_epoch = ring_full_epoch.data_ptr<int>(),
         .ring_empty_epoch = ring_empty_epoch.data_ptr<int>(),
         .ring_done_tiles = ring_done_tiles.data_ptr<int>(),
@@ -187,11 +231,46 @@ inline void dispatch_fc1_mega_impl(
         .num_ring_blocks = static_cast<int>(num_ring_blocks),
         .num_local_experts = static_cast<int>(weights.size(0)),
         .num_sms = num_sms,
+#ifdef PROFILE_TIMINGS
+        .timings = timings,
+#endif
     };
-    launch_mega(G, stream);
+    launch_warp_specialization(G, stream);
 }
 
-inline void dispatch_fc1_mega(
+#ifdef PROFILE_TIMINGS
+inline void dispatch_gemm_warp_specialization_profile(
+    dist::ParallelBuffer &pre_tokens,
+    at::Tensor &ring_tokens,
+    at::Tensor &pull_dispatch_indices,
+    at::Tensor &ring_full_epoch,
+    at::Tensor &ring_empty_epoch,
+    at::Tensor &ring_done_tiles,
+    at::Tensor &row_block_to_expert,
+    at::Tensor &weights,
+    at::Tensor &outputs,
+    at::Tensor &timings,
+    int num_sms
+) {
+    const int64_t required_records =
+        static_cast<int64_t>(num_sms) * ::mkernel::timing::EVENTS_PER_BLOCK;
+    TORCH_CHECK(timings.is_cuda() && timings.is_contiguous() &&
+                    timings.scalar_type() == at::kLong,
+                "timings must be a contiguous CUDA int64 tensor");
+    TORCH_CHECK(timings.get_device() == pre_tokens.local_rank_,
+                "timings must be on the same device as pre_tokens");
+    TORCH_CHECK(timings.numel() >= required_records * 2,
+                "timings needs two int64 values per timing record");
+    dispatch_gemm_warp_specialization_impl(
+        pre_tokens, ring_tokens, pull_dispatch_indices,
+        ring_full_epoch, ring_empty_epoch, ring_done_tiles,
+        row_block_to_expert, weights, outputs, num_sms,
+        reinterpret_cast<::mkernel::timing::TimingRecord *>(
+            timings.data_ptr<int64_t>()));
+}
+#endif
+
+inline void dispatch_gemm_warp_specialization(
     dist::ParallelBuffer &pre_tokens,
     at::Tensor &ring_tokens,
     at::Tensor &pull_dispatch_indices,
@@ -202,11 +281,10 @@ inline void dispatch_fc1_mega(
     at::Tensor &weights,
     at::Tensor &outputs,
     int num_sms) {
-    dispatch_fc1_mega_impl(
+    dispatch_gemm_warp_specialization_impl(
         pre_tokens, ring_tokens, pull_dispatch_indices,
         ring_full_epoch, ring_empty_epoch, ring_done_tiles,
         row_block_to_expert, weights, outputs, num_sms);
 }
 
-}  // namespace moe_dispatch_fc1_mega_blackwell
-
+}  // namespace moe_dispatch_gemm_warp_specialization
