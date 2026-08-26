@@ -46,13 +46,19 @@ struct tt {
         return TT(addr + (row_offset << 16) +
                   col_offset / (4 / static_cast<uint32_t>(sizeof(T))));
     }
+
+    template<ducks::tt::all TT>
+    __device__ inline TT subtile(int col_offset) const {
+        return TT(addr + col_offset / (4 / static_cast<uint32_t>(sizeof(T))));
+    }
 };
 
 template<int Width> using full_tt_fl = tt<float, MAX_TENSOR_ROWS, Width>;
 
-template<int _nblocks_per_sm = 1>
+template<int _nblocks_per_sm = 1, int _ncta = 1>
 struct tensor_allocator {
     static_assert(_nblocks_per_sm == 1 || _nblocks_per_sm == 2);
+    static_assert(_ncta == 1 || _ncta == 2);
     static constexpr int cols =
         ((MAX_TENSOR_COLS / _nblocks_per_sm) / 32) * 32;
 
@@ -63,13 +69,21 @@ struct tensor_allocator {
     // Must be called by one complete warp. shared_addr must live in shared
     // memory and is used to publish the allocated TMEM base to the CTA.
     __device__ inline void provision(uint32_t &shared_addr) {
-        asm volatile(
-            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
-            :: "l"(reinterpret_cast<uint64_t>(&shared_addr)), "n"(cols)
-            : "memory");
-        asm volatile(
-            "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n"
-            ::: "memory");
+       if constexpr (_ncta == 1) {
+            asm volatile(
+                "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32  [%0], %1;\n"
+            ::  "l"(reinterpret_cast<uint64_t>(&shared_addr)), "n"(cols)
+            );
+            asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n");
+        } else {
+            asm volatile(
+                "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32  [%0], %1;\n"
+                ::  "l"(reinterpret_cast<uint64_t>(&shared_addr)), "n"(cols)
+            );
+            // The relinquish must match the alloc granularity: ptxas rejects a
+            // function that mixes .cta_group::1 and .cta_group::2.
+            asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;\n");
+        }
     }
 
     template<ducks::tt::full TT>
@@ -79,10 +93,15 @@ struct tensor_allocator {
 
     // Must be called by one complete warp after every TMEM user has finished.
     __device__ inline void deprovision() {
-        asm volatile(
-            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;\n"
-            :: "r"(addr), "n"(cols)
-            : "memory");
+       if constexpr (_ncta == 1) {
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32  %0, %1;\n"
+            ::  "r"(addr), "n"(cols)
+            );
+        } else {
+            asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32  %0, %1;\n"
+            ::  "r"(addr), "n"(cols)
+            );
+        }
     }
 };
 
