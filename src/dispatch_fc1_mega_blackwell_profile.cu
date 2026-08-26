@@ -1,6 +1,9 @@
 /**
- * @file dispatch_fc1_mega_blackwell.cu
- * @brief Persistent Mega-MoE-style dispatch + BF16 FC1 for Blackwell.
+ * @file dispatch_fc1_mega_blackwell_profile.cu
+ * @brief Instrumented persistent dispatch + BF16 FC1 for Blackwell.
+ *
+ * This is intentionally a standalone kernel implementation. Keep algorithmic
+ * changes synchronized with dispatch_fc1_mega_blackwell.cu.
  */
 
 #include "operators/dispatch_fc1_mega_blackwell/dispatch_fc1_mega_blackwell.cuh"
@@ -20,6 +23,10 @@ __device__ inline void dispatch_warpgroup(
     const mega_globals &G,
     DispatchBuffers &dispatch_buffers,
     semaphore (&dispatch_arrived)[mega_globals::NUM_DISPATCH_WARPS]
+#ifdef PROFILE_TIMINGS
+    , uint64_t (&work_done_timestamps)[mega_globals::NUM_DISPATCH_WARPS]
+    , uint32_t *timing_head
+#endif
 ) {
     constexpr int NUM_CHUNKS =
         mega_globals::H * static_cast<int>(sizeof(bf16)) /
@@ -53,11 +60,26 @@ __device__ inline void dispatch_warpgroup(
         const int slot = row_block % G.num_ring_blocks;
         const uint32_t generation =
             static_cast<uint32_t>(row_block / G.num_ring_blocks);
+#ifdef PROFILE_TIMINGS
+        const uint32_t timing_payload =
+            (static_cast<uint32_t>(warp_idx) << 28) |
+            (static_cast<uint32_t>(row_block) & 0x0FFFFFFFu);
+        if (lane == 0) {
+            MKERNEL_TIMING_EMIT(G.timings, timing_head,
+                                EV_DISPATCH_WAIT_BEGIN, timing_payload);
+        }
+#endif
 
         // Every dispatch warp waits independently. This avoids a full-CTA
         // barrier with the concurrently running GEMM roles.
         if (lane == 0)
             wait_epoch(&G.ring_empty_epoch[slot], generation);
+#ifdef PROFILE_TIMINGS
+        if (lane == 0) {
+            MKERNEL_TIMING_EMIT(G.timings, timing_head,
+                                EV_DISPATCH_WAIT_END, timing_payload);
+        }
+#endif
         __syncwarp();
 
         for (int row_in_block = dispatch_warp_rank;
@@ -114,12 +136,53 @@ __device__ inline void dispatch_warpgroup(
 
         // Each CTA contributes once after its four dispatch warps finish.
         // The GEMM producer waits for all cooperating CTA contributions.
+#ifdef PROFILE_TIMINGS
+        if (lane == 0) {
+            work_done_timestamps[warp_idx] =
+                ::mkernel::timing::globaltimer_ns();
+        }
+        uint64_t group_sync_done_ts = 0;
+        uint64_t publish_done_ts = 0;
+#endif
         warpgroup::sync(4);
         if (warp_idx == 0 && lane == 0) {
+#ifdef PROFILE_TIMINGS
+            group_sync_done_ts = ::mkernel::timing::globaltimer_ns();
+#endif
             comm::atomic_u32::release_add_gpu(
                 &G.ring_full_epoch[slot], 1);
+#ifdef PROFILE_TIMINGS
+            publish_done_ts = ::mkernel::timing::globaltimer_ns();
+#endif
         }
         warpgroup::sync(4);
+#ifdef PROFILE_TIMINGS
+        if (warp_idx == 0 && lane == 0) {
+            const uint64_t round_sync_done_ts =
+                ::mkernel::timing::globaltimer_ns();
+            const uint32_t row_payload = static_cast<uint32_t>(row_block);
+            #pragma unroll
+            for (int timing_warp = 0;
+                 timing_warp < mega_globals::NUM_DISPATCH_WARPS;
+                 ++timing_warp) {
+                const uint32_t work_payload =
+                    (static_cast<uint32_t>(timing_warp) << 28) |
+                    row_payload;
+                MKERNEL_TIMING_EMIT_AT(
+                    G.timings, timing_head, EV_DISPATCH_WORK_DONE,
+                    work_payload, work_done_timestamps[timing_warp]);
+            }
+            MKERNEL_TIMING_EMIT_AT(
+                G.timings, timing_head, EV_DISPATCH_GROUP_SYNC_DONE,
+                row_payload, group_sync_done_ts);
+            MKERNEL_TIMING_EMIT_AT(
+                G.timings, timing_head, EV_DISPATCH_PUBLISH_DONE,
+                row_payload, publish_done_ts);
+            MKERNEL_TIMING_EMIT_AT(
+                G.timings, timing_head, EV_DISPATCH_ROUND_SYNC_DONE,
+                row_payload, round_sync_done_ts);
+        }
+#endif
     }
 }
 
@@ -145,6 +208,16 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
     __shared__ semaphore
         dispatch_arrived[mega_globals::NUM_DISPATCH_WARPS];
     __shared__ uint32_t tmem_addr;
+#ifdef PROFILE_TIMINGS
+    __shared__ uint64_t
+        dispatch_work_done_timestamps[mega_globals::NUM_DISPATCH_WARPS];
+    __shared__ uint32_t timing_head;
+    if (threadIdx.x == 0) {
+        timing_head = 0;
+        MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                            EV_CTA_START, ::mkernel::timing::smid());
+    }
+#endif
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -188,10 +261,31 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
     if (wg == 0) {
         // Communication producer. It progresses independently of all GEMM
         // roles and only synchronizes its own four warps.
+#ifdef PROFILE_TIMINGS
+        if (warp_in_wg == 0 && lane == 0) {
+            MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                EV_DISPATCH_BEGIN, 0);
+        }
+#endif
         dispatch_warpgroup(G, dispatch_buffers, dispatch_arrived
+#ifdef PROFILE_TIMINGS
+                           , dispatch_work_done_timestamps, &timing_head
+#endif
         );
+#ifdef PROFILE_TIMINGS
+        if (warp_in_wg == 0 && lane == 0) {
+            MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                EV_DISPATCH_END, 0);
+        }
+#endif
     } else if (wg == 1) {
         // GEMM epilogue warpgroup.
+#ifdef PROFILE_TIMINGS
+        if (warp_in_wg == 0 && lane == 0) {
+            MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                EV_EPILOGUE_BEGIN, 0);
+        }
+#endif
         int output_stage = 0;
         int output_phase[mega_globals::NUM_OUTPUT_STAGES] = {0, 0};
 
@@ -202,29 +296,63 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
             const int slot = row_block % G.num_ring_blocks;
             const uint32_t generation =
                 static_cast<uint32_t>(row_block / G.num_ring_blocks);
+#ifdef PROFILE_TIMINGS
+            const uint32_t timing_task = static_cast<uint32_t>(task_id);
+            uint64_t epilogue_tmem_wait_ns = 0;
+            uint64_t epilogue_store_wait_ns = 0;
+            if (warp_in_wg == 0 && lane == 0) {
+                MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                    EV_EPILOGUE_WAIT_BEGIN, timing_task);
+            }
+#endif
 
             wait(outputs_arrived[output_stage], output_phase[output_stage]);
             output_phase[output_stage] ^= 1;
+#ifdef PROFILE_TIMINGS
+            if (warp_in_wg == 0 && lane == 0) {
+                MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                    EV_EPILOGUE_WAIT_END, timing_task);
+            }
+#endif
 
             rt_bf<32, 32> C_reg;
             #pragma unroll
             for (int n = 0; n < mega_globals::BLOCK_N / 32; ++n) {
+#ifdef PROFILE_TIMINGS
+                uint64_t tmem_wait_begin = 0;
+                if (warp_in_wg == 0 && lane == 0)
+                    tmem_wait_begin = ::mkernel::timing::globaltimer_ns();
+#endif
                 warpgroup::load_async(
                     C_reg,
                     C_tm[output_stage].template subtile<
                         tt<float, mega_globals::BLOCK_M, 32>>(0, n * 32));
                 tensor_load_wait();
+#ifdef PROFILE_TIMINGS
+                if (warp_in_wg == 0 && lane == 0) {
+                    epilogue_tmem_wait_ns +=
+                        ::mkernel::timing::globaltimer_ns() - tmem_wait_begin;
+                }
+#endif
                 tensor_before_thread_sync();
                 warpgroup::sync(1);
                 warpgroup::store(C_smem, C_reg);
                 warpgroup::sync(1);
 
                 if (warp_in_wg == 0 && lane == 0) {
+#ifdef PROFILE_TIMINGS
+                    const uint64_t store_wait_begin =
+                        ::mkernel::timing::globaltimer_ns();
+#endif
                     ::dist::tma::store_async(
                         G.outputs, C_smem,
                         {row_block,
                          col_block * (mega_globals::BLOCK_N / 32) + n});
                     ::dist::tma::store_async_wait();
+#ifdef PROFILE_TIMINGS
+                    epilogue_store_wait_ns +=
+                        ::mkernel::timing::globaltimer_ns() - store_wait_begin;
+#endif
                 }
                 warpgroup::sync(1);
             }
@@ -242,17 +370,38 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
                     comm::atomic_u32::release_store_gpu(
                         &G.ring_empty_epoch[slot], generation + 1);
                 }
+#ifdef PROFILE_TIMINGS
+                MKERNEL_TIMING_EMIT_AT(
+                    G.timings, &timing_head,
+                    EV_EPILOGUE_TMEM_WAIT_TOTAL, timing_task,
+                    epilogue_tmem_wait_ns);
+                MKERNEL_TIMING_EMIT_AT(
+                    G.timings, &timing_head,
+                    EV_EPILOGUE_STORE_WAIT_TOTAL, timing_task,
+                    epilogue_store_wait_ns);
+                MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                    EV_EPILOGUE_TASK_END, timing_task);
+#endif
             }
             output_stage ^= 1;
         }
+#ifdef PROFILE_TIMINGS
+        if (warp_in_wg == 0 && lane == 0) {
+            MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                EV_EPILOGUE_END, 0);
+        }
+#endif
     } else if (wg == 2 && warp_in_wg == 3 && lane == 0) {
         // A/B TMA producer. Tasks are row-major, matching dispatch order.
+#ifdef PROFILE_TIMINGS
+        MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                            EV_TMA_PRODUCER_BEGIN, 0);
+#endif
         int stage = 0;
         int finished_phase[mega_globals::NUM_STAGES];
         #pragma unroll
         for (int i = 0; i < mega_globals::NUM_STAGES; ++i)
             finished_phase[i] = 1;
-
         for (int task_id = static_cast<int>(blockIdx.x);
              task_id < num_tasks; task_id += G.num_sms) {
             const int row_block = task_id / COL_BLOCKS;
@@ -261,11 +410,22 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
             const int slot = row_block % G.num_ring_blocks;
             const uint32_t generation =
                 static_cast<uint32_t>(row_block / G.num_ring_blocks);
+#ifdef PROFILE_TIMINGS
+            const uint32_t timing_task = static_cast<uint32_t>(task_id);
+            MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                EV_TMA_RING_WAIT_BEGIN, timing_task);
+#endif
 
             wait_epoch(
                 &G.ring_full_epoch[slot],
                 (generation + 1) *
                     mega_globals::DISPATCH_CTAS_PER_BLOCK);
+#ifdef PROFILE_TIMINGS
+            MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                                EV_TMA_RING_WAIT_END, timing_task);
+            const uint64_t tma_k_loop_begin =
+                ::mkernel::timing::globaltimer_ns();
+#endif
 
             #pragma unroll 1
             for (int k = 0; k < mega_globals::H / mega_globals::BLOCK_K;
@@ -283,9 +443,27 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
                     {expert, k, col_block}, inputs_arrived[stage]);
                 stage = (stage + 1) % mega_globals::NUM_STAGES;
             }
+#ifdef PROFILE_TIMINGS
+            const uint64_t tma_k_loop_end =
+                ::mkernel::timing::globaltimer_ns();
+            MKERNEL_TIMING_EMIT_AT(
+                G.timings, &timing_head, EV_TMA_K_LOOP_BEGIN,
+                timing_task, tma_k_loop_begin);
+            MKERNEL_TIMING_EMIT_AT(
+                G.timings, &timing_head, EV_TMA_K_LOOP_END,
+                timing_task, tma_k_loop_end);
+#endif
         }
+#ifdef PROFILE_TIMINGS
+        MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                            EV_TMA_PRODUCER_END, 0);
+#endif
     } else if (wg == 2 && warp_in_wg == 0 && lane == 0) {
         // tcgen05 issue thread.
+#ifdef PROFILE_TIMINGS
+        MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                            EV_MMA_ISSUER_BEGIN, 0);
+#endif
         int stage = 0;
         int arrived_phase[mega_globals::NUM_STAGES];
         #pragma unroll
@@ -293,11 +471,17 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
             arrived_phase[i] = 0;
         int output_stage = 0;
         int reuse_phase[mega_globals::NUM_OUTPUT_STAGES] = {1, 1};
-
         for (int task_id = static_cast<int>(blockIdx.x);
              task_id < num_tasks; task_id += G.num_sms) {
+#ifdef PROFILE_TIMINGS
+            const uint32_t timing_task = static_cast<uint32_t>(task_id);
+#endif
             wait(outputs_finished[output_stage], reuse_phase[output_stage]);
             reuse_phase[output_stage] ^= 1;
+#ifdef PROFILE_TIMINGS
+            const uint64_t mma_k_loop_begin =
+                ::mkernel::timing::globaltimer_ns();
+#endif
 
             #pragma unroll 1
             for (int k = 0; k < mega_globals::H / mega_globals::BLOCK_K;
@@ -315,12 +499,34 @@ void mega_kernel(const __grid_constant__ mega_globals G) {
                 }
                 stage = (stage + 1) % mega_globals::NUM_STAGES;
             }
+#ifdef PROFILE_TIMINGS
+            const uint64_t mma_k_loop_end =
+                ::mkernel::timing::globaltimer_ns();
+#endif
             tensor_commit<1>(outputs_arrived[output_stage]);
+#ifdef PROFILE_TIMINGS
+            MKERNEL_TIMING_EMIT_AT(
+                G.timings, &timing_head, EV_MMA_K_LOOP_BEGIN,
+                timing_task, mma_k_loop_begin);
+            MKERNEL_TIMING_EMIT_AT(
+                G.timings, &timing_head, EV_MMA_K_LOOP_END,
+                timing_task, mma_k_loop_end);
+#endif
             output_stage ^= 1;
         }
+#ifdef PROFILE_TIMINGS
+        MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                            EV_MMA_ISSUER_END, 0);
+#endif
     }
 
     __syncthreads();
+#ifdef PROFILE_TIMINGS
+    if (threadIdx.x == 0) {
+        MKERNEL_TIMING_EMIT(G.timings, &timing_head,
+                            EV_CTA_END, ::mkernel::timing::smid());
+    }
+#endif
     if (wg == 2 && warp_in_wg == 0)
         tm_allocator.deprovision();
 }
@@ -337,4 +543,3 @@ void launch_mega(const mega_globals &G, cudaStream_t stream) {
 }  // namespace moe_dispatch_fc1_mega_blackwell
 
 #include "operators/dispatch_fc1_mega_blackwell/session.cuh"
-
