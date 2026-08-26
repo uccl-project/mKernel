@@ -11,34 +11,6 @@ namespace kittens {
 namespace detail {
 namespace tcgen05_bf16 {
 
-template<int N, bool TRANS_B = false>
-__device__ static inline constexpr uint32_t instruction_descriptor_2sm() {
-    static_assert(N >= 16 && N <= 256 && N % 16 == 0);
-    uint32_t desc = 0;
-    desc |= 0b01u << 4;
-    desc |= 0b001u << 7;
-    desc |= 0b001u << 10;
-    desc |= 1u << 15;                // swapped weight operand is MN-major
-    desc |= static_cast<uint32_t>(TRANS_B) << 16;
-    desc |= static_cast<uint32_t>(N >> 3) << 17;
-    desc |= static_cast<uint32_t>(256 >> 4) << 24;
-    return desc;
-}
-
-template<bool ACCUMULATE>
-__device__ static inline void issue_2sm(
-    uint32_t d_addr, uint64_t a_desc, uint64_t b_desc, uint32_t idesc) {
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        "setp.eq.u32 p, 1, %4;\n"
-        "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n"
-        "}\n"
-        :: "r"(d_addr), "l"(a_desc), "l"(b_desc), "r"(idesc),
-           "n"(ACCUMULATE ? 1 : 0)
-        : "memory");
-}
-
 template<int M, int N, bool TRANS_B>
 __device__ static inline constexpr uint32_t instruction_descriptor() {
     static_assert(M == 64 || M == 128);
@@ -107,7 +79,7 @@ __device__ static inline void mma(
 
     // Release this shared-memory stage only after all tcgen05 instructions
     // that reference it have completed.
-    tensor_commit<1>(inputs_finished);
+    tensor_commit(inputs_finished);
 }
 
 template<bool ACCUMULATE,

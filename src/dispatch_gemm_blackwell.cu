@@ -314,7 +314,7 @@ __device__ inline void gemm_sm(const fused_globals &G, int worker) {
                 }
                 stage = (stage + 1) % fused_globals::PIPELINE_STAGES;
             }
-            tensor_commit<1>(outputs_arrived[output_stage]);
+            tensor_commit(outputs_arrived[output_stage]);
             output_stage ^= 1;
         }
     }
