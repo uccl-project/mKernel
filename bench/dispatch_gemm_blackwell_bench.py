@@ -179,16 +179,16 @@ def make_problem(
             (padded_rows, I), device="cuda", dtype=torch.bfloat16),
     }
     if specialization == "warp":
+        ring_state = torch.zeros(
+            (3, ring_blocks), device="cuda", dtype=torch.int32)
         problem.update({
             "ring_tokens": torch.empty(
                 (ring_blocks * ROW_BLOCK, H),
                 device="cuda", dtype=torch.bfloat16),
-            "ring_full": torch.zeros(
-                ring_blocks, device="cuda", dtype=torch.int32),
-            "ring_empty": torch.zeros(
-                ring_blocks, device="cuda", dtype=torch.int32),
-            "ring_done": torch.zeros(
-                ring_blocks, device="cuda", dtype=torch.int32),
+            "ring_state": ring_state,
+            "ring_full": ring_state[0],
+            "ring_empty": ring_state[1],
+            "ring_done": ring_state[2],
         })
     else:
         problem.update({
@@ -203,9 +203,7 @@ def make_problem(
 
 def reset_workspace(problem: dict[str, object], specialization: str) -> None:
     if specialization == "warp":
-        problem["ring_full"].zero_()
-        problem["ring_empty"].zero_()
-        problem["ring_done"].zero_()
+        problem["ring_state"].zero_()
     else:
         problem["row_ready"].zero_()
 
