@@ -15,6 +15,7 @@
 #include "tk_types_shared_descriptor.cuh"
 #include "tk_types_tensor.cuh"
 #include "tk_types_global_util.cuh"
+#include "tk_types_tensor.cuh"
 
 namespace kittens {
 
