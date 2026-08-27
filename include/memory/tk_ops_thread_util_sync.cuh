@@ -225,24 +225,27 @@ template<typename T, typename... Args> inline constexpr uint32_t size_bytes<T, A
 __device__ static inline void tensor_before_thread_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;\n");
 }
-
 __device__ static inline void tensor_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;\n");
 }
-
-__device__ static inline void tensor_load_wait() {
-    asm volatile("tcgen05.wait::ld.sync.aligned;\n");
+__device__ inline static void tensor_load_wait() {
+   asm volatile("tcgen05.wait::ld.sync.aligned;");
 }
-
-__device__ static inline void tensor_store_wait() {
-    asm volatile("tcgen05.wait::st.sync.aligned;\n");
+__device__ inline static void tensor_store_wait() {
+   asm volatile("tcgen05.wait::st.sync.aligned;");
 }
-
-__device__ static inline void tensor_commit(semaphore &sem) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
-        :: "l"(__cvta_generic_to_shared(&sem))
-        : "memory");
+template <int ncta>
+__device__ static inline void tensor_commit(kittens::semaphore &sem, uint16_t dst_cta_mask = 0b11) {
+    if constexpr (ncta == 1) {
+        asm volatile(
+            "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
+        ::  "l"(__cvta_generic_to_shared(&sem)));
+    }
+    else {
+        asm volatile(
+            "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;\n"
+        ::  "l"(__cvta_generic_to_shared(&sem)), "h"(dst_cta_mask));
+    }
 }
 
 } // namespace kittens

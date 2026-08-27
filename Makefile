@@ -8,8 +8,6 @@
 #                  — build the selected 8-GPU B300 implementation
 #   make run-dispatch-gemm-blackwell SPECIALIZATION=sm|warp
 #                  — build and benchmark the selected implementation
-#   make dispatch-gemm-warp-specialization
-#                  — build the 8-GPU B300 dispatch + warp-specialized kernel
 #   make check     — run correctness check across all 5 kernels
 #   make bench     — run wall-time bench across all 5 kernels
 #   make plots     — regenerate TFLOPS bar charts under plots/
@@ -54,8 +52,7 @@ else
 endif
 
 # === Tooling ===
-CUDA_HOME       ?= /usr/local/cuda
-CUDA_DRIVER_LIB ?= $(if $(CONDA_PREFIX),$(CONDA_PREFIX)/lib,/lib/x86_64-linux-gnu)
+CUDA_HOME       ?= $(DEFAULT_CUDA_HOME)
 EFA_HOME        ?= /opt/amazon/efa
 NVCC            := $(CUDA_HOME)/bin/nvcc
 # Python with torch installed. Override with `PYTHON=/path/to/python`.
@@ -73,40 +70,15 @@ PY_INC          := $(shell $(PYTHON) -c "import sysconfig; print('-I'+sysconfig.
 TORCH_INC       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(' '.join('-I'+p for p in e.include_paths()))")
 TORCH_LIB       := $(shell $(PYTHON) -c "import torch.utils.cpp_extension as e; print(e.library_paths()[0])")
 
-# === Common compile flags ===
-ARCH            := -gencode arch=compute_90a,code=sm_90a
-# dispatch_gemm_blackwell uses tcgen05 and must be compiled for the native
-# Blackwell architecture. B300 is SM 10.3; override BLACKWELL_SM for another
-# Blackwell GPU (for example BLACKWELL_SM=100).
-BLACKWELL_SM ?= 103
-ARCH_dispatch_gemm_blackwell := \
-    -gencode arch=compute_$(BLACKWELL_SM)a,code=sm_$(BLACKWELL_SM)a
-ARCH_dispatch_gemm_warp_specialization := $(ARCH_dispatch_gemm_blackwell)
 # INTRA_NUM_DEVICES = GPUs per logical node (multicast group size). Default 8
 # matches an 8-GPU-per-node deployment. Override to test emulated multinode
 # (e.g. `make INTRA_NUM_DEVICES=4 all` for 4 GPUs / "node").
 INTRA_NUM_DEVICES ?= 8
-BLACKWELL_INTRA_NUM_DEVICES ?= 8
-INTRA_NUM_DEVICES_dispatch_gemm_blackwell := $(BLACKWELL_INTRA_NUM_DEVICES)
-INTRA_NUM_DEVICES_dispatch_gemm_warp_specialization := $(BLACKWELL_INTRA_NUM_DEVICES)
-
-# $* is available while expanding the pattern-rule recipe below. Per-target
-# values keep existing kernels on ARCH/INTRA_NUM_DEVICES while allowing the
-# optional Blackwell kernel to select its native architecture and domain.
-TARGET_ARCH     = $(or $(ARCH_$*),$(ARCH))
-TARGET_INTRA_NUM_DEVICES = $(or $(INTRA_NUM_DEVICES_$*),$(INTRA_NUM_DEVICES))
-# The Blackwell kernel is intra-node-only. Keep its direct target independent
-# of the repository-wide EFA default so it works on the B300/CX7 machine with
-# a plain make dispatch-gemm-blackwell.
-BLACKWELL_INTRANODE_KERNELS := dispatch_gemm_blackwell dispatch_gemm_warp_specialization
-TARGET_BACKEND_DEFINES = $(if $(filter $*,$(BLACKWELL_INTRANODE_KERNELS)),-DINTERNODE_BACKEND_IBVERBS,$(BACKEND_DEFINES))
-TARGET_BACKEND_LIBS = $(if $(filter $*,$(BLACKWELL_INTRANODE_KERNELS)),-libverbs,$(BACKEND_LIBS))
-COMMON_DEFINES  = -DKITTENS_HOPPER -DINTRA_NUM_DEVICES=$(TARGET_INTRA_NUM_DEVICES) $(TARGET_BACKEND_DEFINES)
-COMMON_FLAGS    = -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(TARGET_ARCH)
-LDFLAGS         = -shared -L$(CUDA_DRIVER_LIB) -lcuda $(TARGET_BACKEND_LIBS) \
+COMMON_DEFINES  := $(ARCH_DEFINES) -DINTRA_NUM_DEVICES=$(INTRA_NUM_DEVICES) $(BACKEND_DEFINES)
+COMMON_FLAGS    := -O3 -std=c++20 --use_fast_math --extended-lambda --expt-relaxed-constexpr $(ARCH) $(CCBIN)
+LDFLAGS         := -shared -lcuda $(BACKEND_LIBS) \
                    -L$(TORCH_LIB) -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python \
-                   -Xlinker -rpath -Xlinker $(CUDA_DRIVER_LIB) \
-                   -Xlinker -rpath -Xlinker $(TORCH_LIB)
+                   -Xlinker -rpath -Xlinker $(TORCH_LIB) -L$(CUDA_HOME)/lib
 
 COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 
@@ -161,7 +133,7 @@ dispatch-gemm-warp-specialization: $(BUILD)/libdispatch_gemm_warp_specialization
 BLACKWELL_BENCH_ARGS ?= --check
 run-dispatch-gemm-blackwell: dispatch-gemm-blackwell
 	$(PYTHON) -m torch.distributed.run --standalone \
-	    --nproc-per-node=$(BLACKWELL_INTRA_NUM_DEVICES) \
+	    --nproc-per-node=$(INTRA_NUM_DEVICES) \
 	    bench/dispatch_gemm_blackwell_bench.py \
 	        --specialization $(SPECIALIZATION) $(BLACKWELL_BENCH_ARGS)
 
@@ -205,4 +177,14 @@ plots:
 
 .PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
-	clean bench check test-slot-math plots
+	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
+	test-slot-math plots
+
+run-gemm-ar-blackwell : gemm_ar_blackwell
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
+
+gemm-ar-blackwell : $(BUILD)/libgemm_ar_blackwell.so
+
+$(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@

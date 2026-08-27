@@ -315,7 +315,7 @@ void warp_specialized_kernel(const __grid_constant__ warp_specialization_globals
                 }
                 stage = (stage + 1) % warp_specialization_globals::NUM_STAGES;
             }
-            tensor_commit(outputs_arrived[output_stage]);
+            tensor_commit<1>(outputs_arrived[output_stage]);
             output_stage ^= 1;
         }
     }
@@ -337,4 +337,3 @@ void launch_warp_specialization(const warp_specialization_globals &G, cudaStream
 }  // namespace moe_dispatch_gemm_warp_specialization
 
 #include "operators/dispatch_gemm_warp_specialization/session.cuh"
-
