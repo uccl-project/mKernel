@@ -4,10 +4,10 @@
 #   make all       — build all 5 .so's into build/
 #   make ENABLE_DISPATCH_GEMM_BLACKWELL=1 all
 #                  — also build the intra-node Blackwell dispatch+GEMM kernel
-#   make dispatch-gemm-blackwell
-#                  — directly build the 8-GPU B300 kernel
-#   make run-dispatch-gemm-blackwell
-#                  — build it and run its 8-GPU correctness benchmark
+#   make dispatch-gemm-blackwell SPECIALIZATION=sm|warp
+#                  — build the selected 8-GPU B300 implementation
+#   make run-dispatch-gemm-blackwell SPECIALIZATION=sm|warp
+#                  — build and benchmark the selected implementation
 #   make check     — run correctness check across all 5 kernels
 #   make bench     — run wall-time bench across all 5 kernels
 #   make plots     — regenerate TFLOPS bar charts under plots/
@@ -98,6 +98,7 @@ DEFS_gemm_ar        :=
 TK_MOE_NUM_NODES ?= 2
 DEFS_dispatch_gemm  := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 DEFS_dispatch_gemm_blackwell := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
+DEFS_dispatch_gemm_warp_specialization := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
 DEFS_ring_attention :=
 DEFS_gemm_rs        :=
 DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
@@ -108,19 +109,45 @@ SRC   := src
 
 KERNELS := dispatch_gemm gemm_rs ag_gemm gemm_ar ring_attention dispatch_gemm_glu_combine
 
+SPECIALIZATION ?= sm
+ifeq ($(SPECIALIZATION),warp)
+BLACKWELL_SPECIALIZATION_KERNEL := dispatch_gemm_warp_specialization
+else ifeq ($(SPECIALIZATION),sm)
+BLACKWELL_SPECIALIZATION_KERNEL := dispatch_gemm_blackwell
+else
+$(error Unknown SPECIALIZATION=$(SPECIALIZATION). Use SPECIALIZATION=warp or SPECIALIZATION=sm.)
+endif
+
 ENABLE_DISPATCH_GEMM_BLACKWELL ?= 0
 ifeq ($(ENABLE_DISPATCH_GEMM_BLACKWELL),1)
-KERNELS += dispatch_gemm_blackwell
+KERNELS += $(BLACKWELL_SPECIALIZATION_KERNEL)
 endif
 all: $(addprefix $(BUILD)/lib,$(addsuffix .so,$(KERNELS)))
 
-dispatch-gemm-blackwell: $(BUILD)/libdispatch_gemm_blackwell.so
+dispatch-gemm-blackwell: $(BUILD)/lib$(BLACKWELL_SPECIALIZATION_KERNEL).so
+
+dispatch-gemm-sm-specialization: $(BUILD)/libdispatch_gemm_blackwell.so
+
+dispatch-gemm-warp-specialization: $(BUILD)/libdispatch_gemm_warp_specialization.so
 
 BLACKWELL_BENCH_ARGS ?= --check
 run-dispatch-gemm-blackwell: dispatch-gemm-blackwell
 	$(PYTHON) -m torch.distributed.run --standalone \
-	    --nproc-per-node=$(BLACKWELL_INTRA_NUM_DEVICES) \
-	    bench/dispatch_gemm_blackwell_bench.py $(BLACKWELL_BENCH_ARGS)
+	    --nproc-per-node=$(INTRA_NUM_DEVICES) \
+	    bench/dispatch_gemm_blackwell_bench.py \
+	        --specialization $(SPECIALIZATION) $(BLACKWELL_BENCH_ARGS)
+
+DISPATCH_GEMM_BLACKWELL_HEADERS := \
+	include/operators/dispatch_gemm_blackwell/dispatch_gemm_blackwell.cuh \
+	include/operators/dispatch_gemm_blackwell/session.cuh
+
+$(BUILD)/libdispatch_gemm_blackwell.so: $(DISPATCH_GEMM_BLACKWELL_HEADERS)
+
+DISPATCH_GEMM_WARP_SPECIALIZATION_HEADERS := \
+	include/operators/dispatch_gemm_warp_specialization/dispatch_gemm_warp_specialization.cuh \
+	include/operators/dispatch_gemm_warp_specialization/session.cuh
+
+$(BUILD)/libdispatch_gemm_warp_specialization.so: $(DISPATCH_GEMM_WARP_SPECIALIZATION_HEADERS)
 
 $(BUILD)/lib%.so: $(SRC)/%.cu Makefile | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_$* $(DEFS_$*) $(COMMON_INC) \
@@ -148,7 +175,10 @@ test-slot-math: tests/test_internode_slot_math.cpp | $(BUILD)
 plots:
 	cd plots && python3 plot_tflops_efa.py
 
-.PHONY: all dispatch-gemm-blackwell run-dispatch-gemm-blackwell clean bench check test-slot-math plots
+.PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
+	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
+	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
+	test-slot-math plots
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
