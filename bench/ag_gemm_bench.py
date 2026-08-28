@@ -95,6 +95,7 @@ def main():
     # Preserve explicit --num-intra-comm-sms from the CLI (e.g. AG_GEMM_BENCH_EXTRA
     # profile runs). The per-shape loop used to force 0 here, which silently ignored
     # tuned intra splits unless INTRA_OVERRIDE was populated.
+    cli_num_comm_sms = int(args.num_comm_sms)
     cli_num_intra_comm_sms = int(args.num_intra_comm_sms)
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -149,6 +150,8 @@ def main():
             if is_chief:
                 print(f"[ag_gemm] M={base_n}: per-shape num_comm_sms={args.num_comm_sms}",
                       flush=True)
+        else:
+            args.num_comm_sms = cli_num_comm_sms
         if base_n in INTRA_OVERRIDE:
             args.num_intra_comm_sms = INTRA_OVERRIDE[base_n]
             if is_chief:
