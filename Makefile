@@ -121,6 +121,18 @@ AG_GEMM_STAGES ?=
 ifneq ($(AG_GEMM_STAGES),)
 DEFS_ag_gemm += -DAG_GEMM_PIPELINE_STAGES=$(AG_GEMM_STAGES)
 endif
+# Per-chunk system fence in the gather loop, now off: signal_all is already
+# multimem.red.release.sys, so the fence was redundant (see src/ag_gemm.cu).
+# 1 restores it. Both this and ACQUIRE_WAIT are defined unconditionally --
+# `#if` on an undefined macro is 0, which would change the Hopper path too.
+AG_GEMM_CHUNK_FENCE ?= 0
+DEFS_ag_gemm += -DAG_GEMM_CHUNK_FENCE=$(AG_GEMM_CHUNK_FENCE)
+# Acquire (not relaxed) load in the local readiness spin, pairing with that
+# release. The writer is a peer GPU's multimem.red, which is the case
+# atomic_u32.cuh says requires acquire; measured free (-0.7/+0.5/+0.1/-0.0%
+# over four shapes), so it is on. 0 restores the old relaxed spin.
+AG_GEMM_ACQUIRE_WAIT ?= 1
+DEFS_ag_gemm += -DAG_GEMM_ACQUIRE_WAIT=$(AG_GEMM_ACQUIRE_WAIT)
 DEFS_ag_gemm += $(DEFS_ag_gemm_extra)
 # Arrival-flag layout is now a runtime flag (SessionConfig.use_arrival_queue);
 # gemm_ar's session shim sets it to true. No compile-time switch needed.

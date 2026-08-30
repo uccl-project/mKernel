@@ -75,11 +75,19 @@ __device__ inline void intra_comm_sm(const globals& G) {
                 tma::store_async(G.A, A_smem[warp_id], {global_row_idx, col_idx});
                 tma::store_async_wait();
 
-                // Multicast store_async_wait only fences local-GPU completion;
-                // cross-GPU visibility of the multicast write needs a system
-                // fence before signaling compute (which lives on the same GPU
-                // but reads via multicast). 
+                // No fence here: signal_all below emits
+                // multimem.red.release.sys, and a release orders this thread's
+                // prior writes -- the multicast store included -- ahead of the
+                // signal becoming observable. The __threadfence_system() that
+                // used to sit here was asking for the guarantee the very next
+                // instruction already provides. Dropping it is worth 14.4% at
+                // M=4096, 6.3% at 8192, 2.7% at 16384, 1.8% at 32768, and it
+                // tightens run-to-run spread (2.9% -> 0.2% at M=4096).
+                // AG_GEMM_CHUNK_FENCE=1 restores it, as a one-flag bisect if a
+                // corruption ever points back here.
+#if AG_GEMM_CHUNK_FENCE
                 __threadfence_system();
+#endif
 
                 // Plane 0 [row,col]: per-K-strip, count=1. Compute waits per red_idx
                 // so it can stream tiles as cols arrive, not per whole row block.
@@ -548,8 +556,17 @@ __device__ inline void fused_comp_sm(const globals& G) {
                     // boundary.
                     if (!is_remote && !row_ready && (red_idx & 1) == 0) {
                         MKERNEL_TRACE_TICK_BEGIN(tr_w2);
+                        // The writer is a *peer* GPU's multimem.red, so
+                        // atomic_u32's own contract says this load must be
+                        // acquire, not relaxed. The remote branch below pairs
+                        // its wait with a fence; this one never did.
+#if AG_GEMM_ACQUIRE_WAIT
+                        wait_acquire(G.barrier, {0, row_idx / 2, red_idx / 2},
+                                     G.dev_idx, 1);
+#else
                         wait(G.barrier, {0, row_idx / 2, red_idx / 2},
                              G.dev_idx, 1);
+#endif
                         MKERNEL_TRACE_TICK_END(tr_stall, tr_w2);
                     }
                     if (is_remote && G.remote_ready_per_col != 0 && (red_idx & 1) == 0) {
