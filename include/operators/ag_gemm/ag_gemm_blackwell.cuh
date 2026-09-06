@@ -432,6 +432,13 @@ void entrypoint(
     int num_intra_comm_override,
     int num_nodes
 ) {
+    // Intra-node only, like dispatch_gemm_blackwell and gemm_ar_blackwell:
+    // the kernel has no remote-shard path, no ring drain and no RDMA
+    // prologue, so a peer's rows would simply never be gathered. Say so
+    // rather than computing a wrong answer. Multi-node stays in ag_gemm.cu.
+    TORCH_CHECK(num_nodes == 1,
+                "ag_gemm_blackwell is intra-node only: num_nodes must be 1, "
+                "got ", num_nodes, ". Use the ag_gemm kernel for multi-node.");
     TORCH_CHECK(B.is_cuda() && B.is_contiguous(), "B must be contiguous CUDA");
     TORCH_CHECK(C.is_cuda() && C.is_contiguous(), "C must be contiguous CUDA");
     TORCH_CHECK(B.dtype() == at::ScalarType::BFloat16, "B must be bf16");
