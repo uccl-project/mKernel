@@ -207,7 +207,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);
     m.def("get_proxy_diagnostics", &get_proxy_diagnostics_py);
     m.def("get_proxy_timelines", &get_proxy_timelines_py);
-    m.def("ag_gemm_multinode", &ag_gemm_multinode::entrypoint,
+    m.def("ag_gemm_blackwell", &ag_gemm_blackwell::entrypoint,
           pybind11::arg("A"),
           pybind11::arg("B"),
           pybind11::arg("C"),

@@ -57,14 +57,21 @@ using namespace kittens;
 #define INTRA_NUM_DEVICES 8
 #endif
 
-namespace gemm_rs_multinode {
+namespace gemm_rs_intranode_blackwell {
+
+// Intra-node Blackwell path. The RDMA runtime_state below is still carried
+// so the host entry keeps one signature with gemm_rs.cu's, but no kernel in
+// this build reads it: gemm_rs_blackwell.cu launches compute CTAs only.
 
 // ============================================================================
 // Config
 // ============================================================================
 
 struct config {
-    static constexpr int CLUSTER_SIZE = 1;
+    // 2-CTA clusters: mm2_ABt spans the pair, so A is split by rows and B by
+    // columns across it and each is read once per cluster rather than once per
+    // CTA. That is the arithmetic-intensity win (128 -> 171 FLOP/byte).
+    static constexpr int CLUSTER_SIZE = 2;
     static constexpr int NUM_BLOCKS = 132;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
@@ -112,14 +119,36 @@ __device__ __forceinline__ uint32_t gemm_rs_poll_arrival_relaxed(volatile uint32
 
 struct intra_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
-    static constexpr int PIPELINE_STAGES = 4;
+    // Two A tiles plus this CTA's half of B = 48 KB per stage. Outputs alias
+    // the last stage, so 4 stages is 208 KB of the 227 KB budget -- the same
+    // shape and depth upstream's b200 kernel runs.
+    //
+    // This was 3 while B was full width; the 2-CTA split bought the stage back.
+    // Depth is past its knee at M=32768: 2 stages 8.484 ms, 3 stages 6.444,
+    // 4 stages 6.240. A fifth is worth ~1% and does not fit.
+    //
+    // It is NOT where the remaining gap to upstream lives, despite what this
+    // comment used to claim: the trace shows the MMA warp blocked on
+    // inputs_arrived 54% of the time even at depth 4, and more depth does not
+    // help -- so it is bandwidth/locality (96x reuse for L2 to absorb), which
+    // points at task order rather than at this constant.
+#ifndef GEMM_RS_PIPELINE_STAGES
+#define GEMM_RS_PIPELINE_STAGES 4
+#endif
+    static constexpr int PIPELINE_STAGES = GEMM_RS_PIPELINE_STAGES;
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
-    using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
-    using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
+    // Blackwell: tcgen05 issues one M=128 MMA per row block, so A is a single
+    // 128-row tile rather than two 64-row halves.
+    using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
+    // Blackwell takes B N-major (shape (N, K)) so the MMA can be issued as
+    // ABt. That is what the 2-CTA form requires -- with mm2_ABt the N extent
+    // is B::rows * ncta, i.e. the pair splits B by columns and reads it once
+    // per cluster. Same bytes as the K-major tile it replaces.
+    using B_tile = st_bf<COL_BLOCK / 2, RED_BLOCK>;
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
 
     using A_local_tensor = dist::local_tensor<bf16, 1, 1, -1, -1, A_tile>;
@@ -159,8 +188,17 @@ struct intra_globals {
     unsigned int *next_comm;
     unsigned int *kernel_done;
 
-    struct pipeline_inputs { A_tile A[2]; B_tile B; };
-    struct pipeline_outputs { C_tile C[2]; };
+    // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks that share a
+    // single B tile — that sharing is the point: it doubles the FLOPs per byte
+    // of B read, which measurement showed is what actually limits this kernel.
+    static constexpr int ROW_BLOCKS_PER_TASK = 2;          // per CTA
+    static constexpr int ROW_BLOCKS_PER_CLUSTER = 4;       // x2 CTAs
+    struct pipeline_inputs { A_tile A[ROW_BLOCKS_PER_TASK]; B_tile B; };
+    // One staging tile, not two: the pair of 64-row halves goes out in
+    // sequence. Halving this to 32 KB is what buys outputs their own
+    // allocation at 4 stages (4x48 + 32 = 224 KB), which removes the loader's
+    // per-task wait on the epilogue -- the edge the roofline points at.
+    struct pipeline_outputs { C_tile C; };
 };
 
 struct fused_globals {
@@ -342,6 +380,57 @@ __device__ inline void gemm_rs_slice_super_m_decode(
     row_idx = slice_idx * row_blocks_per_slice + super_rows + rb_in_tail;
 }
 
+// Cluster-unit super-tile decode (GEMM_RS_SUPER_M, default 8), mirroring
+// ThunderKittens' get_task_idx. Consecutive cluster tasks vary the cluster ROW
+// within a band of SUPER_M and only then the column, so the concurrently
+// running clusters occupy a compact block of the (row, col) space and share
+// both A and B in L2. The previous order varied the column fastest across the
+// whole range, which is what left the MMA warp blocked on operands 53% of the
+// time at M=32768.
+//
+// The device rotation is preserved, just expressed globally instead of by
+// slice: device d starts (total / NUM_DEVICES) cluster tasks into the sequence,
+// so the GPUs work on different row ranges and their reduce-scatter store_adds
+// land on different peers. Ownership itself is derived from row_idx downstream,
+// so it follows automatically.
+#ifndef GEMM_RS_SUPER_M
+#define GEMM_RS_SUPER_M 8
+#endif
+// Set to 0 to force the old column-fastest order everywhere.
+#ifndef GEMM_RS_SUPERTILE_ENABLED
+#define GEMM_RS_SUPERTILE_ENABLED 1
+#endif
+template<typename G>
+__device__ inline void gemm_rs_decode_cluster_task(
+    int cluster_task_id, int row_blocks_per_slice, int col_blocks, int dev_idx,
+    int& row_idx, int& col_idx
+) {
+    constexpr int RBC = G::ROW_BLOCKS_PER_CLUSTER;
+    constexpr int SUPER = GEMM_RS_SUPER_M;
+    const int cluster_rows = (row_blocks_per_slice * G::NUM_DEVICES) / RBC;
+    const int total = cluster_rows * col_blocks;
+
+    int t = cluster_task_id + dev_idx * (total / G::NUM_DEVICES);
+    if (t >= total) t -= total;
+
+    const int super_rows = (cluster_rows / SUPER) * SUPER;
+    const int band_tiles = SUPER * col_blocks;
+    int cr, cc;
+    if (t < super_rows * col_blocks) {
+        const int band = t / band_tiles;
+        const int w    = t - band * band_tiles;
+        cr = band * SUPER + (w % SUPER);
+        cc = w / SUPER;
+    } else {
+        const int rem = t - super_rows * col_blocks;
+        const int fr  = cluster_rows - super_rows;   // > 0 on this branch
+        cr = super_rows + rem % fr;
+        cc = rem / fr;
+    }
+    row_idx = cr * RBC;
+    col_idx = cc;
+}
+
 // Dispatcher: compile-time selection of tile visit order (matches gemm_ar's gemm_ar_decode_comp_task).
 template <typename G>
 __device__ inline void gemm_rs_decode_comp_task(
@@ -350,6 +439,28 @@ __device__ inline void gemm_rs_decode_comp_task(
 ) {
     gemm_rs_slice_interleaved_devrel_decode(task_id, row_blocks_per_slice, col_blocks,
                                        G::NUM_DEVICES, dev_idx, row_idx, col_idx);
+}
+
+// Single entry point for the cluster-task loop: picks the ordering and, on the
+// column-fastest path, does the cluster-index -> task-id remap that order needs
+// (a cluster's ROW_BLOCKS_PER_CLUSTER row blocks sit at stride tiles_per_round,
+// so the base task id is the round expanded by the cluster height). Keeping the
+// remap here means the super-tile path does not compute it and throw it away.
+template<typename G>
+__device__ inline void gemm_rs_decode_cluster(
+    int cluster_task_id, int row_blocks_per_slice, int col_blocks, int dev_idx,
+    int tiles_per_round, bool use_supertile, int& row_idx, int& col_idx
+) {
+    if (use_supertile) {
+        gemm_rs_decode_cluster_task<G>(cluster_task_id, row_blocks_per_slice,
+                                       col_blocks, dev_idx, row_idx, col_idx);
+    } else {
+        const int round_pair = cluster_task_id / tiles_per_round;
+        const int within     = cluster_task_id - round_pair * tiles_per_round;
+        gemm_rs_decode_comp_task<G>(
+            round_pair * G::ROW_BLOCKS_PER_CLUSTER * tiles_per_round + within,
+            row_blocks_per_slice, col_blocks, dev_idx, row_idx, col_idx);
+    }
 }
 
 // Compute -> intra-RS ready signalling. Default is per-tile (batch=1): each
@@ -403,7 +514,6 @@ __device__ __forceinline__ int gemm_rs_send_ready_bitmap_region_base(
     int row_blocks_per_dev, int chunks_per_row) {
     return row_blocks_per_dev * fused_globals::NUM_DEVICES * chunks_per_row;
 }
-
 
 // ============================================================================
 // Host entrypoint
@@ -542,18 +652,34 @@ void entrypoint_fused(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev_idx).stream();
 
     const int M = (int)A.size(0);
-    const int N = (int)B.size(1);
+    const int N = (int)B.size(0);   // B is (N, K) on this path
     const int M_local = (int)output.data_.size(0);
     const int row_blocks = M / intra_globals::ROW_BLOCK;
+    // Tasks pair adjacent row blocks inside a device slice, so each slice must
+    // hold an even number of them.
+    TORCH_CHECK((row_blocks / intra_globals::NUM_DEVICES)
+                    % intra_globals::ROW_BLOCKS_PER_CLUSTER == 0,
+                "gemm_rs (Blackwell): row blocks per device slice must be a multiple of ",
+                intra_globals::ROW_BLOCKS_PER_CLUSTER, "; got ",
+                row_blocks / intra_globals::NUM_DEVICES);
     const int col_blocks = N / intra_globals::COL_BLOCK;
     const int local_row_blocks = M_local / fused_globals::ROW_BLOCK;
     const int total_inter_tiles = local_row_blocks * col_blocks;
 
     int num_comp = std::max(1, num_comp_sms);
     int num_intra = std::max(0, num_intra_comm);
-    int num_send = std::max(0, num_send_sms);
-    int num_reduce = std::max(0, num_reduce_sms);
-    const bool intra_only_debug = (num_send == 0 && num_reduce == 0);
+    // This kernel launches compute CTAs only -- gemm_rs_blackwell.cu has no
+    // send or reduce role. Honouring a non-zero request would size the grid for
+    // CTAs that then do nothing, and the compute side would wait on a reduce
+    // that never runs, so clamp instead of hanging. Multi-node stays in
+    // gemm_rs.cu; the caller is told rather than silently given a smaller grid.
+    TORCH_CHECK(num_send_sms <= 0 && num_reduce_sms <= 0,
+                "gemm_rs_blackwell is intra-node only: num_send_sms and "
+                "num_reduce_sms must be 0, got ", num_send_sms, " and ",
+                num_reduce_sms, ". Use the gemm_rs kernel for multi-node.");
+    int num_send = 0;
+    int num_reduce = 0;
+    const bool intra_only_debug = true;
     // When compute directly performs the intra-RS peer store_add into staging,
     // keep the total CTA budget unchanged but collapse the scheduler to
     // 3 logical bands: (compute+intra), send, reduce. This avoids leaving a
@@ -738,7 +864,6 @@ void entrypoint_fused(
             ? 1 + (total_chunks - 1 - node_idx) / std::max(1, num_nodes)
             : 0)
         : total_chunks;
-
 
     if (use_fused_reset) {
         gemm_rs_zero_regions_t regs{};
@@ -934,5 +1059,5 @@ void entrypoint_fused(
     }
 }
 
-}  // namespace gemm_rs_multinode
+}  // namespace gemm_rs_intranode_blackwell
 

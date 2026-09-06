@@ -20,16 +20,18 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
 from common import (  # noqa: E402
+    benchmark_batch,
     check_close,
     compare_named_results,
     get_peer_ips,
     get_peer_ports,
     make_dist_buffer,
+    resolve_timing_mode,
     rdma_backing,
     rdma_policy_label,
 )
 
-KERNEL_NAME = "gemm_rs"
+KERNEL_NAME = "gemm_rs_blackwell"
 from common import get_num_nodes  # noqa: E402
 NUM_NODES = get_num_nodes()
 ROW_BLOCK = 128
@@ -77,6 +79,10 @@ def split_for_shape(m: int) -> tuple[int, int, int, int, int]:
         split = tuple(parts)
 
     n_comp, n_intra, n_send, n_reduce, chunk_tiles = split
+    # This kernel is intra-node only, so the send/reduce bands do not
+    # exist. The Hopper bench needs the env vars set to 0 by hand; here
+    # that is the only valid value, so it is the default.
+    n_send = n_reduce = 0
     n_comp = int(os.environ.get("GEMM_RS_NUM_COMP_SMS", n_comp))
     n_intra = int(os.environ.get("GEMM_RS_NUM_INTRA_COMM_SMS", n_intra))
     n_send = int(os.environ.get("GEMM_RS_NUM_SEND_SMS", n_send))
@@ -122,6 +128,10 @@ def parse_args():
     return p.parse_args()
 
 
+# The Blackwell (tcgen05) build takes B as (N, K); the Hopper build takes (K, N).
+TCGEN05 = os.environ.get("MKERNEL_TCGEN05", "1") == "1"
+
+
 def main():
     args = parse_args()
     rank = int(os.environ["RANK"])
@@ -147,10 +157,14 @@ def main():
 
     peer_ip = os.environ.get("PEER_IP")
     if not peer_ip:
-        peer_node = 1 if node_idx == 0 else 0
-        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
-        if not peer_ip:
-            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+        if NUM_NODES == 1:
+            # Single-node (intra-only): no RDMA session is opened, so no peer.
+            peer_ip = "127.0.0.1"
+        else:
+            peer_node = 1 if node_idx == 0 else 0
+            peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+            if not peer_ip:
+                raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
     tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
     mod = load_module.load(KERNEL_NAME)
@@ -188,7 +202,10 @@ def main():
         torch.manual_seed(42 + global_gpu_idx)
         torch.cuda.manual_seed(42 + global_gpu_idx)
         A = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
-        B = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
+        # The Blackwell path issues the MMA as ABt, so it takes B N-major.
+        # Keep one logical B and hand the kernel whichever layout it wants.
+        B_ref = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
+        B = B_ref.t().contiguous() if TCGEN05 else B_ref
 
         workspace = mod.DistBuffer(
             (m, n), dtype=torch.bfloat16,
@@ -250,20 +267,32 @@ def main():
             fifo_cap *= 2
 
         dist.barrier()
-        peer_ips = get_peer_ips(node_idx, NUM_NODES)
-        mod.create_session(
-            node_idx, peer_ip, tcp_port,
-            staging_buf.data_ptr(), staging_bytes,
-            recv_bytes, total_inter_tiles, fifo_cap, local_rank,
-            peer_ips=peer_ips,
-            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
-        )
-        fifo = mod.get_fifo_handles()
-        arrival_ptr = mod.get_arrival_flags_ptr()
-        recv_ptr = mod.get_recv_buf_ptr()
+        # Single-node (intra-only) runs never touch the network: with
+        # n_send == n_reduce == 0 the kernel takes its intra_only_debug path,
+        # leaves runtime_state as nullptr, and ignores every session-derived
+        # pointer below. Opening an RDMA session would just fail on a host with
+        # no usable HCA, so skip it entirely.
+        intra_only = (NUM_NODES == 1)
+        if intra_only:
+            fifo = (0, 0, 0, 0, 0)
+            arrival_ptr = 0
+            recv_ptr = 0
+        else:
+            peer_ips = get_peer_ips(node_idx, NUM_NODES)
+            mod.create_session(
+                node_idx, peer_ip, tcp_port,
+                staging_buf.data_ptr(), staging_bytes,
+                recv_bytes, total_inter_tiles, fifo_cap, local_rank,
+                peer_ips=peer_ips,
+                peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
+            )
+            fifo = mod.get_fifo_handles()
+            arrival_ptr = mod.get_arrival_flags_ptr()
+            recv_ptr = mod.get_recv_buf_ptr()
 
         epoch = 1
-        mod.set_epoch(epoch)
+        if not intra_only:
+            mod.set_epoch(epoch)
         dist.barrier(); time.sleep(0.5)
 
         use_acquire_poll, reduce_poll_sleep_ns = poll_tuning(m)
@@ -274,12 +303,14 @@ def main():
             workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
             barrier.data_.zero_(); ready_chunk.data_.zero_()
             staging_dbuf.data_.zero_()
-            if hasattr(mod, "zero_recv_buf"):
+            if not intra_only and hasattr(mod, "zero_recv_buf"):
                 mod.zero_recv_buf()
 
         def advance_epoch(next_epoch: int):
             # Queue-mode arrivals carry packed work, not an epoch value. Keep
             # all nodes quiesced before any rank clears arrival slots.
+            if intra_only:
+                return
             if use_prepare_epoch:
                 mod.prepare_epoch()
                 dist.barrier()
@@ -323,29 +354,21 @@ def main():
         # each iter, which deadlocks the proxy without a per-iter barrier+settle.
         # MKERNEL_BENCH_NO_SYNC=1 (or MKERNEL_BENCH_LEGACY_SYNC=0) forces the
         # NCCL-style back-to-back path.
-        legacy_sync = os.environ.get("MKERNEL_BENCH_NO_SYNC") != "1"
-        if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "0":
-            legacy_sync = False
+        # In batch mode the timed loop deliberately produces wrong values: this
+        # kernel's epilogue store_adds into staging, so without the per-iteration
+        # zero the results accumulate. Correctness is verified separately below,
+        # on one clean iteration. Keeping the two coupled is what made these
+        # numbers incomparable in the first place.
+        legacy_sync = (resolve_timing_mode() != "batch")
         if not legacy_sync:
-            # No-sync (steady-state): per-iter reset_state + epoch bump (which
-            # internally syncs the proxy-side via set_epoch) but skip the
-            # per-iter dist.barrier + sleep + cuda.synchronize + elapsed_time
-            # readout. Defer event-pair elapsed_time to the end (mirrors
-            # gemm_ar's GEMM_AR_STEADY_STATE_BENCH path).
-            samples_pairs = []
-            for _ in range(args.iters):
-                start_iter()
-                # NO dist.barrier + sleep here — that's the sync this fix removes.
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
-                s.record(); run_once(); e.record()
-                samples_pairs.append((s, e))
-            torch.cuda.synchronize()
-            dist.barrier()
-            samples = [s.elapsed_time(e) for (s, e) in samples_pairs]
+            n_iters = max(args.iters, 32)
+            avg_ms = benchmark_batch(run_once, start_iter, n_iters)
+            samples = [avg_ms] * args.iters
             if is_chief:
-                print(f"[gemm_rs-nosync] M={m} samples={[f'{x:.4f}' for x in samples]}",
-                      flush=True)
+                print(f"[gemm_rs-batch] M={m} N={n_iters} avg={avg_ms:.4f} ms", flush=True)
+            # One clean iteration so the correctness check below sees valid state.
+            start_iter(); dist.barrier()
+            run_once(); torch.cuda.synchronize(); dist.barrier()
         else:
             for _ in range(args.iters):
                 start_iter()
@@ -366,6 +389,21 @@ def main():
                 _p99 = _ss[min(_n - 1, int(0.99 * _n))]
                 print(f"[gemm_rs-dist] M={m} n={_n} min={_ss[0]:.3f} "
                       f"med={_med:.3f} p99={_p99:.3f} max={_ss[-1]:.3f}", flush=True)
+        if intra_only:
+            # Intra-only runs stop after the NVLink reduce-scatter: the result
+            # is the cross-GPU store_add accumulation in `staging`, and the
+            # reduce CTAs that would normally publish `output` never launch.
+            # Undo the chunk-major staging view so the checks below can run
+            # unchanged. Host entrypoint lays tile (rb, cb) out at
+            # (rb*CB + cb)*128 rows of 256 columns.
+            RB = m_local // ROW_BLOCK
+            CB = n // COL_BLOCK
+            output.data_.copy_(
+                staging_buf.reshape(RB, CB, ROW_BLOCK, COL_BLOCK)
+                           .permute(0, 2, 1, 3)
+                           .reshape(m_local, n)
+            )
+
         C_ref = None
         for target_lr in range(world_size):
             row_lo = target_lr * m_local
@@ -374,7 +412,7 @@ def main():
             # all 8 local GPUs in the node, then reduce the owning local-rank
             # slice across nodes.
             # Keep on GPU so the NCCL backend can all_reduce/all_gather it.
-            ref_slice = torch.matmul(A[row_lo:row_hi], B)
+            ref_slice = torch.matmul(A[row_lo:row_hi], B_ref)
             dist.all_reduce(
                 ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
             )

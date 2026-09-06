@@ -46,10 +46,18 @@ using namespace kittens;
 #define INTRA_NUM_DEVICES 8
 #endif
 
-namespace ag_gemm_multinode {
+namespace ag_gemm_blackwell {
 
 struct config {
+#if defined(AG_GEMM_CLUSTER2)
+    // 2-CTA tcgen05 clusters: A is split by rows across the pair, B by columns.
+    // Requires num_intra_comm to be even -- clusters are formed from
+    // consecutive blockIdx.x, and a cluster straddling the gather/compute role
+    // split would deadlock on the first cluster-scope barrier.
+    static constexpr int CLUSTER_SIZE = 2;
+#else
     static constexpr int CLUSTER_SIZE = 1;
+#endif
     static constexpr int NUM_BLOCKS = 132;
     static constexpr int STATIC_SHARED_MEMORY = 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
@@ -73,7 +81,6 @@ struct comp_task {
     bool is_remote;
 };
 
-
 // ============================================================================
 // Fused globals
 // ============================================================================
@@ -83,15 +90,29 @@ struct globals {
     static constexpr int NUM_NODES = 2;
     // Three stages keep the producer/consumer pipeline deep enough while
     // leaving more shared memory headroom than a four-stage pipeline.
-    static constexpr int PIPELINE_STAGES = 3;
+    // A stage is two A tiles plus B: 64 KB at CLUSTER_SIZE 1, 48 KB at 2 (each
+    // CTA holds half of B). A 4th stage fits at CLUSTER_SIZE 2 but the shapes
+    // disagree on whether it helps -- medians of 3, 3 vs 4 stages: M=16384
+    // 0.984 / 0.969, M=32768 6.496 / 6.609 -- so the default follows the larger
+    // shape. AG_GEMM_STAGES overrides.
+#ifndef AG_GEMM_PIPELINE_STAGES
+#define AG_GEMM_PIPELINE_STAGES 3
+#endif
+    static constexpr int PIPELINE_STAGES = AG_GEMM_PIPELINE_STAGES;
     static constexpr int SUPER_M = 12;
     static constexpr int ROW_BLOCK = 128;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
 
-    using A_tile = st_bf<ROW_BLOCK / 2, RED_BLOCK>;
+    // Blackwell: tcgen05 issues one M=128 MMA per row block, so the compute
+    // path takes A as a single 128-row tile instead of two 64-row halves.
+    // A_comm_tile (the ring all-gather granularity) is unaffected.
+    using A_tile = st_bf<ROW_BLOCK, RED_BLOCK>;
     using A_comm_tile = st_bf<ROW_BLOCK * 2, RED_BLOCK * 2>;
-    using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
+    // Blackwell issues the MMA as ABt, so B arrives N-major, i.e. (N, K). Each
+    // CTA of a cluster holds COL_BLOCK / CLUSTER_SIZE of the columns; the total
+    // B bytes per pipeline stage are the same either way.
+    using B_tile = st_bf<COL_BLOCK / config::CLUSTER_SIZE, RED_BLOCK>;
     using C_tile = st_bf<ROW_BLOCK / 2, COL_BLOCK>;
 
     static constexpr int NUM_COMM_CHUNKS = config::DYNAMIC_SHARED_MEMORY / sizeof(A_comm_tile);
@@ -146,8 +167,44 @@ struct globals {
     const int num_intra_comm;  // CTAs for intra-node IPC gather + RDMA push
     const int num_comp_sms;    // CTAs for GEMM compute
 
-    struct pipeline_inputs { A_tile A[2]; B_tile B; };
-    struct pipeline_outputs { C_tile C[2]; };
+    // One task covers ROW_BLOCKS_PER_TASK adjacent row blocks sharing a single
+    // B tile; that sharing doubles the FLOPs per byte of B read.
+    // Row blocks a CTA computes per task. 2 lets one B tile feed two MMAs,
+    // halving the operand bytes per FLOP; 1 doubles the task count, which is
+    // what small M is short of. Measured (medians of 3, AG_GEMM_RBPT):
+    //   M=4096   1: 0.108   2: 0.117   -> 1 wins by 8%
+    //   M=8192   1: 0.332   2: 0.313
+    //   M=16384  1: 1.215   2: 0.981
+    //   M=32768  1: 8.670   2: 6.576   -> 1 loses by 32%
+    // Only the smallest shape is task-starved enough to pay for the lost reuse,
+    // so the default stays 2. Making this per-shape would mean a runtime value
+    // where the tile types, semaphore counts and epilogue rounds all read a
+    // compile-time constant -- not worth 8% at one shape.
+#ifndef AG_GEMM_RBPT
+#define AG_GEMM_RBPT 2
+#endif
+    static constexpr int ROW_BLOCKS_PER_TASK = AG_GEMM_RBPT;   // per CTA
+    // At CLUSTER_SIZE 2 the leader runs one MMA warp per accumulator; at 1 a
+    // single warp issues them all. The input semaphores are counted per warp.
+    static constexpr int NUM_MMA_WARPS =
+        (config::CLUSTER_SIZE > 1) ? ROW_BLOCKS_PER_TASK : 1;
+    // A cluster's CTAs walk one task together, covering this many row blocks.
+    static constexpr int ROW_BLOCKS_PER_CLUSTER =
+        ROW_BLOCKS_PER_TASK * config::CLUSTER_SIZE;
+    struct pipeline_inputs { A_tile A[ROW_BLOCKS_PER_TASK]; B_tile B; };
+    // One staging tile: the four 64-row halves of the pair go out in sequence,
+    // which is what lets outputs have their own allocation instead of aliasing
+    // the last input stage and gating the loader.
+    // Two staging tiles let the consumers fill the next 64-row half while the
+    // store warp drains the previous, instead of ping-ponging one. Fits at
+    // CLUSTER_SIZE 2 (3x48 + 2x32 = 208 KB) but measured neutral (M=16384
+    // 0.996 -> 0.986, M=32768 6.518 -> 6.563), so off unless asked.
+#if defined(AG_GEMM_DOUBLE_OUTPUT)
+    static constexpr int OUTPUT_BUFFERS = (config::CLUSTER_SIZE > 1) ? 2 : 1;
+#else
+    static constexpr int OUTPUT_BUFFERS = 1;
+#endif
+    struct pipeline_outputs { C_tile C[OUTPUT_BUFFERS]; };
 };
 
 __device__ inline unsigned long long ag_gemm_globaltimer() {
@@ -185,7 +242,6 @@ __device__ __forceinline__ int ag_gemm_ring_origin_for_step(
     while (origin < 0) origin += num_nodes;
     return origin;
 }
-
 
 // ============================================================================
 // Intra-comm SM: IPC multicast gather + signal intra_done per row block
@@ -358,7 +414,6 @@ __device__ inline void post_ring_forward_wrs_for_intra_row(
 // Forward declaration: kernel body and raw CUDA launch live in src/ag_gemm.cu.
 void launch_fused_ag_gemm(const globals& G, unsigned int active_sms);
 
-
 void entrypoint(
     dist::ParallelBuffer& A,
     const at::Tensor& B,
@@ -386,7 +441,7 @@ void entrypoint(
 
     const int M_node = A.data_.size(0);
     const int K = A.data_.size(1);
-    const int N = B.size(1);
+    const int N = B.size(0);   // B is (N, K) on the Blackwell ABt path
     const int M = M_node * num_nodes;
 
     TORCH_CHECK(M % globals::ROW_BLOCK == 0);
@@ -398,6 +453,12 @@ void entrypoint(
     TORCH_CHECK(M_node >= globals::NUM_DEVICES * globals::ROW_BLOCK * 2,
                 "M_node must be >= ", globals::NUM_DEVICES * globals::ROW_BLOCK * 2,
                 " (got M_node=", M_node, ")");
+    TORCH_CHECK((M_node / globals::ROW_BLOCK) % globals::ROW_BLOCKS_PER_CLUSTER == 0,
+                "row blocks per shard must be a multiple of ",
+                globals::ROW_BLOCKS_PER_CLUSTER, "; got ", M_node / globals::ROW_BLOCK);
+    static_assert(globals::SUPER_M % globals::ROW_BLOCKS_PER_CLUSTER == 0,
+                  "SUPER_M must be a multiple of ROW_BLOCKS_PER_CLUSTER so a "
+                  "cluster's row blocks never straddle a super-tile band");
     TORCH_CHECK(M_node % (globals::NUM_DEVICES * globals::ROW_BLOCK * 2) == 0,
                 "M_node must be a multiple of ",
                 globals::NUM_DEVICES * globals::ROW_BLOCK * 2,
@@ -417,18 +478,30 @@ void entrypoint(
         std::atoi(std::getenv("AG1_ADAPTIVE_COMM_SMS")) != 0) {
         if (M >= 32768) adaptive_comm_sms = std::min(num_comm_sms, adaptive_cap_large_m);
         else if (M >= 16384) adaptive_comm_sms = std::min(num_comm_sms, 32);
-        // Small-M: at M<=4K intra-gather has only local_row_blocks=2 rows per
-        // rank with col_blocks=2 (K=256/128), so 4 total intra tasks. Under
-        // MERGE+EARLY_SEND extra intra CTAs sit idle but steal from compute.
-        else if (M <= 4096) adaptive_comm_sms = std::min(num_comm_sms, 8);
-        // At M<=8K, keep enough intra CTAs to cover the small number of
-        // gather tasks while returning idle CTAs to compute.
-        else if (M <= 8192) adaptive_comm_sms = std::min(num_comm_sms, 32);
+        // Re-tuned for Blackwell. The Hopper caps below starve gather at small
+        // M, where a trace shows compute doing 11.6% useful work and waiting
+        // 69.5% -- there is not enough compute to hide the gather behind, so
+        // shortening gather is what matters, not returning CTAs to compute.
+        // Measured (gather CTAs -> ms, 30-iter medians):
+        //   M=4096    4:0.170   8:0.136  16:0.121  32:0.129
+        //   M=8192    8:0.373  16:0.324  32:0.316  48:0.353
+        // The value below is halved into num_intra_comm.
+        else if (M <= 4096) adaptive_comm_sms = std::min(num_comm_sms, 32);
+        else if (M <= 8192) adaptive_comm_sms = std::min(num_comm_sms, 64);
     }
-    const int num_intra_comm = (num_intra_comm_override > 0)
+    int num_intra_comm = (num_intra_comm_override > 0)
         ? num_intra_comm_override
         : std::max(4, adaptive_comm_sms / 2);
+    // Clusters are formed from consecutive blockIdx.x, and gather CTAs occupy
+    // the low block indices. If num_intra_comm were odd, one cluster would hold
+    // a gather CTA and a compute CTA, and the compute half would deadlock on
+    // the first cluster-scope barrier waiting for a partner that never reaches
+    // it. Round up so the role split lands on a cluster boundary.
+    if (config::CLUSTER_SIZE > 1 && (num_intra_comm % config::CLUSTER_SIZE) != 0)
+        num_intra_comm += config::CLUSTER_SIZE - (num_intra_comm % config::CLUSTER_SIZE);
     int num_comp_sms = active_sms - num_intra_comm;
+    // Whole clusters only; the launcher truncates the grid the same way.
+    num_comp_sms -= num_comp_sms % config::CLUSTER_SIZE;
     const bool host_skip_compute =
         std::getenv("AG_GEMM_SKIP_COMPUTE") != nullptr &&
         std::getenv("AG_GEMM_SKIP_COMPUTE")[0] == '1';
@@ -449,7 +522,13 @@ void entrypoint(
     // Ring all-gather: n_peers hops, each into its own recv bank so a
     // forward never overwrites a slot another GPU is still TMA-reading.
     const int ring_recv_banks = std::max(1, num_nodes - 1);
-    const int recv_tensor_rows = M_node * (num_nodes - 1) * ring_recv_banks;
+    // Single-node runs have no peers, so the ring receive area is empty. TMA
+    // descriptors cannot be built over a zero-extent tensor, so clamp to one
+    // A_comm_tile of rows. The kernel never reads it: with num_nodes == 1
+    // every task decodes to the local shard, so is_remote is never true.
+    const int recv_rows_raw = M_node * (num_nodes - 1) * ring_recv_banks;
+    const int recv_tensor_rows =
+        std::max(globals::ROW_BLOCK * 2, recv_rows_raw);
     const int recv_tensor_cols = K;
     auto A_recv_local_tensor = ::dist::make_local_tensor<globals::A_local_tensor>(
         (uint64_t)recv_buf_ptr, 1, 1,
@@ -461,7 +540,7 @@ void entrypoint(
         .A_local = A_local,
         .A_recv_local_tensor = A_recv_local_tensor,
         .A_recv = ::dist::distributed_tensor_from_buffer<globals::A_distributed_tensor>(
-            A_recv, 1, 1, M_node * (num_nodes - 1), K),
+            A_recv, 1, 1, std::max(globals::ROW_BLOCK * 2, M_node * (num_nodes - 1)), K),
         .B = ::dist::local_tensor_from_tensor<globals::B_local_tensor>(B),
         .C = ::dist::local_tensor_from_tensor<globals::C_local_tensor>(C),
         .d2h_fifos = fifo_bundle,
@@ -508,4 +587,4 @@ void entrypoint(
     launch_fused_ag_gemm(G, (unsigned int)active_sms);
 }
 
-}  // namespace ag_gemm_multinode
+}  // namespace ag_gemm_blackwell

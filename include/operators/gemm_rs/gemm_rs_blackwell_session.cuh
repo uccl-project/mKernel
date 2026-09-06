@@ -125,7 +125,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_fifo_handles", &get_fifo_handles_py);
     m.def("get_arrival_flags_ptr", &get_arrival_flags_ptr_py);
     m.def("get_recv_buf_ptr", &get_recv_buf_ptr_py);
-    m.def("gemm_rs_fused", &gemm_rs_multinode::entrypoint_fused,
+    m.def("gemm_rs_fused", &gemm_rs_intranode_blackwell::entrypoint_fused,
           pybind11::arg("A"),
           pybind11::arg("B"),
           pybind11::arg("workspace"),
