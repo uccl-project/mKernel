@@ -33,7 +33,7 @@ endif
 
 # === Target GPU ===
 #   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
-#   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
+#   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs and ag_gemm)
 GPU ?= hopper
 ifeq ($(GPU),blackwell)
     ARCH              := -gencode arch=compute_103a,code=sm_103a
@@ -90,6 +90,49 @@ COMMON_INC      := $(INC_RELEASE) $(INC_EFA) $(TORCH_INC) $(PY_INC)
 # Failed-experiment flags are NOT defined here (HYBRID, MERGED_COMM,
 # PUSH_NVL_FANOUT, DISPATCH_DONATE_INTER_SEND, ACTIVITY_TRACE, etc.) so
 # their #ifdef branches stay disabled.
+# ag_gemm flags: each name becomes -DAG_GEMM_<name> when 1. First group is on
+# by default for GPU=blackwell, second is opt-in -- profiling, or measured and
+# rejected but kept behind a disabled #ifdef as this repository does. Numbers
+# and reasoning for the rejected ones are in README_B300.md.
+#   ROWPERM             consume rows in phase-1's production order
+#   FASTPOLL            drop per-K readiness polls once phase 1 is globally done
+#   CLUSTER2            2-CTA tcgen05 clusters (needs num_intra_comm even)
+#   EPILOGUE_READ_WAIT  don't block the epilogue on the global commit (+0.6%)
+#   DOUBLE_OUTPUT       two epilogue staging tiles (neutral)
+#   ROWPOLL             per-row readiness counter (worse: atomic contention)
+# Row blocks per CTA per task: 2 (default) shares one B tile between two MMAs,
+# 1 doubles the task count. AG_GEMM_RBPT=1 to try the latter.
+AG_GEMM_RBPT ?=
+ifneq ($(AG_GEMM_RBPT),)
+DEFS_ag_gemm_extra := -DAG_GEMM_RBPT=$(AG_GEMM_RBPT)
+endif
+AG_GEMM_BLACKWELL_FLAGS := ROWPERM FASTPOLL CLUSTER2
+AG_GEMM_OPT_IN_FLAGS    := EPILOGUE_READ_WAIT DOUBLE_OUTPUT ROWPOLL
+ifeq ($(GPU),blackwell)
+$(foreach f,$(AG_GEMM_BLACKWELL_FLAGS),$(eval AG_GEMM_$(f) ?= 1))
+endif
+$(foreach f,$(AG_GEMM_BLACKWELL_FLAGS) $(AG_GEMM_OPT_IN_FLAGS),$(eval AG_GEMM_$(f) ?= 0))
+DEFS_ag_gemm_blackwell := $(foreach f,$(AG_GEMM_BLACKWELL_FLAGS) $(AG_GEMM_OPT_IN_FLAGS),\
+                  $(if $(filter 1,$(AG_GEMM_$(f))),-DAG_GEMM_$(f)))
+# Pipeline depth. Default 3; 4 is 1.5% better at M=16384 and 1.7% worse at
+# M=32768, so the default follows the larger shape.
+AG_GEMM_STAGES ?=
+ifneq ($(AG_GEMM_STAGES),)
+DEFS_ag_gemm_blackwell += -DAG_GEMM_PIPELINE_STAGES=$(AG_GEMM_STAGES)
+endif
+# Per-chunk system fence in the gather loop, now off: signal_all is already
+# multimem.red.release.sys, so the fence was redundant (see src/ag_gemm.cu).
+# 1 restores it. Both this and ACQUIRE_WAIT are defined unconditionally --
+# `#if` on an undefined macro is 0, which would change the Hopper path too.
+AG_GEMM_CHUNK_FENCE ?= 0
+DEFS_ag_gemm_blackwell += -DAG_GEMM_CHUNK_FENCE=$(AG_GEMM_CHUNK_FENCE)
+# Acquire (not relaxed) load in the local readiness spin, pairing with that
+# release. The writer is a peer GPU's multimem.red, which is the case
+# atomic_u32.cuh says requires acquire; measured free (-0.7/+0.5/+0.1/-0.0%
+# over four shapes), so it is on. 0 restores the old relaxed spin.
+AG_GEMM_ACQUIRE_WAIT ?= 1
+DEFS_ag_gemm_blackwell += -DAG_GEMM_ACQUIRE_WAIT=$(AG_GEMM_ACQUIRE_WAIT)
+DEFS_ag_gemm_blackwell += $(DEFS_ag_gemm_extra)
 DEFS_ag_gemm        :=
 # Arrival-flag layout is now a runtime flag (SessionConfig.use_arrival_queue);
 # gemm_ar's session shim sets it to true. No compile-time switch needed.
@@ -101,6 +144,23 @@ DEFS_dispatch_gemm_blackwell := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8
 DEFS_dispatch_gemm_warp_specialization := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256
 DEFS_ring_attention :=
 DEFS_gemm_rs        :=
+# Blackwell-only knobs; gemm_rs.cu (Hopper) reads none of them.
+# GEMM_RS_SUPERTILE=1 issues cluster tasks in a SUPER_M-banded order (see
+# gemm_rs_decode_cluster_task) instead of column-fastest.
+DEFS_gemm_rs_blackwell :=
+GEMM_RS_SUPERTILE ?= 1
+ifeq ($(GEMM_RS_SUPERTILE),0)
+DEFS_gemm_rs_blackwell += -DGEMM_RS_SUPERTILE_ENABLED=0
+endif
+GEMM_RS_SUPER_M ?=
+ifneq ($(GEMM_RS_SUPER_M),)
+DEFS_gemm_rs_blackwell += -DGEMM_RS_SUPER_M=$(GEMM_RS_SUPER_M)
+endif
+# Override the prefetch depth (default 4, the most that fits in 226 KB).
+GEMM_RS_STAGES ?=
+ifneq ($(GEMM_RS_STAGES),)
+DEFS_gemm_rs_blackwell += -DGEMM_RS_PIPELINE_STAGES=$(GEMM_RS_STAGES)
+endif
 DEFS_dispatch_gemm_glu_combine := -DTK_MOE_H=7168 -DTK_MOE_I=2048 -DTK_MOE_TOP_K=8 -DTK_MOE_NUM_EXPERTS=256 -DTK_MOE_NUM_NODES=$(TK_MOE_NUM_NODES)
 
 # === Build targets ===
@@ -188,3 +248,15 @@ gemm-ar-blackwell : $(BUILD)/libgemm_ar_blackwell.so
 $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+ag-gemm-blackwell : $(BUILD)/libag_gemm_blackwell.so
+
+run-ag-gemm-blackwell : ag-gemm-blackwell
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_blackwell_bench.py
+
+# Header dependencies for the two Blackwell kernels; the generic lib%.so
+# pattern rule above supplies the recipe.
+$(BUILD)/libgemm_rs_blackwell.so: include/operators/gemm_rs/gemm_rs_blackwell.cuh \
+                                  include/operators/gemm_rs/gemm_rs_blackwell_session.cuh
+$(BUILD)/libag_gemm_blackwell.so: include/operators/ag_gemm/ag_gemm_blackwell.cuh \
+                                  include/operators/ag_gemm/ag_gemm_blackwell_session.cuh
