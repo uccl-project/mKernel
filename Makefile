@@ -238,7 +238,7 @@ plots:
 .PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
-	test-slot-math plots
+	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -249,14 +249,11 @@ $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_ar_blackwell $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
-ag-gemm-blackwell : $(BUILD)/libag_gemm_blackwell.so
+run-ag-gemm-warp-specialized : ag-gemm-warp-specialized
+	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_bench.py --warmup 20 --iters 50 --arch blackwell --intranode-only
 
-run-ag-gemm-blackwell : ag-gemm-blackwell
-	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_blackwell_bench.py
+ag-gemm-warp-specialized : $(BUILD)/libag_gemm_warp_specialized.so
 
-# Header dependencies for the two Blackwell kernels; the generic lib%.so
-# pattern rule above supplies the recipe.
-$(BUILD)/libgemm_rs_blackwell.so: include/operators/gemm_rs/gemm_rs_blackwell.cuh \
-                                  include/operators/gemm_rs/gemm_rs_blackwell_session.cuh
-$(BUILD)/libag_gemm_blackwell.so: include/operators/ag_gemm/ag_gemm_blackwell.cuh \
-                                  include/operators/ag_gemm/ag_gemm_blackwell_session.cuh
+$(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_warp_specialized $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
