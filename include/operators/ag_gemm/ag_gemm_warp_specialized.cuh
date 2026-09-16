@@ -30,12 +30,8 @@ namespace ag_gemm_warp_specialized {
 // CTAs per cluster, i.e. the tcgen05 MMA CTA group. 2 splits COL_BLOCK across
 // the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
 static constexpr int DEFAULT_NUM_CTA = 2;
-static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 1;
 
-template <int _ROW_BLOCK,
-          int _COL_BLOCK,
-          int _NUM_CTA = DEFAULT_NUM_CTA,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA>
 struct fused_globals;
 
 // Number of tile columns visited before the snake pattern steps to the next
@@ -45,20 +41,21 @@ static constexpr int DEFAULT_SUPERGROUP_WIDTH = 5;
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
-          int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
-void launch_ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
+          int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH>
+void launch_ag_gemm_warp_specialized(const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>& G);
+
+static constexpr int DEFAULT_ROW_BLOCK = 128;
+static constexpr int DEFAULT_COL_BLOCK = 128;
 
 // for M < 512, this should be 128
-template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _NUM_CONSUMER_WARPS>
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA>
 struct fused_globals {
     // config items
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 
     // not sure if I want to use a warp specialized or sm specialized strategy yet
     static constexpr int NUM_BLOCKS = 148;
-    static constexpr int CONSUMER_WARPS = _NUM_CONSUMER_WARPS;
+    static constexpr int CONSUMER_WARPS = 1;
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPGROUPS = 1;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
@@ -73,18 +70,14 @@ struct fused_globals {
 
     // this is pipelining along the reduction dimension
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = []() {
-        if constexpr (_NUM_CONSUMER_WARPS == 2) {
-            return 4;
-        } else if constexpr (_NUM_CTA == 1 || _COL_BLOCK == 256) {
+        if constexpr (_NUM_CTA == 1 || _COL_BLOCK == 256) {
             return 6;
         } else {
             return 7;
         }
     }();
     // this is pipelining among different MMAs
-    static constexpr int TMEM_PIPELINE_STAGES =
-        kittens::MAX_TENSOR_COLS / _COL_BLOCK / CONSUMER_WARPS;
-    static constexpr int NUM_TMEM_SLOTS = TMEM_PIPELINE_STAGES * CONSUMER_WARPS;
+    static constexpr int TMEM_PIPELINE_STAGES = kittens::MAX_TENSOR_COLS / _COL_BLOCK;
     // this is the number of epilogue stages that can be in flight at any time
     static constexpr int EPILOGUE_PIPELINE_STAGES = _COL_BLOCK == 128 ? 3 : 2;
     // this is the number of partitions for the epilogue tile in SMEM
@@ -107,7 +100,7 @@ struct fused_globals {
 
     static constexpr int MAX_DYNAMIC_SHARED_MEMORY = 227 * 1024;
     static constexpr int DYNAMIC_SHARED_MEMORY =
-        (sizeof(A_tile) * CONSUMER_WARPS + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
+        (sizeof(A_tile) + sizeof(B_tile)) * PRODUCER_CONSUMER_PIPELINE_STAGES +
         sizeof(C_tile) * EPILOGUE_PIPELINE_STAGES + 1024;
     // Deliberately not a static_assert: the tuner instantiates fused_globals
     // for every candidate so it can ask which ones fit. The hard check lives
@@ -116,15 +109,11 @@ struct fused_globals {
 
     using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
     using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
-
-    // we declare a separate A tensor here that is indexed as ((NUM_DEVICES, local_m), K), so that
-    // TMA loads that go out of bounds will naturally zero themselves out
-    using A_replicated_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
-    using C_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, C_tile>;
+    using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
 
     A_distributed_tensor A;
-    A_replicated_tensor A_local_buf;
+    A_local_tensor A_local_buf;
     B_local_tensor B;
     C_local_tensor C;
 
@@ -139,7 +128,7 @@ struct fused_globals {
     static constexpr int K = 7168;
 
     struct pipeline_inputs {
-        A_tile A[_NUM_CONSUMER_WARPS];
+        A_tile A;
         B_tile B;
     };
 
@@ -150,44 +139,38 @@ struct fused_globals {
     /*
      * bit 0: TMA producer -- starts with 1 (PRODUCER WARP)
      * bit 1: TMA consumer -- starts with 0 (CONSUMER WARP)
-     * bits [2, 2+CONSUMER_WARPS): TMEM producer, one per consumer warp --
-     *   starts with 1 (CONSUMER WARP), since there is no prior epilogue
-     *   readout for the first pipeline fill to wait on
-     * bits [2+CONSUMER_WARPS, 2+2*CONSUMER_WARPS): TMEM consumer, one per
-     *   consumer warp -- starts with 0 (EPILOGUE WARP)
+     * bit 2: TMEM producer -- starts with 1 (CONSUMER WARP)
+     * bit 3: TMEM consumer -- starts with 0 (EPILOGUE WARP)
      */
     static constexpr int TMA_PRODUCER_BIT = 0b1;
-    static constexpr int TMA_CONSUMER_BITS = 0b000;
-    static constexpr int TMEM_PRODUCER_BITS = ((1 << CONSUMER_WARPS) - 1) << 2;
-    static constexpr int TMEM_CONSUMER_BITS = 0;
+    static constexpr int TMA_CONSUMER_BIT = 0b00;
+    static constexpr int TMEM_PROUCER_BIT = 0b100;
+    static constexpr int TMEM_CONSUMER_BIT = 0b0000;
     static constexpr int PHASE_BITS_INIT =
-        TMA_PRODUCER_BIT | TMA_CONSUMER_BITS | TMEM_PRODUCER_BITS | TMEM_CONSUMER_BITS;
+        TMA_PRODUCER_BIT | TMA_CONSUMER_BIT | TMEM_PROUCER_BIT | TMEM_CONSUMER_BIT;
 };
 
-template <int _ROW_BLOCK,
-          int _COL_BLOCK,
-          int _NUM_CTA = DEFAULT_NUM_CTA,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
-__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>
-ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
-                                      const at::Tensor& A_local_buf,
-                                      const at::Tensor& B,
-                                      at::Tensor& C,
-                                      int dev_idx,
-                                      int M,
-                                      int N) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA = DEFAULT_NUM_CTA>
+__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA> ag_gemm_warp_specialized_make_globals(
+    dist::ParallelBuffer& A,
+    const at::Tensor& A_local_buf,
+    const at::Tensor& B,
+    at::Tensor& C,
+    int dev_idx,
+    int M,
+    int N) {
+    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA>;
 
-    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
-            .A_local_buf =
-                ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf),
-            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
-            .A_copy_ready = nullptr,
-            .A_copy_epoch = 0,
-            .dev_idx = dev_idx,
-            .M = M,
-            .N = N};
+    return {
+        .A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+        .A_local_buf = ::dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A_local_buf),
+        .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+        .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
+        .A_copy_ready = nullptr,
+        .A_copy_epoch = 0,
+        .dev_idx = dev_idx,
+        .M = M,
+        .N = N};
 }
 
 void entrypoint(dist::ParallelBuffer& A,
@@ -200,18 +183,17 @@ void entrypoint(dist::ParallelBuffer& A,
     const int dev_idx = A.local_rank_;
     c10::cuda::CUDAGuard device_guard(dev_idx);
 
-    // C is now [NUM_DEVICES, local_m, N];
-    const int M = C.size(0) * C.size(1), N = B.size(0);
+    const int M = C.size(0), N = B.size(0);
     constexpr int K = fused_globals<128, 128>::K;
 
     TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
                 "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
 
     // TODO: this only works for TP == 8
-    constexpr int MIN_LARGE_GEMM_N = 6288;
+    constexpr int KDA_N = 6400;
 
     // use size of N to check which projection is being done
-    if (N >= MIN_LARGE_GEMM_N) {
+    if (N == KDA_N) {
         switch (logical_global_m) {
             case 2048: {
                 using fg = fused_globals<128, 128, 2>;
@@ -242,24 +224,24 @@ void entrypoint(dist::ParallelBuffer& A,
                 break;
             }
             case 8192: {
-                using fg = fused_globals<128, 256, 2, 2>;
+                using fg = fused_globals<128, 256, 2>;
                 fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
                 break;
             }
             case 16384: {
-                using fg = fused_globals<128, 256, 2, 2>;
+                using fg = fused_globals<128, 256, 2>;
                 fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
                 break;
             }
             case 32768: {
-                using fg = fused_globals<128, 256, 2, 2>;
+                using fg = fused_globals<128, 256, 2>;
                 fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
                 break;
             }
             default:
@@ -313,7 +295,7 @@ void entrypoint(dist::ParallelBuffer& A,
                 using fg = fused_globals<128, 256, 2>;
                 fg globals =
                     ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
                 break;
             }
             default:
