@@ -103,12 +103,11 @@ The MMA code is adapted from [ThunderKittens](https://github.com/HazyResearch/Th
 ## Citation
 
 ```bibtex
-@misc{mao2026mkernel,
-  title        = {mKernel: Fast Multi-GPU, Multi-Node Fused Kernels},
-  author       = {Mao, Ziming and Raiciu, Costin and Zhou, Yang and Shenker, Scott and Stoica, Ion},
-  year         = {2026},
-  month        = may,
-  url          = {https://uccl-project.github.io/posts/mkernel/},
+@article{mao2026mkernel,
+  title={mKernel: Fast Multi-GPU, Multi-Node Fused Kernels},
+  author={Mao, Ziming and Zhang, Yihan and Chew, Shawn Wei and Ma, Shuang and Raiciu, Costin and Zhou, Yang and Shenker, Scott and Stoica, Ion},
+  journal={arXiv preprint arXiv:2609.13585},
+  year={2026}
 }
 ```
 
