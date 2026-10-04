@@ -178,7 +178,8 @@ plots:
 .PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
-	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized
+	test-slot-math plots ag-gemm-warp-specialized ag-gemm-warp-specialized-profile \
+	run-ag-gemm-warp-specialized
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -192,8 +193,27 @@ $(BUILD)/libgemm_ar_blackwell.so : $(SRC)/gemm_ar_blackwell.cu | $(BUILD)
 run-ag-gemm-warp-specialized : ag-gemm-warp-specialized
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/ag_gemm_bench.py --warmup 20 --iters 50 --arch blackwell --intranode-only
 
-ag-gemm-warp-specialized : $(BUILD)/libag_gemm_warp_specialized.so
+PROFILE ?= 0
+ifeq ($(PROFILE),1)
+AG_GEMM_WARP_SPECIALIZED_LIB := $(BUILD)/libag_gemm_warp_specialized_profile.so
+else
+AG_GEMM_WARP_SPECIALIZED_LIB := $(BUILD)/libag_gemm_warp_specialized.so
+endif
 
-$(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $(BUILD)
+ag-gemm-warp-specialized : $(AG_GEMM_WARP_SPECIALIZED_LIB)
+
+ag-gemm-warp-specialized-profile : $(BUILD)/libag_gemm_warp_specialized_profile.so
+
+AG_GEMM_WARP_SPECIALIZED_HEADERS := \
+	include/common/timings.cuh \
+	include/operators/ag_gemm/ag_gemm_timing.cuh \
+	include/operators/ag_gemm/ag_gemm_warp_specialized.cuh \
+	include/operators/ag_gemm/ag_gemm_warp_specialized_session.cuh
+
+$(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu $(AG_GEMM_WARP_SPECIALIZED_HEADERS) | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_warp_specialized $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+$(BUILD)/libag_gemm_warp_specialized_profile.so : $(SRC)/ag_gemm_warp_specialized.cu $(AG_GEMM_WARP_SPECIALIZED_HEADERS) | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DPROFILE_TIMINGS -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_warp_specialized_profile $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@

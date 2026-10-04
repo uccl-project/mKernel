@@ -29,6 +29,7 @@
 #include "memory/tk_ops_thread_util_tma.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
+#include "operators/ag_gemm/ag_gemm_timing.cuh"
 
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 
@@ -49,13 +50,35 @@ struct fused_globals;
 // supergroup; wider supergroups trade B-tile reuse for A-tile reuse in L2.
 static constexpr int DEFAULT_SUPERGROUP_WIDTH = 5;
 
+// Optional host-side diagnostics for the submission bubble between the eager
+// and late copy batches. Times use the host steady clock and therefore are not
+// directly aligned with the device's %globaltimer timestamps.
+struct HostLaunchTiming {
+    uint64_t attribute_ns = 0;
+    uint64_t launch_ns = 0;
+    uint64_t submission_gap_ns = 0;
+    bool attribute_configured_now = false;
+    bool launch_was_captured = false;
+#ifdef PROFILE_TIMINGS
+    // Timed events do not consume an SM. They replace the one-thread marker
+    // kernels that could be starved behind the persistent GEMM and delay the
+    // memcpy they were supposed to observe.
+    cudaEvent_t memcpy_anchor_event = nullptr;
+    cudaEvent_t memcpy_begin_events[INTRA_NUM_DEVICES] = {};
+    cudaEvent_t memcpy_complete_events[INTRA_NUM_DEVICES] = {};
+    bool memcpy_events_initialized = false;
+#endif
+};
+
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
           int _NUM_CTA = DEFAULT_NUM_CTA,
           int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
 void launch_ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G,
+    void* timing_records = nullptr,
+    HostLaunchTiming* host_timing = nullptr);
 
 // for M < 512, this should be 128
 template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _NUM_CONSUMER_WARPS>
@@ -64,7 +87,7 @@ struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
 
     // not sure if I want to use a warp specialized or sm specialized strategy yet
-    static constexpr int NUM_BLOCKS = 148;
+    static constexpr int NUM_BLOCKS = AG_GEMM_NUM_BLOCKS;
     static constexpr int CONSUMER_WARPS = _NUM_CONSUMER_WARPS;
     static constexpr int PRODUCER_WARPS = 1;
     static constexpr int EPILOGUE_WARPGROUPS = 1;
@@ -143,6 +166,10 @@ struct fused_globals {
     // Copy-engine completion is published into local HBM.
     uint32_t* A_copy_ready;
     static constexpr uint32_t A_copy_epoch = 1;
+
+#ifdef PROFILE_TIMINGS
+    TimingRecord* timings;
+#endif
 
     int dev_idx;
     int M;
@@ -259,6 +286,9 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
                 reinterpret_cast<uint64_t>(B), 1, 1, N, K),
             .C = C_tensor,
             .A_copy_ready = nullptr,
+#ifdef PROFILE_TIMINGS
+            .timings = nullptr,
+#endif
             .dev_idx = dev_idx,
             .M = M,
             .N = N,
@@ -287,6 +317,9 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
             .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = C_tensor,
             .A_copy_ready = nullptr,
+#ifdef PROFILE_TIMINGS
+            .timings = nullptr,
+#endif
             .dev_idx = dev_idx,
             .M = M,
             .N = N,
@@ -310,7 +343,9 @@ void entrypoint(DistributedTensor& A,
                 int N = -1,
                 int K = -1,
                 int dev_idx = -1,
-                cudaStream_t stream = nullptr) {
+                cudaStream_t stream = nullptr,
+                void* timing_records = nullptr,
+                HostLaunchTiming* host_timing = nullptr) {
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     dev_idx = dev_idx == -1 ? A.local_rank_ : dev_idx;
     M = M == -1 ? C.size(0) * C.size(1) : M;
@@ -331,25 +366,29 @@ void entrypoint(DistributedTensor& A,
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 128, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 15>(
+                globals, timing_records, host_timing);
         } else if (M <= 3072) {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(
+                globals, timing_records, host_timing);
         } else if (M <= 3584) {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 20>(
+                globals, timing_records, host_timing);
         } else if (M <= 4096) {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5>(
+                globals, timing_records, host_timing);
         } else if (M <= 8192) {
             using fg = fused_globals<128, 256, 2, 2>;
             fg globals =
@@ -359,7 +398,8 @@ void entrypoint(DistributedTensor& A,
                                                       256,
                                                       2,
                                                       2>(A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(
+                globals, timing_records, host_timing);
         } else if (M <= 16384) {
             using fg = fused_globals<128, 256, 2, 2>;
             fg globals =
@@ -369,7 +409,8 @@ void entrypoint(DistributedTensor& A,
                                                       256,
                                                       2,
                                                       2>(A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(
+                globals, timing_records, host_timing);
         } else {
             using fg = fused_globals<128, 256, 2, 2>;
             fg globals =
@@ -379,7 +420,8 @@ void entrypoint(DistributedTensor& A,
                                                       256,
                                                       2,
                                                       2>(A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(
+                globals, timing_records, host_timing);
         }
     } else {
         if (M <= 2048) {
@@ -387,43 +429,50 @@ void entrypoint(DistributedTensor& A,
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 128, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 25>(
+                globals, timing_records, host_timing);
         } else if (M <= 3072) {
             using fg = fused_globals<128, 128, 1>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 128, 1>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
+            launch_ag_gemm_warp_specialized<128, 128, 1, 20>(
+                globals, timing_records, host_timing);
         } else if (M <= 3584) {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(
+                globals, timing_records, host_timing);
         } else if (M <= 4096) {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(
+                globals, timing_records, host_timing);
         } else if (M <= 8192) {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10>(
+                globals, timing_records, host_timing);
         } else if (M <= 16384) {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(
+                globals, timing_records, host_timing);
         } else {
             using fg = fused_globals<128, 256, 2>;
             fg globals =
                 ag_gemm_warp_specialized_make_globals<DistributedTensor, LocalTensor, 128, 256, 2>(
                     A, B, C, dev_idx, M, N, K, stream);
-            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15>(
+                globals, timing_records, host_timing);
         }
     }
 }

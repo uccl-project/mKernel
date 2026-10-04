@@ -9,7 +9,9 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +61,13 @@ struct ACopyPipelineState {
 
 ACopyPipelineState A_copy_states[INTRA_NUM_DEVICES];
 
+using HostClock = std::chrono::steady_clock;
+
+inline uint64_t elapsed_host_ns(HostClock::time_point start) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(HostClock::now() - start).count());
+}
+
 inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     ACopyPipelineState& state = A_copy_states[dev_idx];
     if (!state.initialized) {
@@ -76,6 +85,24 @@ inline ACopyPipelineState& get_A_copy_state(int dev_idx) {
     }
     return state;
 }
+
+#ifdef PROFILE_TIMINGS
+// This is the only helper kernel in the memcpy timing path. It runs before any
+// copies or the persistent GEMM, so it cannot be starved by the kernel being
+// profiled. Timed CUDA events provide every per-copy endpoint without using SMs;
+// the dumper aligns their relative clock to this %globaltimer sample.
+__global__ void record_memcpy_timing_anchor(TimingRecord* records) {
+    if (records != nullptr && threadIdx.x == 0) {
+        timing_profile::store_record(
+            records,
+            static_cast<uint64_t>(TIMING_CONTROL_BLOCK) * EVENTS_PER_BLOCK +
+                TIMING_ANCHOR_INDEX,
+            timing_profile::globaltimer_ns(),
+            0,
+            0);
+    }
+}
+#endif
 
 // tcgen05 MMA with the CTA group taken from the config. mm2_AB / mma2_AB are
 // hardwired to a 2-CTA group, so spell out the ncta template argument instead.
@@ -188,6 +215,14 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     __shared__ uint32_t tmem_addr;
     tensor_allocator<1, fg::NUM_CLUSTERS> tm_alloc{};
 
+#ifdef PROFILE_TIMINGS
+    __shared__ uint32_t timing_head;
+    if (threadIdx.x == 0) {
+        timing_head = 0;
+    }
+    __syncthreads();
+#endif
+
     uint32_t phasebits = fg::PHASE_BITS_INIT;
 
     if (warp_id == 0 && elect_warp_leader()) {
@@ -215,7 +250,11 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     // flush to ensure the mbarriers are visible
     everyone::tma::cluster::arrive_aligned();
 
-    auto load = [&](int tile_row_idx, int tile_col_idx, int target_device, int& input_stage_id) {
+    auto load = [&](int tile_id,
+                    int tile_row_idx,
+                    int tile_col_idx,
+                    int target_device,
+                    int& input_stage_id) {
         const int actual_target_device = (target_device + G.dev_idx) % fg::NUM_DEVICES;
         const bool is_local = actual_target_device == G.dev_idx;
 
@@ -223,10 +262,16 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         // D2D copy. Both the payload and flag reside in local HBM, so GPU-scope
         // acquire is sufficient for the consumer.
         if (!is_local) {
+#ifdef PROFILE_TIMINGS
+            timing_profile::emit(G.timings, &timing_head, EV_COPY_WAIT_BEGIN, tile_id);
+#endif
             while (comm::atomic_u32::acquire_load_gpu(&G.A_copy_ready[actual_target_device]) <
                    fg::A_copy_epoch) {
                 __nanosleep(16);
             }
+#ifdef PROFILE_TIMINGS
+            timing_profile::emit(G.timings, &timing_head, EV_COPY_WAIT_DONE, tile_id);
+#endif
         }
 
         // tile_row_idx is consumer 0's row tile; each additional consumer
@@ -298,8 +343,14 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     auto consume = [&](typename fg::C_tt_tile* tmem,
                        int& input_stage_id,
                        int& epilogue_stage_id,
-                       const int consumer_id) {
+                       const int consumer_id,
+                       const int tile_id) {
         const int consumer_semaphore_idx = consumer_id + 2;
+#ifdef PROFILE_TIMINGS
+        const uint32_t timing_payload =
+            (static_cast<uint32_t>(consumer_id) << 28) |
+            (static_cast<uint32_t>(tile_id) & 0x0fffffffu);
+#endif
         wait(epilogue_tmem_finished[epilogue_stage_id * fg::CONSUMER_WARPS + consumer_id],
              (phasebits >> consumer_semaphore_idx) & 0b1);
 
@@ -307,6 +358,12 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+
+#ifdef PROFILE_TIMINGS
+            if (cta_rank == 0) {
+                timing_profile::emit(G.timings, &timing_head, EV_GEMM_BEGIN, timing_payload);
+            }
+#endif
 
             mm_ABt_ncta<fg::NUM_CTA>(
                 tmem[epilogue_stage_id], A_smem, B_smem, mma_finish[input_stage_id]);
@@ -347,10 +404,16 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                         const int consumer_id,
                         int& epilogue_stage_id,
                         int& epilogue_transfer_stage_id,
-                        bool is_last_tile) {
+                        bool is_last_tile,
+                        int tile_id) {
         const auto& C_out = G.C;
         constexpr int C_CHUNK_COLS = fg::COL_BLOCK / fg::C_TILE_DIVISOR;
         rt_bf<fg::ROW_BLOCK / WARPGROUP_WARPS, C_CHUNK_COLS> c_reg[fg::C_TILE_DIVISOR];
+#ifdef PROFILE_TIMINGS
+        const uint32_t timing_payload =
+            (static_cast<uint32_t>(consumer_id) << 28) |
+            (static_cast<uint32_t>(tile_id) & 0x0fffffffu);
+#endif
 
         // Mirrors consume()'s consumer_semaphore_idx (bits [2, 2+CONSUMER_WARPS)):
         // this is the other end of the same per-consumer double-buffer, using
@@ -358,6 +421,12 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         const int epilogue_semaphore_idx = 2 + fg::CONSUMER_WARPS + consumer_id;
         wait(epilogue_ready[epilogue_stage_id * fg::CONSUMER_WARPS + consumer_id],
              (phasebits >> epilogue_semaphore_idx) & 0b1);
+
+#ifdef PROFILE_TIMINGS
+        if (warpgroup::laneid() == 0 && cta_rank == 0) {
+            timing_profile::emit(G.timings, &timing_head, EV_GEMM_DONE, timing_payload);
+        }
+#endif
 
 #pragma unroll
         for (int i = 0; i < fg::C_TILE_DIVISOR; i++) {
@@ -431,7 +500,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
                     int target_device = tile_id / cluster_tiles_per_device;
 
-                    load(local_row_id * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS + cta_rank,
+                    load(tile_id,
+                         local_row_id * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS + cta_rank,
                          tile_col_idx,
                          target_device,
                          input_stage_id);
@@ -473,7 +543,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
 
                 for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_comp_clusters) {
-                    consume(tmem, input_stage_id, epilogue_stage_id, consumer_warp_id);
+                    consume(
+                        tmem, input_stage_id, epilogue_stage_id, consumer_warp_id, tile_id);
                 }
             }
 
@@ -519,7 +590,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
                          c,
                          epilogue_stage_id[c],
                          epilogue_transfer_stage_id,
-                         tile_id + num_comp_clusters >= total_num_tiles);
+                         tile_id + num_comp_clusters >= total_num_tiles,
+                         tile_id);
             }
         }
 
@@ -575,7 +647,16 @@ template <int _ROW_BLOCK,
           int SUPERGROUP_WIDTH,
           int _NUM_CONSUMER_WARPS>
 inline void launch_ag_gemm_warp_specialized(
-    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
+    const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G,
+    void* timing_records,
+    HostLaunchTiming* host_timing) {
+    if (host_timing != nullptr) {
+        host_timing->attribute_ns = 0;
+        host_timing->launch_ns = 0;
+        host_timing->submission_gap_ns = 0;
+        host_timing->attribute_configured_now = false;
+        host_timing->launch_was_captured = false;
+    }
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -588,17 +669,68 @@ inline void launch_ag_gemm_warp_specialized(
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
+    constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
+    constexpr int num_threads = fg::NUM_THREADS;
+    constexpr int grid = fg::NUM_BLOCKS;
+
+    auto this_kernel =
+        fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH, _NUM_CONSUMER_WARPS>;
+
+    // This attribute is invariant for a kernel specialization and device. Do
+    // the first configuration before submitting any copies, then cache it, so
+    // it can never create an idle hole between the eager and late copy batches.
+    static std::atomic<bool> attribute_configured[INTRA_NUM_DEVICES] = {};
+    if (!attribute_configured[G.dev_idx].load(std::memory_order_acquire)) {
+        HostClock::time_point attribute_start;
+        if (host_timing != nullptr) {
+            attribute_start = HostClock::now();
+        }
+        MKERNEL_CUDACHECK(cudaFuncSetAttribute(
+            this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        attribute_configured[G.dev_idx].store(true, std::memory_order_release);
+        if (host_timing != nullptr) {
+            host_timing->attribute_ns = elapsed_host_ns(attribute_start);
+            host_timing->attribute_configured_now = true;
+        }
+    }
+
     MKERNEL_CUDACHECK(
         cudaMemsetAsync(copy_state.ready, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
 
     fg launch_G = G;
     launch_G.A_copy_ready = copy_state.ready;
+#ifdef PROFILE_TIMINGS
+    launch_G.timings = static_cast<TimingRecord*>(timing_records);
+#else
+    (void)timing_records;
+#endif
 
     // Capture prior work on the caller's stream. On repeated invocations this
     // prevents the copy stream from overwriting A's staged peer slots until the
     // previous persistent kernel on the caller stream has finished consuming them.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
+
+#ifdef PROFILE_TIMINGS
+    const bool record_memcpy_events = launch_G.timings != nullptr && host_timing != nullptr &&
+        host_timing->memcpy_events_initialized;
+    unsigned int memcpy_event_record_flags = cudaEventRecordDefault;
+    if (record_memcpy_events) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        MKERNEL_CUDACHECK(cudaStreamIsCapturing(copy_state.stream, &capture_status));
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            host_timing->launch_was_captured = true;
+            // A normal captured event represents graph dependencies but need
+            // not update a queryable event timestamp on replay. An external
+            // record node does, while preserving stream order.
+            memcpy_event_record_flags = cudaEventRecordExternal;
+        }
+        record_memcpy_timing_anchor<<<1, 1, 0, copy_state.stream>>>(launch_G.timings);
+        MKERNEL_CUDACHECK(cudaEventRecordWithFlags(host_timing->memcpy_anchor_event,
+                                                   copy_state.stream,
+                                                   memcpy_event_record_flags));
+    }
+#endif
 
     const size_t shard_elements = static_cast<size_t>(G.A.rows()) * G.K;
     const size_t shard_bytes = shard_elements * sizeof(typename fg::A_local_tensor::dtype);
@@ -608,13 +740,28 @@ inline void launch_ag_gemm_warp_specialized(
     // owning device, so peer copies never overwrite any rank's source data.
     constexpr int eager_copy_end = fg::NUM_DEVICES < 4 ? fg::NUM_DEVICES : 4;
 #pragma unroll
-    for (int distance = 1; distance < eager_copy_end; ++distance) {
+    for (int distance = 1; distance < fg::NUM_DEVICES; ++distance) {
         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
         auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
         const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
 
+#ifdef PROFILE_TIMINGS
+        if (record_memcpy_events) {
+            MKERNEL_CUDACHECK(cudaEventRecordWithFlags(host_timing->memcpy_begin_events[distance],
+                                                       copy_state.stream,
+                                                       memcpy_event_record_flags));
+        }
+#endif
         MKERNEL_CUDACHECK(
             cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+#ifdef PROFILE_TIMINGS
+        if (record_memcpy_events) {
+            MKERNEL_CUDACHECK(
+                cudaEventRecordWithFlags(host_timing->memcpy_complete_events[distance],
+                                         copy_state.stream,
+                                         memcpy_event_record_flags));
+        }
+#endif
 
         // Keep the default pre-write barrier: it publishes the copied shard
         // before the completion epoch. The kernel-side load only needs GPU
@@ -625,15 +772,14 @@ inline void launch_ag_gemm_warp_specialized(
                                              CU_STREAM_WRITE_VALUE_DEFAULT));
     }
 
-    constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
-    constexpr int num_threads = fg::NUM_THREADS;
-    constexpr int grid = fg::NUM_BLOCKS;
-
-    auto this_kernel =
-        fused_kernel_stub<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, SUPERGROUP_WIDTH, _NUM_CONSUMER_WARPS>;
-
-    MKERNEL_CUDACHECK(
-        cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    // The GPU can drain the eager copy batch while the host is below. Measure
+    // the entire interval until the late batch can be submitted, as well as its
+    // two potentially expensive CUDA API calls, for comparison with the device
+    // timeline's visible copy-stream gap.
+    HostClock::time_point submission_gap_start;
+    if (host_timing != nullptr) {
+        submission_gap_start = HostClock::now();
+    }
 
     cudaLaunchAttribute pdl_attr = {};
     pdl_attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -647,25 +793,48 @@ inline void launch_ag_gemm_warp_specialized(
     launch_config.attrs = &pdl_attr;
     launch_config.numAttrs = 1;
 
-    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
-
-#pragma unroll
-    for (int distance = eager_copy_end; distance < fg::NUM_DEVICES; ++distance) {
-        const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
-        auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
-        const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
-
-        MKERNEL_CUDACHECK(
-            cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
-
-        // Keep the default pre-write barrier: it publishes the copied shard
-        // before the completion epoch. The kernel-side load only needs GPU
-        // scope because it reads a flag and payload resident on this device.
-        MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
-                                             reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
-                                             fg::A_copy_epoch,
-                                             CU_STREAM_WRITE_VALUE_DEFAULT));
+    HostClock::time_point launch_start;
+    if (host_timing != nullptr) {
+        launch_start = HostClock::now();
     }
+    MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, launch_G));
+    if (host_timing != nullptr) {
+        host_timing->launch_ns = elapsed_host_ns(launch_start);
+        host_timing->submission_gap_ns = elapsed_host_ns(submission_gap_start);
+    }
+
+// #pragma unroll
+//     for (int distance = eager_copy_end; distance < fg::NUM_DEVICES; ++distance) {
+//         const int peer = (G.dev_idx + distance) % fg::NUM_DEVICES;
+//         auto* dst = G.A[G.dev_idx].raw_ptr + static_cast<size_t>(peer) * shard_elements;
+//         const auto* src = G.A[peer].raw_ptr + static_cast<size_t>(peer) * shard_elements;
+
+// #ifdef PROFILE_TIMINGS
+//         if (record_memcpy_events) {
+//             MKERNEL_CUDACHECK(cudaEventRecordWithFlags(host_timing->memcpy_begin_events[distance],
+//                                                        copy_state.stream,
+//                                                        memcpy_event_record_flags));
+//         }
+// #endif
+//         MKERNEL_CUDACHECK(
+//             cudaMemcpyAsync(dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
+// #ifdef PROFILE_TIMINGS
+//         if (record_memcpy_events) {
+//             MKERNEL_CUDACHECK(
+//                 cudaEventRecordWithFlags(host_timing->memcpy_complete_events[distance],
+//                                          copy_state.stream,
+//                                          memcpy_event_record_flags));
+//         }
+// #endif
+
+    //     // Keep the default pre-write barrier: it publishes the copied shard
+    //     // before the completion epoch. The kernel-side load only needs GPU
+    //     // scope because it reads a flag and payload resident on this device.
+    //     MKERNEL_CUCHECK(cuStreamWriteValue32(reinterpret_cast<CUstream>(copy_state.stream),
+    //                                          reinterpret_cast<CUdeviceptr>(copy_state.ready + peer),
+    //                                          fg::A_copy_epoch,
+    //                                          CU_STREAM_WRITE_VALUE_DEFAULT));
+    // }
 
     // have the copy stream join the main stream again to ensure cudagraph compatibility
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
