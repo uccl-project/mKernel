@@ -172,6 +172,7 @@ class BlackwellBenchVars:
     mkernel_padded_n: int | None = None
     mkernel_a_dist: DistBufferLike | None = None
     mkernel_a_copy_ready: DistBufferLike | None = None
+    mkernel_sync: torch.Tensor | None = None
     mkernel_b_buf: torch.Tensor | None = None
     mkernel_c_buf: torch.Tensor | None = None
 
@@ -531,6 +532,17 @@ def unpad_rows(
     rows = c.view(world_size, padded_local_m, -1)[:, :local_m, :logical_n]
     return rows.reshape(world_size * local_m, logical_n)
 
+def run_prepared_ag_gemm(mod, A, ready, B, C, sync):
+    """Capture reset and cross-rank ordering together with the kernel launch."""
+    mod.ag_gemm_warp_specialized_prepare(ready, C.size(0) * C.size(1), B.size(0))
+    # These GPU collectives depend on preceding work on the current stream and
+    # insert a dependency for subsequent work, including on CUDA graph replay.
+    dist.all_reduce(sync)
+    mod.ag_gemm_warp_specialized_launch(A, ready, B, C)
+    # All consumers/copy streams must finish before any rank reuses A or flags.
+    dist.all_reduce(sync)
+
+
 def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
     all_correct = True
     for (projection, logical_n), m in product(config.projections, config.shapes_to_test):
@@ -591,8 +603,9 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         dist.barrier()
 
         C_kernel.zero_()
-        mod.ag_gemm_warp_specialized(
-            A_kernel, A_copy_ready, B_kernel, C_kernel
+        sync = torch.zeros(1, device="cuda", dtype=torch.int32)
+        run_prepared_ag_gemm(
+            mod, A_kernel, A_copy_ready, B_kernel, C_kernel, sync
         )
         torch.cuda.synchronize()
 
@@ -840,6 +853,7 @@ def ag_gemm_blackwell_prepare(
         multicast=True,
     )
     run_config.mkernel_a_copy_ready.data_.zero_()
+    run_config.mkernel_sync = torch.zeros(1, device="cuda", dtype=torch.int32)
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
 
     # The fused kernel reads peer shards, and the multicast path requires every
@@ -852,10 +866,12 @@ def ag_gemm_blackwell_prepare(
     tune_iterations = 5
 
     def run_mkernel():
-        mod.ag_gemm_warp_specialized(
+        run_prepared_ag_gemm(
+            mod,
             run_config.mkernel_a_dist,
             run_config.mkernel_a_copy_ready,
             run_config.mkernel_b_buf, run_config.mkernel_c_buf,
+            run_config.mkernel_sync,
         )
 
     # Build the logical reference before capture so torch.mm initializes cuBLAS
@@ -865,6 +881,11 @@ def ag_gemm_blackwell_prepare(
     )
     dist.all_gather_into_tensor(A_ref, A_local)
     C_ref = torch.mm(A_ref, B_ref)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Initialize the copy stream and collective resources before capture.
+    run_mkernel()
     torch.cuda.synchronize()
     dist.barrier()
 

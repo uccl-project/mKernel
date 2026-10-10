@@ -44,6 +44,11 @@ enum class AgStrategy {
     MULTICAST_PUSH,
 };
 
+// Shared by prepare and launch so the reset matches the dispatched transport.
+constexpr AgStrategy strategy_for_shape(int M, int N) {
+    return N < MIN_LARGE_GEMM_N && M <= 4096 ? AgStrategy::MULTICAST_PUSH : AgStrategy::PULL;
+}
+
 template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _NUM_CONSUMER_WARPS>
 struct fused_globals;
 
@@ -297,18 +302,51 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
     }
 }
 
+// Enqueue the local reset. Before launch, callers must establish a stream-ordered
+// cross-rank barrier AFTER every rank's prepare (and input writes). The previous
+// invocation must have finished on every rank before reusing its flags/buffers.
+template <AgStrategy STRATEGY, typename ReadyTensor>
+static void prepare_impl(ReadyTensor& A_copy_ready, int dev_idx, cudaStream_t stream) {
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    if (!stream)
+        stream = at::cuda::getCurrentCUDAStream().stream();
+#endif
+    void* local_flags;
+    if constexpr (dist::RawDistributedMulticastTensorLike<ReadyTensor, comm::bf16>) {
+        local_flags = A_copy_ready.uc_ptrs[dev_idx];
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    } else if constexpr (std::is_same_v<ReadyTensor, dist::ParallelBuffer>) {
+        local_flags = A_copy_ready.data_.data_ptr();
+#endif
+    } else {
+        static_assert(always_false_v<ReadyTensor>, "Unsupported ready tensor type");
+    }
+    constexpr size_t flag_count = STRATEGY == AgStrategy::MULTICAST_PUSH ? 1 : INTRA_NUM_DEVICES;
+    MKERNEL_CUDACHECK(cudaMemsetAsync(local_flags, 0, flag_count * sizeof(uint32_t), stream));
+}
+
+// Use the same physical (padded) M and N that will be passed to launch.
+template <typename ReadyTensor>
+void prepare(ReadyTensor& A_copy_ready, int M, int N, int dev_idx, cudaStream_t stream) {
+    if (strategy_for_shape(M, N) == AgStrategy::MULTICAST_PUSH)
+        prepare_impl<AgStrategy::MULTICAST_PUSH>(A_copy_ready, dev_idx, stream);
+    else
+        prepare_impl<AgStrategy::PULL>(A_copy_ready, dev_idx, stream);
+}
+
 // A contains every rank's shard; callers initialize only A[rank] on each device.
-// M/N/K are the physical tensor dimensions, including any caller-provided padding.
+// M/N/K are physical tensor dimensions, including padding. Does not reset flags:
+// prepare -> cross-rank barrier -> launch -> cross-rank completion barrier.
 template <typename DistributedTensor, typename ReadyTensor, typename LocalTensor>
-void entrypoint(DistributedTensor& A,
-                ReadyTensor& A_copy_ready,
-                const LocalTensor& B,
-                LocalTensor& C,
-                int M,
-                int N,
-                int K,
-                int dev_idx,
-                cudaStream_t stream) {
+void launch(DistributedTensor& A,
+            ReadyTensor& A_copy_ready,
+            const LocalTensor& B,
+            LocalTensor& C,
+            int M,
+            int N,
+            int K,
+            int dev_idx,
+            cudaStream_t stream) {
     // use size of N to check which projection is being done
     if (N >= MIN_LARGE_GEMM_N) {
         if (M <= 2048) {

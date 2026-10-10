@@ -592,16 +592,7 @@ inline void launch_ag_gemm_warp_specialized(
     static_assert(fg::SMEM_FITS, "SMEM allocation too large for this config");
     ACopyPipelineState& copy_state = get_A_copy_state(G.dev_idx);
 
-    // Reset before the fork event so graph replay orders every copy-stream
-    // completion publication after the reset.
-    if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
-        MKERNEL_CUDACHECK(
-            cudaMemsetAsync(G.A_copy_ready[G.dev_idx].raw_ptr, 0, sizeof(uint32_t), stream));
-    } else {
-        MKERNEL_CUDACHECK(cudaMemsetAsync(
-            G.A_copy_ready[G.dev_idx].raw_ptr, 0, fg::NUM_DEVICES * sizeof(uint32_t), stream));
-    }
-
+    // NOTE: must prepare and the caller's cross-rank barrier precede this fork on stream.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.main_pre_event, stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(copy_state.stream, copy_state.main_pre_event, 0));
 
