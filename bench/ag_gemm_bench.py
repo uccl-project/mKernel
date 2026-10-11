@@ -171,7 +171,6 @@ class BlackwellBenchVars:
     mkernel_padded_n: int | None = None
     mkernel_a_dist: DistBufferLike | None = None
     mkernel_a_copy_ready: DistBufferLike | None = None
-    mkernel_sync: torch.Tensor | None = None
     mkernel_b_buf: torch.Tensor | None = None
     mkernel_c_buf: torch.Tensor | None = None
 
@@ -531,15 +530,10 @@ def unpad_rows(
     rows = c.view(world_size, padded_local_m, -1)[:, :local_m, :logical_n]
     return rows.reshape(world_size * local_m, logical_n)
 
-def run_prepared_ag_gemm(mod, A, ready, B, C, sync):
-    """
-    Capture reset and cross-rank ordering together with the kernel launch.
-    We use all_reduce here to implement a barrier, but without the CPU side sync
-    """
+def run_prepared_ag_gemm(mod, A, ready, B, C):
+    """Advance the GPU epoch and launch, including peer buffer-reuse ordering."""
     mod.ag_gemm_warp_specialized_prepare(ready, C.size(0) * C.size(1), B.size(0))
-    dist.all_reduce(sync)
     mod.ag_gemm_warp_specialized_launch(A, ready, B, C)
-    dist.all_reduce(sync)
 
 
 def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
@@ -581,7 +575,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         )
         A_kernel.data_[config.local_rank].copy_(pad_rows(config, A_ref_local, padded_local_m))
         A_copy_ready = mod.DistBuffer(
-            (config.world_size,), dtype=torch.int32,
+            (mod.ag_gemm_warp_specialized_ready_words,), dtype=torch.int32,
             local_rank=config.local_rank,
             local_world_size=config.world_size,
             multicast=True,
@@ -602,9 +596,8 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         dist.barrier()
 
         C_kernel.zero_()
-        sync = torch.zeros(1, device="cuda", dtype=torch.int32)
         run_prepared_ag_gemm(
-            mod, A_kernel, A_copy_ready, B_kernel, C_kernel, sync
+            mod, A_kernel, A_copy_ready, B_kernel, C_kernel
         )
         torch.cuda.synchronize()
 
@@ -847,12 +840,11 @@ def ag_gemm_blackwell_prepare(
     )
     run_config.mkernel_a_dist.data_[config.local_rank].copy_(A_mk_local)
     run_config.mkernel_a_copy_ready = mod.DistBuffer(
-        (config.world_size,), dtype=torch.int32,
+        (mod.ag_gemm_warp_specialized_ready_words,), dtype=torch.int32,
         local_rank=config.local_rank, local_world_size=config.world_size,
         multicast=True,
     )
     run_config.mkernel_a_copy_ready.data_.zero_()
-    run_config.mkernel_sync = torch.zeros(1, device="cuda", dtype=torch.int32)
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
 
     # The fused kernel reads peer shards, and the multicast path requires every
@@ -870,7 +862,6 @@ def ag_gemm_blackwell_prepare(
             run_config.mkernel_a_dist,
             run_config.mkernel_a_copy_ready,
             run_config.mkernel_b_buf, run_config.mkernel_c_buf,
-            run_config.mkernel_sync,
         )
 
     # Build the logical reference before capture so torch.mm initializes cuBLAS
@@ -883,7 +874,7 @@ def ag_gemm_blackwell_prepare(
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Initialize the copy stream and collective resources before capture.
+    # Initialize the copy stream before capture.
     run_mkernel()
     torch.cuda.synchronize()
     dist.barrier()

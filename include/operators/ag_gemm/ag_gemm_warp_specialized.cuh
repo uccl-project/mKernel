@@ -44,9 +44,47 @@ enum class AgStrategy {
     MULTICAST_PUSH,
 };
 
-// Shared by prepare and launch so the reset matches the dispatched transport.
-constexpr AgStrategy strategy_for_shape(int M, int N) {
-    return N < MIN_LARGE_GEMM_N && M <= 4096 ? AgStrategy::MULTICAST_PUSH : AgStrategy::PULL;
+// Zero this allocation once, before any rank starts using it. Each rank owns
+// its copy flags, current epoch, and completion epoch. Keep it alive across
+// graph replays, and serialize prepare/launch pairs on one stream per device.
+static constexpr int EPOCH_SLOT = INTRA_NUM_DEVICES;
+static constexpr int COMPLETED_SLOT = EPOCH_SLOT + 1;
+static constexpr int READY_WORDS = COMPLETED_SLOT + 1;
+using A_ready_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, READY_WORDS>;
+using A_ready_distributed_tensor =
+    dist::distributed_tensor<A_ready_local_tensor, INTRA_NUM_DEVICES, false>;
+
+void prepare_ready(const A_ready_distributed_tensor& ready, int dev_idx, cudaStream_t stream);
+
+// Ranks can differ by at most one invocation. Modular comparison also handles
+// uint32 wraparound without resetting flags while a peer is still using them.
+__device__ inline bool epoch_reached(uint32_t observed, uint32_t expected) {
+    return static_cast<int32_t>(observed - expected) >= 0;
+}
+
+// https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/p2593r1.html#valid-workaround
+// to allow the else branch of template deductions to accept static_assert(0)
+template <typename>
+inline constexpr bool always_false_v = false;
+
+template <typename ReadyTensor>
+A_ready_distributed_tensor make_ready_tensor(ReadyTensor& ready) {
+    if constexpr (dist::RawDistributedMulticastTensorLike<ReadyTensor, comm::bf16>) {
+        return dist::make_distributed_tensor<A_ready_distributed_tensor>(
+            reinterpret_cast<uint64_t*>(ready.uc_ptrs), 1, 1, 1, READY_WORDS);
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    } else if constexpr (std::is_same_v<ReadyTensor, dist::ParallelBuffer>) {
+        TORCH_CHECK(ready.data_.scalar_type() == at::kInt && ready.data_.is_contiguous() &&
+                        ready.data_.numel() >= READY_WORDS,
+                    "A_copy_ready must contain at least ",
+                    READY_WORDS,
+                    " contiguous int32 words, initialized to zero once before use");
+        return dist::distributed_tensor_from_buffer<A_ready_distributed_tensor>(
+            ready, 1, 1, 1, READY_WORDS);
+#endif
+    } else {
+        static_assert(always_false_v<ReadyTensor>, "Unsupported ready tensor type");
+    }
 }
 
 template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _NUM_CONSUMER_WARPS>
@@ -147,12 +185,7 @@ struct fused_globals {
     B_local_tensor B;
     C_local_tensor C;
 
-    // One distributed allocation holds all copy-engine completion flags.
-    using A_ready_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, NUM_DEVICES>;
-    using A_ready_distributed_tensor =
-        dist::distributed_tensor<A_ready_local_tensor, NUM_DEVICES, false>;
     A_ready_distributed_tensor A_copy_ready;
-    static constexpr uint32_t A_copy_epoch = 1;
 
     int dev_idx;
     int M;
@@ -186,11 +219,6 @@ struct fused_globals {
     static constexpr int PHASE_BITS_INIT =
         TMA_PRODUCER_BIT | TMA_CONSUMER_BITS | TMEM_PRODUCER_BITS | TMEM_CONSUMER_BITS;
 };
-
-// https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/p2593r1.html#valid-workaround
-// to allow the else branch of template deductions to accept static_assert(0)
-template <typename>
-inline constexpr bool always_false_v = false;
 
 template <int ROW_BLOCK,
           int COL_BLOCK,
@@ -271,8 +299,7 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
             .B = dist::make_local_tensor<typename fg::B_local_tensor>(
                 reinterpret_cast<uint64_t>(B), 1, 1, N, K),
             .C = C_tensor,
-            .A_copy_ready = dist::make_distributed_tensor<typename fg::A_ready_distributed_tensor>(
-                reinterpret_cast<uint64_t*>(A_copy_ready.uc_ptrs), 1, 1, 1, fg::NUM_DEVICES),
+            .A_copy_ready = make_ready_tensor(A_copy_ready),
             .dev_idx = dev_idx,
             .M = M,
             .N = N,
@@ -287,9 +314,7 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
             .A = dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
             .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
             .C = C_tensor,
-            .A_copy_ready =
-                dist::distributed_tensor_from_buffer<typename fg::A_ready_distributed_tensor>(
-                    A_copy_ready, 1, 1, 1, fg::NUM_DEVICES),
+            .A_copy_ready = make_ready_tensor(A_copy_ready),
             .dev_idx = dev_idx,
             .M = M,
             .N = N,
@@ -302,41 +327,22 @@ ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
     }
 }
 
-// Enqueue the local reset. Before launch, callers must establish a stream-ordered
-// cross-rank barrier AFTER every rank's prepare (and input writes). The previous
-// invocation must have finished on every rank before reusing its flags/buffers.
-template <AgStrategy STRATEGY, typename ReadyTensor>
-static void prepare_impl(ReadyTensor& A_copy_ready, int dev_idx, cudaStream_t stream) {
+// Advance the device-side epoch and wait for peers' input writes. This executes
+// on every graph replay; no host counter, flag reset, or NCCL barrier is needed.
+// M/N remain in the API for compatibility; both transports share the same state.
+template <typename ReadyTensor>
+void prepare(ReadyTensor& A_copy_ready, int M, int N, int dev_idx, cudaStream_t stream) {
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream)
         stream = at::cuda::getCurrentCUDAStream().stream();
 #endif
-    void* local_flags;
-    if constexpr (dist::RawDistributedMulticastTensorLike<ReadyTensor, comm::bf16>) {
-        local_flags = A_copy_ready.uc_ptrs[dev_idx];
-#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-    } else if constexpr (std::is_same_v<ReadyTensor, dist::ParallelBuffer>) {
-        local_flags = A_copy_ready.data_.data_ptr();
-#endif
-    } else {
-        static_assert(always_false_v<ReadyTensor>, "Unsupported ready tensor type");
-    }
-    constexpr size_t flag_count = STRATEGY == AgStrategy::MULTICAST_PUSH ? 1 : INTRA_NUM_DEVICES;
-    MKERNEL_CUDACHECK(cudaMemsetAsync(local_flags, 0, flag_count * sizeof(uint32_t), stream));
-}
-
-// Use the same physical (padded) M and N that will be passed to launch.
-template <typename ReadyTensor>
-void prepare(ReadyTensor& A_copy_ready, int M, int N, int dev_idx, cudaStream_t stream) {
-    if (strategy_for_shape(M, N) == AgStrategy::MULTICAST_PUSH)
-        prepare_impl<AgStrategy::MULTICAST_PUSH>(A_copy_ready, dev_idx, stream);
-    else
-        prepare_impl<AgStrategy::PULL>(A_copy_ready, dev_idx, stream);
+    prepare_ready(make_ready_tensor(A_copy_ready), dev_idx, stream);
 }
 
 // A contains every rank's shard; callers initialize only A[rank] on each device.
-// M/N/K are physical tensor dimensions, including padding. Does not reset flags:
-// prepare -> cross-rank barrier -> launch -> cross-rank completion barrier.
+// All ranks must enqueue the same sequence of prepare -> launch pairs. Launch
+// includes a completion handshake before subsequent stream work can reuse A.
+// M/N/K are physical tensor dimensions, including padding.
 template <typename DistributedTensor, typename ReadyTensor, typename LocalTensor>
 void launch(DistributedTensor& A,
             ReadyTensor& A_copy_ready,

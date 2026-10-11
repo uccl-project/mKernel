@@ -8,11 +8,14 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BIND_DIST_PARALLEL_BUFFER(m);
+    m.attr("ag_gemm_warp_specialized_ready_words") = ag_gemm_warp_specialized::READY_WORDS;
     m.def(
         "ag_gemm_warp_specialized_prepare",
         [](dist::ParallelBuffer& A_copy_ready, int M, int N) {
             const int dev_idx = A_copy_ready.local_rank_;
             c10::cuda::CUDAGuard device_guard(dev_idx);
+            ag_gemm_warp_specialized::prepare(
+                A_copy_ready, M, N, dev_idx, at::cuda::getCurrentCUDAStream().stream());
         },
         pybind11::arg("A_copy_ready"),
         pybind11::arg("M"),
