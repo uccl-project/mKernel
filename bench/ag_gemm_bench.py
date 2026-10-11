@@ -12,8 +12,7 @@ CUTLASS_PATH=<path to cutlass root folder>
 THUNDERKITTENS_PATH=<path to TK root folder>
 USE_QUACK=<1 / 0, default 0>
 
-QUACK requires quack-kernels, nvidia-cutlass-dsl>=4.7, and
-apache-tvm-ffi>=0.1.10,<0.2 in the torchrun environment.
+QUACK requires quack-kernels, get them using the guide at https://github.com/Dao-AILab/quack#installation
 
 E.g. THUNDERKITTENS_PATH=/home/ThunderKittens CUTLASS_PATH=/home/cutlass python -m torch.distributed.run \
     --standalone --nproc-per-node=8 ag_gemm_bench.py --arch blackwell --intranode-only
@@ -533,13 +532,13 @@ def unpad_rows(
     return rows.reshape(world_size * local_m, logical_n)
 
 def run_prepared_ag_gemm(mod, A, ready, B, C, sync):
-    """Capture reset and cross-rank ordering together with the kernel launch."""
+    """
+    Capture reset and cross-rank ordering together with the kernel launch.
+    We use all_reduce here to implement a barrier, but without the CPU side sync
+    """
     mod.ag_gemm_warp_specialized_prepare(ready, C.size(0) * C.size(1), B.size(0))
-    # These GPU collectives depend on preceding work on the current stream and
-    # insert a dependency for subsequent work, including on CUDA graph replay.
     dist.all_reduce(sync)
     mod.ag_gemm_warp_specialized_launch(A, ready, B, C)
-    # All consumers/copy streams must finish before any rank reuses A or flags.
     dist.all_reduce(sync)
 
 
