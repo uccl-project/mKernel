@@ -1,13 +1,20 @@
 #pragma once
 
+#include <cassert>
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
+
+#include "dist/dbuf_buffer_bridge.cuh"
+#include "dist/parallel_buffer.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "comm/comm.cuh"
@@ -17,13 +24,13 @@
 #include "common/tk_types_shared_st.cuh"
 #include "common/tk_types_tensor.cuh"
 #include "common/types.cuh"
-#include "dist/dbuf_buffer_bridge.cuh"
 #include "dist/distributed_buffer.cuh"
 #include "dist/local_tensor.cuh"
-#include "dist/parallel_buffer.cuh"
 #include "dist/tma.cuh"
 #include "memory/tk_ops_group_group.cuh"
+#include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
+#include "memory/tk_ops_thread_util_tma.cuh"
 
 namespace ag_gemm_warp_specialized {
 
@@ -31,11 +38,53 @@ namespace ag_gemm_warp_specialized {
 // the pair so each CTA stages half the B tile; 1 gives every CTA its own MMA.
 static constexpr int DEFAULT_NUM_CTA = 2;
 static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 1;
+static constexpr int MIN_LARGE_GEMM_N = 6288;
+enum class AgStrategy {
+    PULL,
+    MULTICAST_PUSH,
+};
 
-template <int _ROW_BLOCK,
-          int _COL_BLOCK,
-          int _NUM_CTA = DEFAULT_NUM_CTA,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+// Zero this allocation once, before any rank starts using it. Each rank owns
+// its copy flags and current epoch. Keep it alive across
+// graph replays, and serialize prepare/launch pairs on one stream per device.
+static constexpr int EPOCH_SLOT = INTRA_NUM_DEVICES;
+static constexpr int READY_WORDS = EPOCH_SLOT + 1;
+using A_ready_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, READY_WORDS>;
+using A_ready_distributed_tensor =
+    dist::distributed_tensor<A_ready_local_tensor, INTRA_NUM_DEVICES, false>;
+
+void prepare_ready(const A_ready_distributed_tensor& ready, int dev_idx, cudaStream_t stream);
+
+__device__ inline bool epoch_reached(uint32_t observed, uint32_t expected) {
+    return static_cast<int32_t>(observed - expected) >= 0;
+}
+
+// https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/p2593r1.html#valid-workaround
+// to allow the else branch of template deductions to accept static_assert(0)
+template <typename>
+inline constexpr bool always_false_v = false;
+
+template <typename ReadyTensor>
+A_ready_distributed_tensor make_ready_tensor(ReadyTensor& ready) {
+    if constexpr (dist::RawDistributedMulticastTensorLike<ReadyTensor, comm::bf16>) {
+        return dist::make_distributed_tensor<A_ready_distributed_tensor>(
+            reinterpret_cast<uint64_t*>(ready.uc_ptrs), 1, 1, 1, READY_WORDS);
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    } else if constexpr (std::is_same_v<ReadyTensor, dist::ParallelBuffer>) {
+        TORCH_CHECK(ready.data_.scalar_type() == at::kInt && ready.data_.is_contiguous() &&
+                        ready.data_.numel() >= READY_WORDS,
+                    "A_copy_ready must contain at least ",
+                    READY_WORDS,
+                    " contiguous int32 words, initialized to zero once before use");
+        return dist::distributed_tensor_from_buffer<A_ready_distributed_tensor>(
+            ready, 1, 1, 1, READY_WORDS);
+#endif
+    } else {
+        static_assert(always_false_v<ReadyTensor>, "Unsupported ready tensor type");
+    }
+}
+
+template <int _ROW_BLOCK, int _COL_BLOCK, int _NUM_CTA, int _NUM_CONSUMER_WARPS>
 struct fused_globals;
 
 // Number of tile columns visited before the snake pattern steps to the next
@@ -44,9 +93,10 @@ static constexpr int DEFAULT_SUPERGROUP_WIDTH = 5;
 
 template <int _ROW_BLOCK,
           int _COL_BLOCK,
-          int _NUM_CTA = DEFAULT_NUM_CTA,
-          int SUPERGROUP_WIDTH = DEFAULT_SUPERGROUP_WIDTH,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
+          int _NUM_CTA,
+          int SUPERGROUP_WIDTH,
+          int _NUM_CONSUMER_WARPS,
+          AgStrategy STRATEGY>
 void launch_ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G);
 
@@ -114,28 +164,32 @@ struct fused_globals {
     // in launch_ag_gemm_warp_specialized, so nothing oversized can actually launch.
     static constexpr bool SMEM_FITS = DYNAMIC_SHARED_MEMORY <= MAX_DYNAMIC_SHARED_MEMORY;
 
-    using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
+    using A_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using A_distributed_tensor = dist::distributed_tensor<A_local_tensor, NUM_DEVICES, true>;
-
-    // we declare a separate A tensor here that is indexed as ((NUM_DEVICES, local_m), K), so that
-    // TMA loads that go out of bounds will naturally zero themselves out
-    using A_replicated_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
-    using C_local_tensor = dist::local_tensor<comm::bf16, 1, NUM_DEVICES, -1, -1, C_tile>;
+
+    // Keep C's real N stride. The generic local_tensor helper rounds the
+    // tensor-map width to the swizzle granularity, which can produce OOB or
+    // shifted stores when N is not a multiple of C_tile::cols.
+    struct C_local_tensor {
+        comm::bf16* data;
+        CUtensorMap map;
+
+        __device__ inline void prefetch_tma() const { dist::tma::prefetch_tensormap(&map); }
+    };
 
     A_distributed_tensor A;
-    A_replicated_tensor A_local_buf;
     B_local_tensor B;
     C_local_tensor C;
 
-    // Copy-engine completion is published into local HBM.
-    uint32_t* A_copy_ready;
-    static constexpr uint32_t A_copy_epoch = 1;
+    A_ready_distributed_tensor A_copy_ready;
 
     int dev_idx;
     int M;
     int N;
-    static constexpr int K = 7168;
+    int K;
+
+    cudaStream_t stream = nullptr;
 
     struct pipeline_inputs {
         A_tile A[_NUM_CONSUMER_WARPS];
@@ -163,159 +217,190 @@ struct fused_globals {
         TMA_PRODUCER_BIT | TMA_CONSUMER_BITS | TMEM_PRODUCER_BITS | TMEM_CONSUMER_BITS;
 };
 
-template <int _ROW_BLOCK,
-          int _COL_BLOCK,
-          int _NUM_CTA = DEFAULT_NUM_CTA,
-          int _NUM_CONSUMER_WARPS = DEFAULT_NUM_CONSUMER_WARPS>
-__host__ inline fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>
-ag_gemm_warp_specialized_make_globals(dist::ParallelBuffer& A,
-                                      const at::Tensor& A_local_buf,
-                                      const at::Tensor& B,
-                                      at::Tensor& C,
+template <int ROW_BLOCK,
+          int COL_BLOCK,
+          int NUM_CTA,
+          int NUM_CONSUMER_WARPS,
+          typename DistributedTensor,
+          typename ReadyTensor,
+          typename LocalTensor>
+__host__ inline fused_globals<ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>
+ag_gemm_warp_specialized_make_globals(DistributedTensor& A,
+                                      ReadyTensor& A_copy_ready,
+                                      const LocalTensor& B,
+                                      LocalTensor& C,
                                       int dev_idx,
                                       int M,
-                                      int N) {
-    using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
+                                      int N,
+                                      int K,
+                                      cudaStream_t stream) {
+    using fg = fused_globals<ROW_BLOCK, COL_BLOCK, NUM_CTA, NUM_CONSUMER_WARPS>;
 
-    return {.A = ::dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
-            .A_local_buf =
-                ::dist::local_tensor_from_tensor<typename fg::A_replicated_tensor>(A_local_buf),
-            .B = ::dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-            .C = ::dist::local_tensor_from_tensor<typename fg::C_local_tensor>(C),
-            .A_copy_ready = nullptr,
+    const int local_m = M / fg::NUM_DEVICES;
+    typename fg::C_local_tensor C_tensor;
+    if constexpr (std::is_same_v<LocalTensor, comm::bf16*>) {
+        C_tensor.data = C;
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    } else if constexpr (std::is_same_v<LocalTensor, at::Tensor>) {
+        C_tensor.data = reinterpret_cast<comm::bf16*>(C.data_ptr());
+#endif
+    } else {
+        static_assert(always_false_v<LocalTensor>, "Unsupported local tensor type");
+    }
+
+    uint64_t global_dim[3] = {
+        static_cast<uint64_t>(N),
+        static_cast<uint64_t>(local_m),
+        static_cast<uint64_t>(fg::NUM_DEVICES),
+    };
+    uint64_t global_stride[2] = {
+        static_cast<uint64_t>(N) * sizeof(comm::bf16),
+        static_cast<uint64_t>(local_m) * N * sizeof(comm::bf16),
+    };
+    uint32_t box_dim[3] = {
+        fg::C_tile::cols,
+        fg::C_tile::rows,
+        1,
+    };
+    uint32_t element_stride[3] = {1, 1, 1};
+
+    constexpr CUtensorMapSwizzle c_swizzle = fg::C_tile::swizzle_bytes == 128
+        ? CU_TENSOR_MAP_SWIZZLE_128B
+        : fg::C_tile::swizzle_bytes == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
+                                          : CU_TENSOR_MAP_SWIZZLE_32B;
+
+    MKERNEL_CUCHECK(cuTensorMapEncodeTiled(&C_tensor.map,
+                                           CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                                           3,
+                                           C_tensor.data,
+                                           global_dim,
+                                           global_stride,
+                                           box_dim,
+                                           element_stride,
+                                           CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                           c_swizzle,
+                                           CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    if constexpr (std::is_same_v<LocalTensor, comm::bf16*> &&
+                  dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16> &&
+                  dist::RawDistributedMulticastTensorLike<ReadyTensor, comm::bf16>) {
+        return {
+            .A = dist::make_distributed_tensor<typename fg::A_distributed_tensor>(
+                reinterpret_cast<uint64_t>(A.mc),
+                reinterpret_cast<uint64_t*>(A.uc_ptrs),
+                1,
+                fg::NUM_DEVICES,
+                local_m,
+                K),
+            .B = dist::make_local_tensor<typename fg::B_local_tensor>(
+                reinterpret_cast<uint64_t>(B), 1, 1, N, K),
+            .C = C_tensor,
+            .A_copy_ready = make_ready_tensor(A_copy_ready),
             .dev_idx = dev_idx,
             .M = M,
-            .N = N};
+            .N = N,
+            .K = K,
+            .stream = stream,
+        };
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    } else if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
+                         std::is_same_v<DistributedTensor, dist::ParallelBuffer> &&
+                         std::is_same_v<ReadyTensor, dist::ParallelBuffer>) {
+        return {
+            .A = dist::distributed_tensor_from_buffer<typename fg::A_distributed_tensor>(A),
+            .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+            .C = C_tensor,
+            .A_copy_ready = make_ready_tensor(A_copy_ready),
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N,
+            .K = K,
+            .stream = stream,
+        };
+#endif
+    } else {
+        static_assert(always_false_v<LocalTensor>, "Unsupported distributed/local tensor types");
+    }
 }
 
-void entrypoint(dist::ParallelBuffer& A,
-                const at::Tensor& A_local_buf,
-                const at::Tensor& B,
-                at::Tensor& C,
-                const int logical_global_m  // used to determine what the actual shape being
-                                            // operated on is, since M might be padded up
-) {
-    const int dev_idx = A.local_rank_;
-    c10::cuda::CUDAGuard device_guard(dev_idx);
+// Advance the device-side epoch and wait for peers' input writes. This executes
+// on every graph replay; no host counter, flag reset, or NCCL barrier is needed.
+// M/N remain in the API for compatibility; both transports share the same state.
+template <typename ReadyTensor>
+void prepare(ReadyTensor& A_copy_ready, int M, int N, int dev_idx, cudaStream_t stream) {
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
+    if (!stream)
+        stream = at::cuda::getCurrentCUDAStream().stream();
+#endif
+    prepare_ready(make_ready_tensor(A_copy_ready), dev_idx, stream);
+}
 
-    // C is now [NUM_DEVICES, local_m, N];
-    const int M = C.size(0) * C.size(1), N = B.size(0);
-    constexpr int K = fused_globals<128, 128>::K;
-
-    TORCH_CHECK(A.local_world_size_ == INTRA_NUM_DEVICES,
-                "A.local_world_size must match the compiled INTRA_NUM_DEVICES");
-
-    // TODO: this only works for TP == 8
-    constexpr int MIN_LARGE_GEMM_N = 6288;
-
+// A contains every rank's shard; callers initialize only A[rank] on each device.
+// All ranks must enqueue the same sequence of prepare -> launch pairs on an
+// ordered stream. Launch joins the local copy stream; the next prepare waits
+// for all ranks before reusing gathered buffers. There is no exit barrier.
+// For pull, callers must keep source shards unchanged until all peer reads
+// finish: synchronize all ranks before rewriting/freeing them, or retain
+// separate source allocations. An entry barrier cannot protect earlier writes.
+// M/N/K are physical tensor dimensions, including padding.
+template <typename DistributedTensor, typename ReadyTensor, typename LocalTensor>
+void launch(DistributedTensor& A,
+            ReadyTensor& A_copy_ready,
+            const LocalTensor& B,
+            LocalTensor& C,
+            int M,
+            int N,
+            int K,
+            int dev_idx,
+            cudaStream_t stream) {
     // use size of N to check which projection is being done
     if (N >= MIN_LARGE_GEMM_N) {
-        switch (logical_global_m) {
-            case 2048: {
-                using fg = fused_globals<128, 128, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 15>(globals);
-                break;
-            }
-            case 3072: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
-                break;
-            }
-            case 3584: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 20>(globals);
-                break;
-            }
-            case 4096: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
-                break;
-            }
-            case 8192: {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
-                break;
-            }
-            case 16384: {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
-                break;
-            }
-            case 32768: {
-                using fg = fused_globals<128, 256, 2, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2>(globals);
-                break;
-            }
-            default:
-                TORCH_CHECK(false, "ag_gemm_warp_specialized: no tile config for M=", M, " N=", N);
+        if (M <= 2048) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 128, 2, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 15, 1, AgStrategy::PULL>(globals);
+        } else if (M <= 3072) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 1, AgStrategy::PULL>(globals);
+        } else if (M <= 3584) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 20, 1, AgStrategy::PULL>(globals);
+        } else if (M <= 4096) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 1, AgStrategy::PULL>(globals);
+        } else {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 5, 2, AgStrategy::PULL>(globals);
         }
     } else {
-        switch (logical_global_m) {
-            case 2048: {
-                using fg = fused_globals<128, 128, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 128, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 2, 25>(globals);
-                break;
-            }
-            case 3072: {
-                using fg = fused_globals<128, 128, 1>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 128, 1>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 128, 1, 20>(globals);
-                break;
-            }
-            case 3584: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
-                break;
-            }
-            case 4096: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
-                break;
-            }
-            case 8192: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 10>(globals);
-                break;
-            }
-            case 16384: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
-                break;
-            }
-            case 32768: {
-                using fg = fused_globals<128, 256, 2>;
-                fg globals =
-                    ag_gemm_warp_specialized_make_globals<128, 256, 2>(A, A_local_buf, B, C, dev_idx, M, N);
-                launch_ag_gemm_warp_specialized<128, 256, 2, 15>(globals);
-                break;
-            }
-            default:
-                TORCH_CHECK(false, "ag_gemm_warp_specialized: no tile config for M=", M, " N=", N);
+        if (M <= 2048) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 128, 2, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 128, 2, 25, 1, AgStrategy::MULTICAST_PUSH>(
+                globals);
+        } else if (M <= 3072) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 128, 1, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 128, 1, 20, 1, AgStrategy::MULTICAST_PUSH>(
+                globals);
+        } else if (M <= 4096) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, AgStrategy::MULTICAST_PUSH>(
+                globals);
+        } else if (M <= 8192) {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 1>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 10, 1, AgStrategy::PULL>(globals);
+        } else {
+            auto globals = ag_gemm_warp_specialized_make_globals<128, 256, 2, 2>(
+                A, A_copy_ready, B, C, dev_idx, M, N, K, stream);
+            launch_ag_gemm_warp_specialized<128, 256, 2, 15, 2, AgStrategy::PULL>(globals);
         }
     }
 }

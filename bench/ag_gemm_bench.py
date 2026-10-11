@@ -10,13 +10,16 @@ To include cutlass and TK's distributed kernels, specify the following environme
 
 CUTLASS_PATH=<path to cutlass root folder>
 THUNDERKITTENS_PATH=<path to TK root folder>
+USE_QUACK=<1 / 0, default 0>
+
+QUACK requires quack-kernels, get them using the guide at https://github.com/Dao-AILab/quack#installation
 
 E.g. THUNDERKITTENS_PATH=/home/ThunderKittens CUTLASS_PATH=/home/cutlass python -m torch.distributed.run \
     --standalone --nproc-per-node=8 ag_gemm_bench.py --arch blackwell --intranode-only
 """
 from __future__ import annotations
 
-import argparse, json, os, sys, time
+import argparse, inspect, json, os, sys, time
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
@@ -138,6 +141,15 @@ class BlackwellBenchConfig:
     tk_tile_granularity = 256
     tk_comm_sms = (2, 4, 8, 16, 32, 64)
 
+    # QUACK dense SM100 kernels support tile_M=128/256 in their normal config
+    # space; tile_M=512 is not supported. Keep the requested policy here and
+    # filter it through quack_supported_tile_m before compiling candidates.
+    # ref: https://github.com/Dao-AILab/quack/blob/main/quack/gemm_sm100.py#L3020-L3055
+    quack_small_tile_m = (128, 256)
+    quack_large_tile_m = (256, 512)
+    quack_supported_tile_m = (128, 256)
+    quack_tile_n = 256
+
 @dataclass
 class BlackwellBenchVars:
     """Per-(projection, M) kernel-input state, filled in progressively as each candidate is set up -- every field defaults to None so BlackwellBenchVars() can be built empty and filled in later."""
@@ -158,7 +170,7 @@ class BlackwellBenchVars:
     mkernel_padded_m: int | None = None
     mkernel_padded_n: int | None = None
     mkernel_a_dist: DistBufferLike | None = None
-    mkernel_a_local_buf: torch.Tensor | None = None
+    mkernel_a_copy_ready: DistBufferLike | None = None
     mkernel_b_buf: torch.Tensor | None = None
     mkernel_c_buf: torch.Tensor | None = None
 
@@ -169,6 +181,14 @@ class BlackwellBenchVars:
     tk_b_transposed: torch.Tensor | None = None
     tk_c_buf: torch.Tensor | None = None
     tk_barrier: DistBufferLike | None = None
+
+    # QUACK specific args. The runner owns symmetric buffers and side streams,
+    # so retain it alongside every tensor whose address is baked into the graph.
+    quack_runner: object | None = None
+    quack_a_local: torch.Tensor | None = None
+    quack_b_transposed: torch.Tensor | None = None
+    quack_c_buf: torch.Tensor | None = None
+    quack_graph: torch.cuda.CUDAGraph | None = None
 
 CONFIGS = {
     "hopper": HopperBenchConfig,
@@ -510,6 +530,16 @@ def unpad_rows(
     rows = c.view(world_size, padded_local_m, -1)[:, :local_m, :logical_n]
     return rows.reshape(world_size * local_m, logical_n)
 
+def run_prepared_ag_gemm(mod, A, ready, B, C):
+    """Advance the GPU epoch, synchronize ranks before transfer, then launch.
+
+    Benchmark inputs stay unchanged across replays. The kernel joins its local
+    copy stream; the next prepare supplies cross-rank buffer-reuse ordering.
+    """
+    mod.ag_gemm_warp_specialized_prepare(ready, C.size(0) * C.size(1), B.size(0))
+    mod.ag_gemm_warp_specialized_launch(A, ready, B, C)
+
+
 def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
     all_correct = True
     for (projection, logical_n), m in product(config.projections, config.shapes_to_test):
@@ -541,16 +571,20 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         # dispatched schedule tiles at. The padding rows and columns are zero,
         # so they contribute zero to C and cost only the tiles spent on them.
         A_kernel = mod.DistBuffer(
-            (padded_local_m, config.default_k),
+            (config.world_size, padded_local_m, config.default_k),
             dtype=torch.bfloat16,
             local_rank=config.local_rank,
             local_world_size=config.world_size,
             multicast=True,
         )
-        A_kernel.data_.copy_(pad_rows(config, A_ref_local, padded_local_m))
-        A_local_buf = torch.empty(
-            (config.world_size, padded_local_m, config.default_k), device="cuda", dtype=torch.bfloat16
+        A_kernel.data_[config.local_rank].copy_(pad_rows(config, A_ref_local, padded_local_m))
+        A_copy_ready = mod.DistBuffer(
+            (mod.ag_gemm_warp_specialized_ready_words,), dtype=torch.int32,
+            local_rank=config.local_rank,
+            local_world_size=config.world_size,
+            multicast=True,
         )
+        A_copy_ready.data_.zero_()
         # ag_gemm_warp_specialized takes B pre-transposed to [N, K] (contiguous K reads
         # per N-tile); see the same transform in ag_gemm_blackwell_prepare.
         B_kernel = pad_cols(config, B_ref, padded_n).T.contiguous()
@@ -566,7 +600,9 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
         dist.barrier()
 
         C_kernel.zero_()
-        mod.ag_gemm_warp_specialized(A_kernel, A_local_buf, B_kernel, C_kernel, m)
+        run_prepared_ag_gemm(
+            mod, A_kernel, A_copy_ready, B_kernel, C_kernel
+        )
         torch.cuda.synchronize()
 
         # Drop the padded rows and columns and compare the logical
@@ -669,7 +705,7 @@ def check_correctness_ag_gemm_blackwell(config: BlackwellBenchConfig, mod):
             del A_tk, B_tk_transposed, tk_barrier
 
         del A_ref_local, A_ref, B_ref, C_ref
-        del A_kernel, A_local_buf, B_kernel, C_kernel
+        del A_kernel, A_copy_ready, B_kernel, C_kernel
         dist.barrier()
 
     if not all_correct:
@@ -690,6 +726,7 @@ def report_blackwell_result(
     baseline_ms = ms_by_name.get("baseline")
     cutlass_ms = ms_by_name.get("cutlass")
     tk_ms = ms_by_name.get("TK")
+    quack_ms = ms_by_name.get("quack")
     mkernel_ms = ms_by_name.get("mkernel")
 
     def tflops_for(ms: float) -> float:
@@ -721,6 +758,13 @@ def report_blackwell_result(
             f"{tflops_for(tk_ms):8.2f} TFLOP/s{vs_baseline}",
             flush=True,
         )
+    if quack_ms is not None:
+        vs_baseline = f"  ({baseline_ms / quack_ms:6.3f}x vs baseline)" if baseline_ms else ""
+        print(
+            f"  {'QUACK AG-GEMM':<26} {quack_ms:8.3f} ms  "
+            f"{tflops_for(quack_ms):8.2f} TFLOP/s{vs_baseline}",
+            flush=True,
+        )
     if mkernel_ms is not None:
         line = (
             f"  {'ag_gemm_warp_specialized':<26} {mkernel_ms:8.3f} ms  "
@@ -734,11 +778,13 @@ def report_blackwell_result(
         if tk_ms is not None:
             verdict = "BEATS" if mkernel_ms < tk_ms else "behind"
             line += f"  {tk_ms / mkernel_ms:6.3f}x vs ThunderKittens ({verdict})"
+        if quack_ms is not None:
+            verdict = "BEATS" if mkernel_ms < quack_ms else "behind"
+            line += f"  {quack_ms / mkernel_ms:6.3f}x vs QUACK ({verdict})"
         print(line, flush=True)
-
 def ag_gemm_blackwell_prepare(
     config: BlackwellBenchConfig, mod, projection: str, global_m: int, logical_n: int,
-    warmup: int, iters: int,
+    warmup: int, iters: int, check_only: bool = False,
 ) -> list[tuple[Callable[[], float | None], str, bool]]:
     """
     To be called per (projection, shape). Tunes each kernel, returning a list of
@@ -793,19 +839,21 @@ def ag_gemm_blackwell_prepare(
     # per-K-step access across N.
     run_config.mkernel_b_buf = pad_cols(config, B_ref, mk_n).T.contiguous()
     run_config.mkernel_a_dist = mod.DistBuffer(
-        (mk_local_m, config.default_k), dtype=torch.bfloat16,
+        (config.world_size, mk_local_m, config.default_k), dtype=torch.bfloat16,
         local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
     )
-    run_config.mkernel_a_dist.data_.copy_(A_mk_local)
-    run_config.mkernel_a_local_buf = torch.empty(
-        (config.world_size, mk_local_m, config.default_k), device="cuda", dtype=torch.bfloat16
+    run_config.mkernel_a_dist.data_[config.local_rank].copy_(A_mk_local)
+    run_config.mkernel_a_copy_ready = mod.DistBuffer(
+        (mod.ag_gemm_warp_specialized_ready_words,), dtype=torch.int32,
+        local_rank=config.local_rank, local_world_size=config.world_size,
+        multicast=True,
     )
+    run_config.mkernel_a_copy_ready.data_.zero_()
     run_config.mkernel_c_buf = torch.zeros((config.world_size, mk_local_m, mk_n), device="cuda", dtype=torch.bfloat16)
 
-    # The kernel's first act is to pull every peer's shard out of their
-    # DistBuffer, so no rank may launch until all of them have finished
-    # filling theirs -- and the fill is stream-ordered work that a bare
-    # dist.barrier() does not wait on.
+    # The fused kernel reads peer shards, and the multicast path requires every
+    # rank's counter backing to be zero before its first replay. A bare host
+    # barrier does not wait for the preceding stream-ordered fills/resets.
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -813,27 +861,40 @@ def ag_gemm_blackwell_prepare(
     tune_iterations = 5
 
     def run_mkernel():
-        mod.ag_gemm_warp_specialized(
-            run_config.mkernel_a_dist, run_config.mkernel_a_local_buf,
-            run_config.mkernel_b_buf, run_config.mkernel_c_buf, global_m,
+        run_prepared_ag_gemm(
+            mod,
+            run_config.mkernel_a_dist,
+            run_config.mkernel_a_copy_ready,
+            run_config.mkernel_b_buf, run_config.mkernel_c_buf,
         )
 
-    mkernel_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(mkernel_graph):
-        run_mkernel()
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    # Check correctness agains the cudagraph
+    # Build the logical reference before capture so torch.mm initializes cuBLAS
+    # outside graph capture.
     A_ref = torch.empty(
         (global_m, config.default_k), device="cuda", dtype=torch.bfloat16
     )
     dist.all_gather_into_tensor(A_ref, A_local)
     C_ref = torch.mm(A_ref, B_ref)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Initialize the copy stream before capture.
+    run_mkernel()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    mkernel_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(mkernel_graph):
+        run_mkernel()
+
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Check the selected transport against the logical reference.
     run_config.mkernel_c_buf.zero_()
     mkernel_graph.replay()
     torch.cuda.synchronize()
-    graph_ok = check_close(
+    mkernel_graph_ok = check_close(
         f"ag-gemm-warp-specialized cudagraph {projection} M={global_m} N={logical_n}",
         unpad_rows(
             run_config.mkernel_c_buf, run_config.logical_m, mk_local_m,
@@ -841,14 +902,15 @@ def ag_gemm_blackwell_prepare(
         ),
         C_ref,
     )
+
     # Vote so every rank bails together; a rank that kept going alone would
     # hang in the next collective.
-    graph_vote = torch.tensor([1 if graph_ok else 0], device="cuda")
+    graph_vote = torch.tensor([1 if mkernel_graph_ok else 0], device="cuda")
     dist.all_reduce(graph_vote, op=dist.ReduceOp.MIN)
     if not graph_vote.item():
         if config.is_chief:
             print(
-                f"ag-gemm-warp-specialized cudagraph {projection} M={global_m}: "
+                f"Blackwell AG-GEMM cudagraph checks {projection} M={global_m}: "
                 f"FAILED :( -- skipping benchmarks.",
                 flush=True,
             )
@@ -856,6 +918,9 @@ def ag_gemm_blackwell_prepare(
         sys.exit(1)
     del A_ref, C_ref
     dist.barrier()
+
+    if check_only:
+        return []
 
     def bench_mkernel():
         mkernel_graph.replay()
@@ -1046,6 +1111,234 @@ def ag_gemm_blackwell_prepare(
 
         fns.append((bench_tk, "TK", True))
 
+    # ---- QUACK: quack/distributed/all_gather_gemm.py ----
+    # QUACK is opt-in because importing it pulls in the CuTe DSL toolchain and
+    # its first eager launch JIT-compiles the selected GEMM configuration.
+    if os.environ.get("USE_QUACK", "0") == "1":
+        quack_ok = True
+        quack_why = ""
+        try:
+            from quack.distributed import AllGatherRunner
+            from quack.gemm import gemm as quack_gemm
+            from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper
+
+            # CUTLASS DSL passes this keyword while building QUACK's TVM-FFI
+            # launch wrapper. It was added in apache-tvm-ffi 0.1.10; older
+            # versions import successfully but fail only at the first JIT.
+            if "map_dataclass_to_tuple" not in inspect.signature(
+                make_kwargs_wrapper
+            ).parameters:
+                raise RuntimeError(
+                    "incompatible apache-tvm-ffi; install "
+                    "'apache-tvm-ffi>=0.1.10,<0.2'"
+                )
+        except Exception as exc:
+            quack_ok = False
+            quack_why = f"{type(exc).__name__}: {exc}"
+
+        quack_vote = torch.tensor([1 if quack_ok else 0], device="cuda")
+        dist.all_reduce(quack_vote, op=dist.ReduceOp.MIN)
+        quack_ok = bool(quack_vote.item())
+        if not quack_ok:
+            if config.is_chief:
+                print(
+                    f"[skip] QUACK all-gather GEMM: "
+                    f"{quack_why or 'unavailable on a peer'}",
+                    flush=True,
+                )
+        else:
+            # CuTe requires BF16 matrix leading dimensions to be 16-byte
+            # aligned. In particular KDA's logical N=6284 would give a
+            # row-major D stride of 6284, which is not divisible by 8 BF16
+            # elements. Pad B/D in N and slice back to logical_n for checking
+            # and useful-TFLOP/s reporting, just like the other candidates.
+            quack_n = round_up(run_config.logical_n, 16)
+            run_config.quack_b_transposed = pad_cols(
+                config, B_ref, quack_n
+            ).T.contiguous()
+            requested_tile_ms = (
+                config.quack_small_tile_m
+                if global_m < 8192
+                else config.quack_large_tile_m
+            )
+            quack_tile_ms = tuple(
+                tile_m
+                for tile_m in requested_tile_ms
+                if tile_m in config.quack_supported_tile_m
+            )
+            unsupported_tile_ms = tuple(
+                tile_m
+                for tile_m in requested_tile_ms
+                if tile_m not in config.quack_supported_tile_m
+            )
+            if config.is_chief and unsupported_tile_ms:
+                print(
+                    f"  [skip] QUACK config {projection} M={global_m}: "
+                    f"unsupported tile_M={unsupported_tile_ms}; "
+                    f"dense SM100 supports tile_M=64/128/256",
+                    flush=True,
+                )
+
+            quack_candidates = []
+            for quack_tile_m in quack_tile_ms:
+                # tile_M=256 selects QUACK's 2-CTA MMA and therefore requires
+                # an even cluster_M. For tile_M=128, retain the 2-CTA config
+                # whenever the logical shard already satisfies its geometry;
+                # otherwise use cluster_M=1 to avoid unnecessary M padding.
+                quack_cluster_m = (
+                    2
+                    if quack_tile_m == 256
+                    or run_config.logical_m % (quack_tile_m * 2) == 0
+                    else 1
+                )
+                quack_local_m = round_up(
+                    run_config.logical_m,
+                    quack_tile_m * quack_cluster_m,
+                )
+                quack_m = quack_local_m * config.world_size
+                quack_a_local = pad_rows(config, A_local, quack_local_m)
+                quack_c_buf = torch.zeros(
+                    (quack_m, quack_n),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                quack_runner = AllGatherRunner(
+                    quack_local_m,
+                    config.default_k,
+                    torch.bfloat16,
+                    device=torch.device("cuda", config.local_rank),
+                )
+
+                def run_quack():
+                    with quack_runner.gather(quack_a_local) as (quack_a, ag_args):
+                        quack_gemm(
+                            quack_a,
+                            run_config.quack_b_transposed,
+                            quack_c_buf,
+                            None,
+                            None,
+                            tile_M=quack_tile_m,
+                            tile_N=config.quack_tile_n,
+                            cluster_M=quack_cluster_m,
+                            cluster_N=1,
+                            # CTA scheduler/L2 traversal group, unrelated to
+                            # the 128-byte TMA shared-memory swizzle.
+                            max_swizzle_size=8,
+                            ag_args=ag_args,
+                        )
+
+                # Compile the candidate and initialize its runner before graph
+                # capture. One replay is one logical AG+GEMM, matching the
+                # other candidates in this cross-implementation benchmark.
+                for _ in range(2):
+                    run_quack()
+                torch.cuda.synchronize()
+                dist.barrier()
+
+                quack_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(quack_graph):
+                    run_quack()
+
+                torch.cuda.synchronize()
+                dist.barrier()
+
+                quack_c_buf.zero_()
+                quack_graph.replay()
+                torch.cuda.synchronize()
+                quack_graph_ok = check_close(
+                    f"QUACK cudagraph {projection} M={global_m} N={logical_n} "
+                    f"tile_m={quack_tile_m} padded_m={quack_m} padded_n={quack_n} "
+                    f"cluster_m={quack_cluster_m}",
+                    unpad_rows(
+                        quack_c_buf,
+                        run_config.logical_m,
+                        quack_local_m,
+                        config.world_size,
+                        logical_n,
+                    ),
+                    unpad_rows(
+                        run_config.mkernel_c_buf,
+                        run_config.logical_m,
+                        mk_local_m,
+                        config.world_size,
+                        logical_n,
+                    ),
+                )
+                if not quack_graph_ok:
+                    continue
+
+                tune_ms = benchmark_cuda(
+                    quack_graph.replay,
+                    tune_warmup,
+                    tune_iterations,
+                )
+                quack_candidates.append(
+                    {
+                        "tile_m": quack_tile_m,
+                        "cluster_m": quack_cluster_m,
+                        "local_m": quack_local_m,
+                        "padded_m": quack_m,
+                        "padded_n": quack_n,
+                        "a_local": quack_a_local,
+                        "c_buf": quack_c_buf,
+                        "runner": quack_runner,
+                        "graph": quack_graph,
+                        "ms": tune_ms,
+                    }
+                )
+
+            if not quack_candidates:
+                if config.is_chief:
+                    print(
+                        f"QUACK cudagraph checks {projection} M={global_m}: "
+                        f"no supported candidate passed.",
+                        flush=True,
+                    )
+                dist.destroy_process_group()
+                sys.exit(1)
+
+            best_quack = min(quack_candidates, key=lambda candidate: candidate["ms"])
+            run_config.quack_runner = best_quack["runner"]
+            run_config.quack_a_local = best_quack["a_local"]
+            run_config.quack_c_buf = best_quack["c_buf"]
+            run_config.quack_graph = best_quack["graph"]
+
+            if config.is_chief:
+                print(
+                    f"  QUACK config {projection} M={global_m}: "
+                    f"tile={best_quack['tile_m']}x{config.quack_tile_n} "
+                    f"cluster={best_quack['cluster_m']}x1 (autotuned)",
+                    flush=True,
+                )
+                for candidate in sorted(
+                    quack_candidates, key=lambda candidate: candidate["ms"]
+                ):
+                    mark = " <- best" if candidate is best_quack else ""
+                    tune_tflops = useful_tflops(
+                        global_m,
+                        logical_n,
+                        config.default_k,
+                        candidate["ms"],
+                    )
+                    print(
+                        f"    [autotune] tile={candidate['tile_m']}x"
+                        f"{config.quack_tile_n} cluster={candidate['cluster_m']}x1 "
+                        f"padded_m={candidate['padded_m']} "
+                        f"padded_n={candidate['padded_n']}: "
+                        f"{candidate['ms']:8.3f} ms  "
+                        f"{tune_tflops:8.2f} TFLOP/s{mark}",
+                        flush=True,
+                    )
+
+            def bench_quack():
+                return benchmark_cuda(
+                    run_config.quack_graph.replay,
+                    warmup,
+                    iters,
+                )
+
+            fns.append((bench_quack, "quack", False))
+
     return fns
 
 def main():
@@ -1073,6 +1366,7 @@ def main():
     mod = load_module.load(config.kernel_name)
     result_sizes, result_fused = [], []
     correctness_ok = True
+    check_only = args.mode == "check"
 
     if args.arch == "hopper":
         # config modification
@@ -1143,8 +1437,24 @@ def main():
 
     else:
         check_correctness_ag_gemm_blackwell(config, mod)
+        if args.mode == "check":
+            # check_correctness_ag_gemm_blackwell already exits nonzero on failure.
+            dist.destroy_process_group()
+            return 0
         for (projection, logical_n), m in product(config.projections, config.shapes_to_test):
-            fns_to_run = ag_gemm_blackwell_prepare(config, mod, projection, m, logical_n, args.warmup, args.iters)
+            fns_to_run = ag_gemm_blackwell_prepare(
+                config,
+                mod,
+                projection,
+                m,
+                logical_n,
+                args.warmup,
+                args.iters,
+                check_only=check_only,
+            )
+
+            if check_only:
+                continue
 
             results = []
             for i, (fn, name, should_wrap) in enumerate(fns_to_run):
@@ -1164,7 +1474,7 @@ def main():
                 if name == "mkernel":
                     result_fused.append(res)
 
-    if config.is_chief and args.save_json:
+    if config.is_chief and args.save_json and not check_only:
         # MERGE with existing JSON so a single-shape bench doesn't erase the
         # other shapes the chart needs.
         from common import write_results_json
@@ -1173,7 +1483,7 @@ def main():
                            note=f"release ag_gemm bench (world={config.world_size*config.num_nodes})")
         print(f"[ag_gemm] wrote {args.save_json}", flush=True)
 
-    if config.is_chief and args.compare_to:
+    if config.is_chief and args.compare_to and not check_only:
         ok = compare_named_results("ag_gemm", result_sizes, result_fused, args.compare_to)
         ok = ok and correctness_ok
         dist.destroy_process_group()
@@ -1187,4 +1497,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-    

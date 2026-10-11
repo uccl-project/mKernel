@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <utility>
+#include <concepts>
 
 namespace dist {
 
@@ -479,5 +480,17 @@ template<typename DistributedTensor>
 __host__ inline DistributedTensor make_dbuf(uint64_t mc, uint64_t* data, int b, int d, int r, int c) {
     return make_distributed_tensor<DistributedTensor>(mc, data, b, d, r, c);
 }
+
+// helper types to define interfaces for raw parallel buffers
+template <typename T, typename dtype>
+concept RawDistributedMulticastTensorLike = requires (const T& mapping) {
+    { mapping.mc } -> std::convertible_to<dtype*>;
+    { mapping.uc_ptrs } -> std::convertible_to<dtype**>;
+};
+
+template <typename T, typename dtype>
+concept RawDistributedTensorLike = requires (const T& mapping) {
+    { mapping.mc } -> std::convertible_to<dtype*>;
+};
 
 } // namespace dist
