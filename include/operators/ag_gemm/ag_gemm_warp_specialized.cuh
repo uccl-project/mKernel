@@ -45,19 +45,16 @@ enum class AgStrategy {
 };
 
 // Zero this allocation once, before any rank starts using it. Each rank owns
-// its copy flags, current epoch, and completion epoch. Keep it alive across
+// its copy flags and current epoch. Keep it alive across
 // graph replays, and serialize prepare/launch pairs on one stream per device.
 static constexpr int EPOCH_SLOT = INTRA_NUM_DEVICES;
-static constexpr int COMPLETED_SLOT = EPOCH_SLOT + 1;
-static constexpr int READY_WORDS = COMPLETED_SLOT + 1;
+static constexpr int READY_WORDS = EPOCH_SLOT + 1;
 using A_ready_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, READY_WORDS>;
 using A_ready_distributed_tensor =
     dist::distributed_tensor<A_ready_local_tensor, INTRA_NUM_DEVICES, false>;
 
 void prepare_ready(const A_ready_distributed_tensor& ready, int dev_idx, cudaStream_t stream);
 
-// Ranks can differ by at most one invocation. Modular comparison also handles
-// uint32 wraparound without resetting flags while a peer is still using them.
 __device__ inline bool epoch_reached(uint32_t observed, uint32_t expected) {
     return static_cast<int32_t>(observed - expected) >= 0;
 }
@@ -340,8 +337,12 @@ void prepare(ReadyTensor& A_copy_ready, int M, int N, int dev_idx, cudaStream_t 
 }
 
 // A contains every rank's shard; callers initialize only A[rank] on each device.
-// All ranks must enqueue the same sequence of prepare -> launch pairs. Launch
-// includes a completion handshake before subsequent stream work can reuse A.
+// All ranks must enqueue the same sequence of prepare -> launch pairs on an
+// ordered stream. Launch joins the local copy stream; the next prepare waits
+// for all ranks before reusing gathered buffers. There is no exit barrier.
+// For pull, callers must keep source shards unchanged until all peer reads
+// finish: synchronize all ranks before rewriting/freeing them, or retain
+// separate source allocations. An entry barrier cannot protect earlier writes.
 // M/N/K are physical tensor dimensions, including padding.
 template <typename DistributedTensor, typename ReadyTensor, typename LocalTensor>
 void launch(DistributedTensor& A,

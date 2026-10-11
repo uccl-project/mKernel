@@ -531,7 +531,11 @@ def unpad_rows(
     return rows.reshape(world_size * local_m, logical_n)
 
 def run_prepared_ag_gemm(mod, A, ready, B, C):
-    """Advance the GPU epoch and launch, including peer buffer-reuse ordering."""
+    """Advance the GPU epoch, synchronize ranks before transfer, then launch.
+
+    Benchmark inputs stay unchanged across replays. The kernel joins its local
+    copy stream; the next prepare supplies cross-rank buffer-reuse ordering.
+    """
     mod.ag_gemm_warp_specialized_prepare(ready, C.size(0) * C.size(1), B.size(0))
     mod.ag_gemm_warp_specialized_launch(A, ready, B, C)
 

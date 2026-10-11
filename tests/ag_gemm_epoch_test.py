@@ -3,9 +3,10 @@
 make GPU=blackwell ag-gemm-warp-specialized
 python -m torch.distributed.run --standalone --nproc-per-node=8 tests/ag_gemm_epoch_test.py
 
-Covers both transports, eager reuse, multiple launches per captured graph,
-replay with changed inputs, rank skew, and uint32 epoch wraparound. The world
-size must match the extension's INTRA_NUM_DEVICES build setting.
+Covers both transports, back-to-back eager/graph launches with fixed inputs,
+input changes between globally completed batches, rank skew, and uint32 epoch
+wraparound. The world size must match the extension's INTRA_NUM_DEVICES build
+setting. Pull source shards must remain unchanged until every peer is done.
 """
 import os
 from datetime import timedelta
@@ -49,47 +50,59 @@ def check_shape(mod, rank, world, n, initial_epoch):
         expected = ((expected_rows + offset) * k).to(torch.bfloat16).expand_as(tensor)
         torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
 
-    # Queue all iterations before checking; a host sync per iteration would
-    # hide buffer reuse races. Different ranks deliberately delay different calls.
-    for i in range(4):
-        if rank == i % world:
-            torch.cuda._sleep(100_000)
-        a.data_[rank].fill_(rank + 1 + i)
-        launch()
-        snapshots[i].copy_(c)
-    torch.cuda.synchronize()
-    for i, snapshot in enumerate(snapshots):
-        check(snapshot, i)
+    def check_epoch(calls):
+        expected_epoch = (initial_epoch + calls + 2**31) % 2**32 - 2**31
+        assert ready.data_[world].item() == expected_epoch
 
-    # Capture two invocations, including an input change between them. Capture
-    # itself must not consume an epoch, and every replay must consume two.
-    dist.barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        launch()
-        snapshots[0].copy_(c)
-        a.data_[rank].add_(1)
-        launch()
-        snapshots[1].copy_(c)
-    torch.cuda.synchronize()
-    dist.barrier()
-    assert ready.data_[world].item() == ((initial_epoch + 4 + 2**31) % 2**32 - 2**31)
-
-    for i in range(6):
-        if rank == i % world:
+    graph = None
+    for batch, offset in enumerate((0, 8)):
+        # The preceding synchronize + barrier protects old source shards.
+        # Deliberately delay this batch's input write on one rank. There is no
+        # host barrier after the write: prepare must establish input readiness.
+        if rank == batch % world:
             torch.cuda._sleep(100_000)
-        a.data_[rank].fill_(rank + 1 + i)
-        graph.replay()
-        replay_results[2 * i].copy_(snapshots[0])
-        replay_results[2 * i + 1].copy_(snapshots[1])
-    torch.cuda.synchronize()
-    for i in range(6):
-        check(replay_results[2 * i], i)
-        check(replay_results[2 * i + 1], i + 1)
-    expected_epoch = (initial_epoch + 16 + 2**31) % 2**32 - 2**31
-    assert ready.data_[world].item() == expected_epoch
-    assert ready.data_[world + 1].item() == expected_epoch
-    dist.barrier()
+        a.data_[rank].fill_(rank + 1 + offset)
+
+        # No per-invocation host synchronization. Only the next prepare's
+        # entry barrier prevents a fast multicast sender overwriting a peer.
+        for i in range(4):
+            if rank == i % world:
+                torch.cuda._sleep(100_000)
+            c.zero_()
+            launch()
+            snapshots[i].copy_(c)
+        torch.cuda.synchronize()
+        for snapshot in snapshots:
+            check(snapshot, offset)
+        check_epoch(batch * 16 + 4)
+        dist.barrier()
+
+        if graph is None:
+            # Capture must not consume an epoch; each replay consumes two.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                c.zero_()
+                launch()
+                snapshots[0].copy_(c)
+                c.zero_()
+                launch()
+                snapshots[1].copy_(c)
+            torch.cuda.synchronize()
+            dist.barrier()
+            check_epoch(4)
+
+        for i in range(6):
+            if rank == i % world:
+                torch.cuda._sleep(100_000)
+            graph.replay()
+            replay_results[2 * i].copy_(snapshots[0])
+            replay_results[2 * i + 1].copy_(snapshots[1])
+        torch.cuda.synchronize()
+        for result in replay_results:
+            check(result, offset)
+        check_epoch((batch + 1) * 16)
+        # All peers must finish pulling before changing or freeing sources.
+        dist.barrier()
 
 
 def main():
@@ -98,7 +111,7 @@ def main():
     dist.init_process_group("nccl", timeout=timedelta(seconds=120))
     world = dist.get_world_size()
     mod = load_module.load("ag_gemm_warp_specialized")
-    assert mod.ag_gemm_warp_specialized_ready_words == world + 2
+    assert mod.ag_gemm_warp_specialized_ready_words == world + 1
     for n in (256, 6400):  # multicast push, then pull
         for initial_epoch in (0, -2, -6):
             check_shape(mod, rank, world, n, initial_epoch)

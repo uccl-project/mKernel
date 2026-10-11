@@ -108,21 +108,20 @@ __device__ inline void store_async_3d(
 
 }  // namespace
 
-// One small CTA supplies the ordering previously provided by NCCL. Completion
-// is published only after both the GEMM and copy stream have finished, so a
-// faster rank cannot overwrite shards still being read by a slower rank.
-template <bool BEGIN>
-__global__ void epoch_barrier(A_ready_distributed_tensor ready, int dev_idx) {
+// One entry barrier per invocation, before the copy/GEMM stream fork. Reaching
+// it certifies that this rank's previous GEMM and joined copy stream finished.
+// Waiting for every rank protects gathered-buffer reuse even for multicast push.
+// Input writes preceding prepare are also complete before any peer starts pulling.
+__global__ void prepare_epoch_barrier(A_ready_distributed_tensor ready, int dev_idx) {
     __shared__ uint32_t epoch;
     auto* local = ready[dev_idx].raw_ptr;
     if (threadIdx.x == 0) {
-        epoch = comm::atomic_u32::acquire_load_sys(local + EPOCH_SLOT) + (BEGIN ? 1u : 0u);
-        comm::atomic_u32::release_store_sys(
-            local + (BEGIN ? EPOCH_SLOT : COMPLETED_SLOT), epoch);
+        epoch = comm::atomic_u32::acquire_load_gpu(local + EPOCH_SLOT) + 1u;
+        comm::atomic_u32::release_store_sys(local + EPOCH_SLOT, epoch);
     }
     __syncthreads();
     for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES; peer += blockDim.x) {
-        auto* flag = ready[peer].raw_ptr + (BEGIN ? EPOCH_SLOT : COMPLETED_SLOT);
+        auto* flag = ready[peer].raw_ptr + EPOCH_SLOT;
         while (!epoch_reached(comm::atomic_u32::acquire_load_sys(flag), epoch)) {
             __nanosleep(16);
         }
@@ -130,7 +129,7 @@ __global__ void epoch_barrier(A_ready_distributed_tensor ready, int dev_idx) {
 }
 
 void prepare_ready(const A_ready_distributed_tensor& ready, int dev_idx, cudaStream_t stream) {
-    epoch_barrier<true><<<1, 32, 0, stream>>>(ready, dev_idx);
+    prepare_epoch_barrier<<<1, 32, 0, stream>>>(ready, dev_idx);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 
@@ -168,8 +167,8 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
     const fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>& G) {
     using fg = fused_globals<_ROW_BLOCK, _COL_BLOCK, _NUM_CTA, _NUM_CONSUMER_WARPS>;
 
-    const uint32_t copy_epoch = comm::atomic_u32::acquire_load_gpu(
-        G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT);
+    const uint32_t copy_epoch =
+        comm::atomic_u32::acquire_load_gpu(G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT);
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
     const int warpgroup_id = warpgroupid();
@@ -250,12 +249,14 @@ __device__ __forceinline__ void ag_gemm_warp_specialized(
         if (!is_local) {
             if constexpr (STRATEGY == AgStrategy::MULTICAST_PUSH) {
                 while (!epoch_reached(comm::atomic_u32::acquire_load_sys(
-                           G.A_copy_ready[actual_target_device].raw_ptr), copy_epoch)) {
+                                          G.A_copy_ready[actual_target_device].raw_ptr),
+                                      copy_epoch)) {
                     __nanosleep(16);
                 }
             } else {
                 while (!epoch_reached(comm::atomic_u32::acquire_load_gpu(
-                           G.A_copy_ready[G.dev_idx].raw_ptr + actual_target_device), copy_epoch)) {
+                                          G.A_copy_ready[G.dev_idx].raw_ptr + actual_target_device),
+                                      copy_epoch)) {
                     __nanosleep(16);
                 }
             }
@@ -634,10 +635,11 @@ inline void launch_ag_gemm_warp_specialized(
         // Copy the device epoch after the payload, so graph replay publishes
         // a fresh value. Keep signaling on the copy engine: a signal kernel
         // could starve behind the persistent GEMM's polling CTAs.
-        MKERNEL_CUDACHECK(cudaMemcpyAsync(
-            G.A_copy_ready[G.dev_idx].raw_ptr,
-            G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT,
-            sizeof(uint32_t), cudaMemcpyDeviceToDevice, copy_state.stream));
+        MKERNEL_CUDACHECK(cudaMemcpyAsync(G.A_copy_ready[G.dev_idx].raw_ptr,
+                                          G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT,
+                                          sizeof(uint32_t),
+                                          cudaMemcpyDeviceToDevice,
+                                          copy_state.stream));
     } else {
         // Stage one complete shard per remote device in the same ring order
         // used by the persistent kernel. The local shard is read directly.
@@ -651,10 +653,11 @@ inline void launch_ag_gemm_warp_specialized(
                 dst, src, shard_bytes, cudaMemcpyDeviceToDevice, copy_state.stream));
 
             // Stream order publishes the payload before its dynamic epoch.
-            MKERNEL_CUDACHECK(cudaMemcpyAsync(
-                G.A_copy_ready[G.dev_idx].raw_ptr + peer,
-                G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT,
-                sizeof(uint32_t), cudaMemcpyDeviceToDevice, copy_state.stream));
+            MKERNEL_CUDACHECK(cudaMemcpyAsync(G.A_copy_ready[G.dev_idx].raw_ptr + peer,
+                                              G.A_copy_ready[G.dev_idx].raw_ptr + EPOCH_SLOT,
+                                              sizeof(uint32_t),
+                                              cudaMemcpyDeviceToDevice,
+                                              copy_state.stream));
         }
     }
 
@@ -686,10 +689,8 @@ inline void launch_ag_gemm_warp_specialized(
 
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
 
-    // Have the copy stream join the main stream again for graph capture.
     MKERNEL_CUDACHECK(cudaEventRecord(copy_state.copy_completion, copy_state.stream));
     MKERNEL_CUDACHECK(cudaStreamWaitEvent(stream, copy_state.copy_completion));
-    epoch_barrier<false><<<1, 32, 0, stream>>>(G.A_copy_ready, G.dev_idx);
 
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
