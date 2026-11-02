@@ -5,8 +5,8 @@ ncu and selects the one launch inside the NVTX range below. Each rank warms up
 the chosen config, then issues exactly one launch of it inside the push/pop
 range "ncu_target". Uses the release build (no timing ring), so build with
     make GPU=blackwell INTRA_NUM_DEVICES=8 gemm-rs-blackwell
-Kernel replay restores device memory between passes, so this driver does not
-check the output: a replayed launch can leave C or the ready counters stale.
+Under ncu application replay the whole process reruns once per metric pass, so
+every pass starts from freshly prepared buffers and real cross-rank waits.
 """
 
 import argparse
@@ -25,6 +25,34 @@ from gemm_rs_blackwell_bench import BlackwellBenchConfig, make_blackwell_buffers
 import load_module
 
 NVTX_RANGE = "ncu_target"
+
+
+def next_pass_index(local_rank: int) -> int:
+    """Count this rank's launches, which under ncu application replay are its
+    passes. Every rank relaunches once per pass, so the counts agree across ranks.
+    Without NCU_PASS_DIR (a plain torchrun), every launch is pass 0."""
+    pass_dir = os.environ.get("NCU_PASS_DIR")
+    if not pass_dir:
+        return 0
+    counter = Path(pass_dir) / f"rank{local_rank}.pass"
+    index = int(counter.read_text()) + 1 if counter.exists() else 0
+    counter.write_text(str(index))
+    return index
+
+
+def init_process_group(config, pass_index: int):
+    """Join the torchrun agent's store under a per-pass prefix. Application replay
+    relaunches the worker inside one torchrun, so the default env:// rendezvous
+    would read the previous pass's NCCL id and barrier keys from the same store."""
+    store = dist.TCPStore(
+        os.environ["MASTER_ADDR"], int(os.environ["MASTER_PORT"]), config.world_size,
+        is_master=False, wait_for_workers=False,
+    )
+    dist.init_process_group(
+        "nccl", store=dist.PrefixStore(f"ncu_pass{pass_index}", store),
+        rank=int(os.environ["RANK"]), world_size=config.world_size,
+        device_id=torch.device("cuda", config.local_rank),
+    )
 
 
 def main():
@@ -48,6 +76,10 @@ def main():
     if args.mma_warps == 1 and args.signals_per_tile == 4:
         parser.error("--mma-warps 1 supports --signals-per-tile 1 or 2")
 
+    pass_index = next_pass_index(config.local_rank)
+    # The broker's shm/socket keys and the store keys must not collide with a
+    # previous application-replay pass whose peers may still be tearing down.
+    os.environ["DIST_BROKER_KEY"] = f"mkernel_ncu_{os.environ['MASTER_PORT']}_{pass_index}"
     module = load_module.load("gemm_rs_blackwell")
     if module.gemm_rs_blackwell_world_size != config.world_size:
         parser.error(
@@ -55,7 +87,7 @@ def main():
         )
 
     torch.cuda.set_device(config.local_rank)
-    dist.init_process_group("nccl", device_id=torch.device("cuda", config.local_rank))
+    init_process_group(config, pass_index)
     try:
         buffers = make_blackwell_buffers(config, M, N, K, module)
         candidate = (args.swizzle, args.signals_per_tile, args.rs_strip_rows, args.mma_warps)
