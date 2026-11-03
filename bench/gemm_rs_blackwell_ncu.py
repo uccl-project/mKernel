@@ -6,7 +6,10 @@ the chosen config, then issues exactly one launch of it inside the push/pop
 range "ncu_target". Uses the release build (no timing ring), so build with
     make GPU=blackwell INTRA_NUM_DEVICES=8 gemm-rs-blackwell
 Under ncu application replay the whole process reruns once per metric pass, so
-every pass starts from freshly prepared buffers and real cross-rank waits.
+every pass starts from freshly prepared buffers. Ranks still reach the profiled
+launch at different times, so by default the ready counters are pre-filled and
+the RS never waits on peers (see presatisfy_ready_counters); use the in-kernel
+timing profiler to study those waits.
 """
 
 import argparse
@@ -40,6 +43,16 @@ def next_pass_index(local_rank: int) -> int:
     return index
 
 
+def presatisfy_ready_counters(buffers, world_size: int):
+    """Fill this rank's ready counters with the count the next launch waits for,
+    so its RS warps never spin on peers. Each ncu rank reaches the profiled launch
+    at a different time, and without this the profile is mostly that spin. The RS
+    then reduces partially written tiles, so the output is wrong; nothing checks it.
+    Call only after every rank has drained its previous launch (sync + barrier)."""
+    next_epoch = buffers.epochs_mkernel.data_.view(-1)[:1] + 1
+    buffers.ready_mkernel.data_.copy_(next_epoch * world_size)
+
+
 def init_process_group(config, pass_index: int):
     """Join the torchrun agent's store under a per-pass prefix. Application replay
     relaunches the worker inside one torchrun, so the default env:// rendezvous
@@ -63,6 +76,11 @@ def main():
     parser.add_argument("--signals-per-tile", type=int, default=2, choices=(1, 2, 4))
     parser.add_argument("--rs-strip-rows", type=int, default=16, choices=(8, 16, 32))
     parser.add_argument("--mma-warps", type=int, default=2, choices=(1, 2))
+    parser.add_argument(
+        "--keep-waits", action="store_true",
+        help="Leave the ready counters alone, so the RS warps spin until peers publish. "
+        "Under ncu that profiles cross-rank launch skew, not the kernel",
+    )
     args = parser.parse_args()
 
     config = BlackwellBenchConfig()
@@ -95,6 +113,8 @@ def main():
             run_mkernel(module, buffers, candidate)
         torch.cuda.synchronize()
         dist.barrier()
+        if not args.keep_waits:
+            presatisfy_ready_counters(buffers, config.world_size)
 
         torch.cuda.nvtx.range_push(NVTX_RANGE)
         run_mkernel(module, buffers, candidate)

@@ -72,6 +72,8 @@ GEMM_RS_BLACKWELL = Layout(
             _SETUP,
             # Includes waiting on mma_finish for a free smem stage.
             ("LOAD_TILE_BEGIN", "LOAD_TILE_ISSUED", SLOTS[0], "prod: issue tile loads", "payload"),
+            # Per K step, drawn over the tile bar: blocked on the MMA freeing a stage.
+            ("LOAD_K_BEGIN", "LOAD_K_STAGE_FREE", SLOTS[6], "prod: k wait stage free", "payload"),
         ],
         # MMA rows exist only for cta_rank 0, which issues the 2-CTA MMA.
         "mma": [
@@ -79,6 +81,8 @@ GEMM_RS_BLACKWELL = Layout(
             ("MMA_TILE_BEGIN", "MMA_TMEM_FREE", SLOTS[1], "mma: wait tmem", "payload"),
             # Includes waiting on tma_load per K step.
             ("MMA_TMEM_FREE", "MMA_COMMITTED", SLOTS[0], "mma: k-loop", "payload"),
+            # Per K step, drawn over the k-loop bar: blocked on that stage's TMA bytes.
+            ("MMA_K_BEGIN", "MMA_K_LOADED", SLOTS[7], "mma: k wait load", "payload"),
         ],
         "epilogue": [
             _SETUP,
@@ -345,6 +349,72 @@ def summarize_rs_counters(table, num_devices: int):
     return "\n".join(lines)
 
 
+# Mirrors fg::RED_BLOCK: per-K-step payloads are tile * (K // RED_BLOCK) + iter_k.
+RED_BLOCK = 64
+
+
+def kstep_table(records, name_to_id, k_steps: int):
+    """Per-K-step MMA view -> dict of arrays, or None for traces without K events.
+
+    One row per (MMA block, warp, tile, k): when the MMA warp started waiting
+    for the stage's bytes, how long it waited, and when the last of the two
+    cluster CTAs' producers got the stage free and issued its loads. MMA rows
+    live on cta_rank 0 (even blocks); its cluster peer is block + 1.
+    """
+    ids = {n: name_to_id.get(n) for n in
+           ("LOAD_K_BEGIN", "LOAD_K_STAGE_FREE", "MMA_K_BEGIN", "MMA_K_LOADED")}
+    if any(v is None for v in ids.values()):
+        return None
+    blk, ts, eid = records[:, 0], records[:, 1], records[:, 2]
+    pld = records[:, 3] & 0xFFFFFFFF
+    warp, seq = pld >> WARP_ID_SHIFT, pld & SEQ_MASK
+
+    def lookup(name, keys_of):
+        m = eid == ids[name]
+        return dict(zip(keys_of(m), ts[m].tolist()))
+
+    mma_key = lambda m: zip(blk[m].tolist(), warp[m].tolist(), seq[m].tolist())
+    begin = lookup("MMA_K_BEGIN", mma_key)
+    loaded = lookup("MMA_K_LOADED", mma_key)
+    issued = lookup("LOAD_K_STAGE_FREE", lambda m: zip(blk[m].tolist(), seq[m].tolist()))
+
+    rows = []
+    for (b, w, s), t0 in begin.items():
+        t1 = loaded.get((b, w, s))
+        p0, p1 = issued.get((b, s)), issued.get((b + 1, s))
+        if t1 is None or p0 is None or p1 is None:
+            continue
+        rows.append((b, w, s // k_steps, s % k_steps, t0, t1 - t0, max(p0, p1)))
+    if not rows:
+        return None
+    a = np.asarray(rows, dtype=np.int64)
+    return dict(block=a[:, 0], warp=a[:, 1], tile=a[:, 2], k=a[:, 3],
+                begin=a[:, 4], wait=a[:, 5], issued=a[:, 6])
+
+
+def summarize_ksteps(table, stall_ns: int = 500):
+    """Where MMA load stalls come from. A stall whose stage was issued long
+    before the MMA got there is slow memory; one issued only just before is
+    the producer being held back (stage not yet freed), i.e. pipeline depth."""
+    if table is None:
+        return "  (no per-K-step events in this trace)"
+    wait = table["wait"]
+    landed = table["begin"] + wait
+    in_flight = landed - table["issued"]  # issue -> bytes landed, when the MMA waited
+    stalled = wait > stall_ns
+    pct = lambda x, q: np.percentile(x, q) / 1000.0 if x.size else float("nan")
+    lines = [
+        f"  MMA k steps: {wait.size}, wait for load us p50 {pct(wait, 50):.2f} "
+        f"p90 {pct(wait, 90):.2f} p99 {pct(wait, 99):.2f} max {wait.max() / 1000.0:.2f}",
+        f"  steps stalled > {stall_ns} ns: {int(stalled.sum())} "
+        f"({100.0 * stalled.mean():.1f}%), {wait[stalled].sum() / 1000.0:.1f} us of stall in total",
+        f"  issue -> landed on stalled steps us: p50 {pct(in_flight[stalled], 50):.2f} "
+        f"p90 {pct(in_flight[stalled], 90):.2f} max "
+        f"{(in_flight[stalled].max() / 1000.0) if stalled.any() else float('nan'):.2f}",
+    ]
+    return "\n".join(lines)
+
+
 def wall_span_us(records):
     """Wall time covered by the trace. Should agree with the measured kernel
     time to within a few percent; a large gap is time in uninstrumented phases."""
@@ -495,6 +565,9 @@ def main(argv=None):
     print(summarize(spans_for_layout(records, name_to_id, layout)))
     if "world_size" in meta:
         print(summarize_rs_counters(rs_counters(records, name_to_id), int(meta["world_size"])))
+    if "K" in meta:
+        k_steps = int(meta["K"]) // RED_BLOCK
+        print(summarize_ksteps(kstep_table(records, name_to_id, k_steps)))
 
     out = Path(args.out) if args.out else Path(args.npz).with_suffix(".pdf")
     written = plot(records, out, name_to_id, layout, title=title)

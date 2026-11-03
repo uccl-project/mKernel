@@ -248,11 +248,20 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
     // flush to ensure the mbarriers are visible
     everyone::tma::cluster::arrive_aligned();
 
-    auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
+    // tile_id only names the K steps in the profile trace.
+    auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id, const int tile_id) {
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile(&A_smem)[fg::CONSUMER_WARPS] = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+#ifdef PROFILE_TIMINGS
+            const uint32_t k_payload =
+                timing_profile::pack_payload(warp_id, tile_id * (G.K / fg::RED_BLOCK) + iter_k);
+            timing_profile::emit(G.timings, &timing_head, EV_LOAD_K_BEGIN, k_payload);
+#endif
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
+#ifdef PROFILE_TIMINGS
+            timing_profile::emit(G.timings, &timing_head, EV_LOAD_K_STAGE_FREE, k_payload);
+#endif
 
             tma::cluster::expect_bytes(tma_load[input_stage_id],
                                        sizeof(fg::A_tile) * fg::CONSUMER_WARPS + sizeof(fg::B_tile),
@@ -307,7 +316,15 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
         {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+#ifdef PROFILE_TIMINGS
+            const uint32_t k_payload =
+                timing_profile::pack_payload(warp_id, tile_id * (G.K / fg::RED_BLOCK));
+            timing_profile::emit(G.timings, &timing_head, EV_MMA_K_BEGIN, k_payload);
+#endif
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+#ifdef PROFILE_TIMINGS
+            timing_profile::emit(G.timings, &timing_head, EV_MMA_K_LOADED, k_payload);
+#endif
             mm_ABt_ncta<fg::NUM_CLUSTERS>(accumulator, A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -319,7 +336,15 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
         for (int iter_k = 1; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile& A_smem = inputs_smem[input_stage_id].A[consumer_id];
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
+#ifdef PROFILE_TIMINGS
+            const uint32_t k_payload = timing_profile::pack_payload(
+                warp_id, tile_id * (G.K / fg::RED_BLOCK) + iter_k);
+            timing_profile::emit(G.timings, &timing_head, EV_MMA_K_BEGIN, k_payload);
+#endif
             wait(tma_load[input_stage_id], (phasebits >> 1) & 0b1);
+#ifdef PROFILE_TIMINGS
+            timing_profile::emit(G.timings, &timing_head, EV_MMA_K_LOADED, k_payload);
+#endif
             mma_ABt_ncta<fg::NUM_CLUSTERS>(accumulator, A_smem, B_smem, mma_finish[input_stage_id]);
 
             input_stage_id = (input_stage_id + 1) % fg::PRODUCER_CONSUMER_PIPELINE_STAGES;
@@ -486,7 +511,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_NUM_EPILO
                     load(tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                              cta_rank * fg::CONSUMER_WARPS,
                          tile_col_idx,
-                         input_stage_id);
+                         input_stage_id,
+                         i);
 #ifdef PROFILE_TIMINGS
                     timing_profile::emit(
                         G.timings, &timing_head, EV_LOAD_TILE_ISSUED, timing_payload);

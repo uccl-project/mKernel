@@ -53,6 +53,14 @@ enum TimingEvent : uint32_t {
     // Signal: between the release fence and the relaxed red, splitting what
     // SIG_EPI_DRAINED -> EPI_SIGNALED used to time as one red.release.
     EV_SIG_FENCED = 23,
+    // Per K step, payload seq = cluster tile index * K_STEPS + iter_k, where
+    // K_STEPS = K / RED_BLOCK. The producer brackets its wait for a free smem
+    // stage (mma_finish); the MMA brackets its wait for that stage's TMA bytes
+    // (tma_load). The next K step's begin marks when the previous issue ended.
+    EV_LOAD_K_BEGIN = 24,
+    EV_LOAD_K_STAGE_FREE = 25,
+    EV_MMA_K_BEGIN = 26,
+    EV_MMA_K_LOADED = 27,
 };
 
 struct TimingEventName {
@@ -86,6 +94,10 @@ inline constexpr TimingEventName TIMING_EVENT_NAMES[] = {
     {"RS_COUNT_FIRST", EV_RS_COUNT_FIRST},
     {"RS_COUNT_READY", EV_RS_COUNT_READY},
     {"SIG_FENCED", EV_SIG_FENCED},
+    {"LOAD_K_BEGIN", EV_LOAD_K_BEGIN},
+    {"LOAD_K_STAGE_FREE", EV_LOAD_K_STAGE_FREE},
+    {"MMA_K_BEGIN", EV_MMA_K_BEGIN},
+    {"MMA_K_LOADED", EV_MMA_K_LOADED},
 };
 
 // The ring head is initialized alongside the mbarriers, after kernel entry, so
