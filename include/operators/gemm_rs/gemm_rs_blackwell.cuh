@@ -30,13 +30,10 @@
 #include "memory/tk_ops_thread_memory_tile_tma.cuh"
 #include "memory/tk_ops_thread_mma_tcgen05_bf16.cuh"
 #include "memory/tk_ops_thread_util_tma.cuh"
-#include "operators/gemm_rs/gemm_rs_blackwell_timing.cuh"
 
 namespace gemm_rs_blackwell {
 static constexpr int DEFAULT_NUM_CTA = 2;
 static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 2;
-static constexpr int DEFAULT_NUM_EPILOGUE_WARPS = 1;
-static constexpr int DEFAULT_C_TILE_DIVISOR = 4;
 static constexpr int DEFAULT_SWIZZLE_SIZE = 4;
 static constexpr int DEFAULT_SIGNALS_PER_TILE = 1;
 static constexpr int DEFAULT_RS_STRIP_ROWS = 32;
@@ -47,50 +44,22 @@ using completion_epoch_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, 1>;
 using completion_epoch_dist_tensor =
     dist::distributed_tensor<completion_epoch_local_tensor, INTRA_NUM_DEVICES, false>;
 
-template <int _NUM_EPILOGUE_WARPS,
-          int _C_TILE_DIVISOR,
-          int _SWIZZLE_SIZE,
-          int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
+template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
 struct fused_globals;
 
-template <int _NUM_EPILOGUE_WARPS,
-          int _C_TILE_DIVISOR,
-          int _SWIZZLE_SIZE,
-          int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
-void launch_gemm_rs_blackwell(const fused_globals<_NUM_EPILOGUE_WARPS,
-                                                  _C_TILE_DIVISOR,
-                                                  _SWIZZLE_SIZE,
-                                                  _SIGNALS_PER_TILE,
-                                                  _RS_STRIP_ROWS,
-                                                  _CONSUMER_WARPS>& G);
+template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
+void launch_gemm_rs_blackwell(
+    const fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>& G);
 
 // Call once before capture/replay, with no work using these buffers in flight.
 // Wait for this stream's initialization to finish locally, then synchronize all
 // ranks before the first launch. Keep the same tile layout and serialize launches
 // on G.stream; both allocations must remain alive across all graph replays.
-template <int _NUM_EPILOGUE_WARPS,
-          int _C_TILE_DIVISOR,
-          int _SWIZZLE_SIZE,
-          int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
-void initialize_gemm_rs_blackwell_state(const fused_globals<_NUM_EPILOGUE_WARPS,
-                                                            _C_TILE_DIVISOR,
-                                                            _SWIZZLE_SIZE,
-                                                            _SIGNALS_PER_TILE,
-                                                            _RS_STRIP_ROWS,
-                                                            _CONSUMER_WARPS>& G);
+template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
+void initialize_gemm_rs_blackwell_state(
+    const fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>& G);
 
-template <int _NUM_EPILOGUE_WARPS,
-          int _C_TILE_DIVISOR,
-          int _SWIZZLE_SIZE,
-          int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
+template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
@@ -99,7 +68,7 @@ struct fused_globals {
     static constexpr int CONSUMER_WARPS = _CONSUMER_WARPS;
     static_assert(CONSUMER_WARPS == 1 || CONSUMER_WARPS == 2, "CONSUMER_WARPS must be 1 or 2");
     static constexpr int PRODUCER_WARPS = 1;
-    static constexpr int EPILOGUE_WARPGROUPS = _NUM_EPILOGUE_WARPS;
+    static constexpr int EPILOGUE_WARPGROUPS = 1;
     static constexpr int REDUCE_SCATTER_WARPS = 4;
     static constexpr int EPILOGUE_WARPS = EPILOGUE_WARPGROUPS * kittens::WARPGROUP_WARPS;
 
@@ -114,7 +83,7 @@ struct fused_globals {
     static constexpr int FIRST_RS_WARP_ID = RS_WARPGROUP * kittens::WARPGROUP_WARPS;
     // The warp that pads the producer/MMA warpgroup publishes tile arrivals, so
     // the epilogue never stalls on the release fence of the signal. It stays the
-    // warpgroup's last warp for any MMA warp count, so trace layouts keep its id.
+    // warpgroup's last warp for any MMA warp count.
     static constexpr int SIGNAL_WARP_ID = FIRST_RS_WARP_ID - 1;
     static_assert(FIRST_CONSUMER_WARP_ID + CONSUMER_WARPS <= SIGNAL_WARP_ID,
                   "Producer/MMA/signal warps must fit in one warpgroup");
@@ -142,6 +111,7 @@ struct fused_globals {
     static constexpr int ROW_BLOCK = 128 * CONSUMER_WARPS;
     static constexpr int COL_BLOCK = 256;
     static constexpr int RED_BLOCK = 64;
+    static constexpr int C_TILE_DIVISOR = 4;
 
     // Ready counters cover READY_ROWS x READY_COLS, the finest region any signal
     // granularity publishes, so one `ready` buffer serves every configuration.
@@ -163,14 +133,11 @@ struct fused_globals {
     static constexpr int SIGNAL_ROWS = ROW_BLOCK / SIGNAL_ROW_SPLITS;
     static constexpr int SIGNAL_COLS = COL_BLOCK / SIGNAL_COL_SPLITS;
     static constexpr int CONSUMERS_PER_SIGNAL = CONSUMER_WARPS / SIGNAL_ROW_SPLITS;
-    static constexpr int C_CHUNKS_PER_SIGNAL = _C_TILE_DIVISOR / SIGNAL_COL_SPLITS;
+    static constexpr int C_CHUNKS_PER_SIGNAL = C_TILE_DIVISOR / SIGNAL_COL_SPLITS;
     static_assert(SIGNAL_ROWS % READY_ROWS == 0 && SIGNAL_COLS % READY_COLS == 0,
                   "A signal region must cover whole ready counters");
-    static_assert(_C_TILE_DIVISOR % SIGNAL_COL_SPLITS == 0,
+    static_assert(C_TILE_DIVISOR % SIGNAL_COL_SPLITS == 0,
                   "A signal region must end on a C chunk boundary");
-    // Profile seq offset for a half's first column region, so its events don't pair
-    // with the half's final region.
-    static constexpr uint32_t EARLY_REGION_SEQ_OFFSET = 1u << 24;
 
     // RS units are RS_M_STRIP_SIZE x RS_COLS strips inside one signal region, so each
     // waits on exactly one ready counter.
@@ -199,7 +166,6 @@ struct fused_globals {
     // Drained tiles the epilogue may hand off before the signal warp catches up.
     static constexpr int SIGNAL_PIPELINE_STAGES = 4;
 
-    static constexpr int C_TILE_DIVISOR = _C_TILE_DIVISOR;
     // Tile columns per supergroup in the tile rasterization.
     static constexpr int SWIZZLE_SIZE = _SWIZZLE_SIZE;
     static_assert(SWIZZLE_SIZE > 0, "SWIZZLE_SIZE must be greater than 0");
@@ -238,11 +204,6 @@ struct fused_globals {
 
     cudaStream_t stream = nullptr;
 
-#ifdef PROFILE_TIMINGS
-    // NUM_BLOCKS * EVENTS_PER_BLOCK records, zero-initialized; nullptr skips stores.
-    TimingRecord* timings = nullptr;
-#endif
-
     struct pipeline_inputs {
         A_tile A[CONSUMER_WARPS];
         B_tile B;
@@ -264,20 +225,13 @@ struct fused_globals {
 template <typename>
 inline constexpr bool always_false_v = false;
 
-template <int _NUM_EPILOGUE_WARPS,
-          int _C_TILE_DIVISOR,
-          int _SWIZZLE_SIZE,
+template <int _SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
           typename DistributedTensor,
           typename LocalTensor>
-__host__ inline fused_globals<_NUM_EPILOGUE_WARPS,
-                              _C_TILE_DIVISOR,
-                              _SWIZZLE_SIZE,
-                              _SIGNALS_PER_TILE,
-                              _RS_STRIP_ROWS,
-                              _CONSUMER_WARPS>
+__host__ inline fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>
 gemm_rs_blackwell_make_globals(LocalTensor& A,
                                LocalTensor& B,
                                DistributedTensor& C,
@@ -288,12 +242,7 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                                int N,
                                int K,
                                cudaStream_t stream) {
-    using fg = fused_globals<_NUM_EPILOGUE_WARPS,
-                             _C_TILE_DIVISOR,
-                             _SWIZZLE_SIZE,
-                             _SIGNALS_PER_TILE,
-                             _RS_STRIP_ROWS,
-                             _CONSUMER_WARPS>;
+    using fg = fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {

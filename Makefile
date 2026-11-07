@@ -182,8 +182,7 @@ plots:
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
 	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized \
-	gemm-rs-blackwell run-gemm-rs-blackwell \
-	gemm-rs-blackwell-profile run-gemm-rs-blackwell-profile
+	gemm-rs-blackwell run-gemm-rs-blackwell
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -205,27 +204,13 @@ $(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $
 
 gemm-rs-blackwell: $(BUILD)/libgemm_rs_blackwell.so
 
-# PROFILE_TIMINGS builds a separate .so with the in-kernel timing ring; the
-# plain build has no emit instructions and no timings argument.
-gemm-rs-blackwell-profile: $(BUILD)/libgemm_rs_blackwell_profile.so
-
 GEMM_RS_BLACKWELL_HEADERS := \
-	include/common/timings.cuh \
 	include/operators/gemm_rs/gemm_rs_blackwell.cuh \
-	include/operators/gemm_rs/gemm_rs_blackwell_session.cuh \
-	include/operators/gemm_rs/gemm_rs_blackwell_timing.cuh
+	include/operators/gemm_rs/gemm_rs_blackwell_session.cuh
 
 $(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu $(GEMM_RS_BLACKWELL_HEADERS) Makefile | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
-$(BUILD)/libgemm_rs_blackwell_profile.so: $(SRC)/gemm_rs_blackwell.cu $(GEMM_RS_BLACKWELL_HEADERS) Makefile | $(BUILD)
-	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DPROFILE_TIMINGS -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell_profile $(COMMON_INC) \
-	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
-
 run-gemm-rs-blackwell: gemm-rs-blackwell
 	$(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_blackwell_bench.py --warmup 20 --iters 50
-
-GEMM_RS_PROFILE_ARGS ?= --shapes 8192
-run-gemm-rs-blackwell-profile: gemm-rs-blackwell-profile
-	$(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_blackwell_profile.py $(GEMM_RS_PROFILE_ARGS)
