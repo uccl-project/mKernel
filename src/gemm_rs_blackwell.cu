@@ -726,130 +726,44 @@ inline void prepare(at::Tensor& A,
         sync.data_.data_ptr(), 0, sync.data_.nbytes(), at::cuda::getCurrentCUDAStream().stream()));
 }
 
-template <int _SCHEDULER_SWIZZLE_SIZE,
-          int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
-inline void launch_with_config(at::Tensor& A,
-                               at::Tensor& B,
-                               dist::ParallelBuffer& C,
-                               dist::ParallelBuffer& sync) {
-    auto globals =
-        gemm_rs_blackwell_make_globals<_SCHEDULER_SWIZZLE_SIZE,
-                                       _SIGNALS_PER_TILE,
-                                       _RS_STRIP_ROWS,
-                                       _CONSUMER_WARPS>(A,
-                                                        B,
-                                                        C,
-                                                        sync,
-                                                        C.local_rank_,
-                                                        A.size(0),
-                                                        B.size(0),
-                                                        A.size(1),
-                                                        at::cuda::getCurrentCUDAStream().stream());
-    launch_gemm_rs_blackwell(globals);
-}
+// Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps> for M.
+// Keep in sync with BlackwellBenchConfig.mkernel_candidates in gemm_rs_bench.py.
+inline void entrypoint(at::Tensor& A,
+                       at::Tensor& B,
+                       dist::ParallelBuffer& C,
+                       dist::ParallelBuffer& sync,
+                       cudaStream_t stream = nullptr) {
+    const int M = A.size(0);
 
-template <int _SCHEDULER_SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS>
-inline void launch_with_rows(at::Tensor& A,
-                             at::Tensor& B,
-                             dist::ParallelBuffer& C,
-                             dist::ParallelBuffer& sync,
-                             int mma_warps) {
-    switch (mma_warps) {
-        case 1:
-            // Four signals with one MMA warp would mean 64-column regions. The flat
-            // ready layout would allow it, but the configuration is untested.
-            if constexpr (_SIGNALS_PER_TILE <= 2) {
-                return launch_with_config<_SCHEDULER_SWIZZLE_SIZE,
-                                          _SIGNALS_PER_TILE,
-                                          _RS_STRIP_ROWS,
-                                          1>(A, B, C, sync);
-            } else {
-                TORCH_CHECK(false, "mma_warps=1 supports signals_per_tile 1 or 2");
-            }
-        case 2:
-            return launch_with_config<_SCHEDULER_SWIZZLE_SIZE,
-                                      _SIGNALS_PER_TILE,
-                                      _RS_STRIP_ROWS,
-                                      2>(A, B, C, sync);
-        default:
-            TORCH_CHECK(false, "mma_warps must be 1 or 2, got ", mma_warps);
+    if (!stream) {
+        stream = at::cuda::getCurrentCUDAStream().stream();
+    }
+
+    if (M <= 2048) {
+        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
+            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 4096) {
+        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
+            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 8192) {
+        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
+            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 16384) {
+        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
+            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 32768) {
+        auto globals = gemm_rs_blackwell_make_globals<2, 2, 16, 1>(
+            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        launch_gemm_rs_blackwell(globals);
+    } else {
+        TORCH_CHECK(false, "gemm_rs_blackwell is not tuned for M > 32768, got M=", M);
     }
 }
 
-template <int _SCHEDULER_SWIZZLE_SIZE, int _SIGNALS_PER_TILE>
-inline void launch_with_signals(at::Tensor& A,
-                                at::Tensor& B,
-                                dist::ParallelBuffer& C,
-                                dist::ParallelBuffer& sync,
-                                int rs_strip_rows,
-                                int mma_warps) {
-    switch (rs_strip_rows) {
-        case 8:
-            return launch_with_rows<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 8>(
-                A, B, C, sync, mma_warps);
-        case 16:
-            return launch_with_rows<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 16>(
-                A, B, C, sync, mma_warps);
-        case 32:
-            return launch_with_rows<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 32>(
-                A, B, C, sync, mma_warps);
-        default:
-            TORCH_CHECK(false, "rs_strip_rows must be 8, 16, or 32, got ", rs_strip_rows);
-    }
-}
-
-template <int _SCHEDULER_SWIZZLE_SIZE>
-inline void launch_with_swizzle(at::Tensor& A,
-                                at::Tensor& B,
-                                dist::ParallelBuffer& C,
-                                dist::ParallelBuffer& sync,
-                                int signals_per_tile,
-                                int rs_strip_rows,
-                                int mma_warps) {
-    switch (signals_per_tile) {
-        case 1:
-            return launch_with_signals<_SCHEDULER_SWIZZLE_SIZE, 1>(
-                A, B, C, sync, rs_strip_rows, mma_warps);
-        case 2:
-            return launch_with_signals<_SCHEDULER_SWIZZLE_SIZE, 2>(
-                A, B, C, sync, rs_strip_rows, mma_warps);
-        case 4:
-            return launch_with_signals<_SCHEDULER_SWIZZLE_SIZE, 4>(
-                A, B, C, sync, rs_strip_rows, mma_warps);
-        default:
-            TORCH_CHECK(false, "signals_per_tile must be 1, 2, or 4, got ", signals_per_tile);
-    }
-}
-
-inline void launch(at::Tensor& A,
-                   at::Tensor& B,
-                   dist::ParallelBuffer& C,
-                   dist::ParallelBuffer& sync,
-                   int SCHEDULER_SWIZZLE_SIZE,
-                   int signals_per_tile,
-                   int rs_strip_rows,
-                   int mma_warps) {
-    switch (SCHEDULER_SWIZZLE_SIZE) {
-        case 1:
-            return launch_with_swizzle<1>(
-                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
-        case 2:
-            return launch_with_swizzle<2>(
-                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
-        case 4:
-            return launch_with_swizzle<4>(
-                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
-        case 8:
-            return launch_with_swizzle<8>(
-                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
-        default:
-            TORCH_CHECK(false,
-                        "SCHEDULER_SWIZZLE_SIZE must be 1, 2, 4, or 8, got ",
-                        SCHEDULER_SWIZZLE_SIZE);
-    }
-}
 #endif
 
 // Instantiate the default API so the compile target checks the fused kernel,

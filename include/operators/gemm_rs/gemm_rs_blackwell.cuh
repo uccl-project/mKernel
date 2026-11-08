@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>

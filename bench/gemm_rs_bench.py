@@ -10,7 +10,6 @@ import argparse, json, os, sys, time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Protocol
-import itertools
 
 # Default binding behavior; callers can override for compatibility checks.
 os.environ.setdefault("MKERNEL_BIND_RETAINED_HANDLE", "1")
@@ -113,24 +112,17 @@ class BlackwellBenchConfig:
     output_dim = 7168
     split_inner_dim = 12288 // world_size
 
-    # Tile columns per rasterization supergroup; must match the instantiated
-    # values in gemm_rs_blackwell::launch.
-    mkernel_swizzle_sizes = [1, 2]
-    # Ready-counter publications per 256x256 tile and RS strip heights; must match
-    # the instantiated values in gemm_rs_blackwell::launch.
-    mkernel_signals_per_tile = [1, 2, 4]
-    mkernel_rs_strip_rows = [8, 16, 32]
-
-    def mkernel_candidates(self, M: int):
-        return [
-            (swizzle, signals, rs_rows, mma_warps)
-            for swizzle, signals, rs_rows, mma_warps in itertools.product(
-                self.mkernel_swizzle_sizes, self.mkernel_signals_per_tile,
-                self.mkernel_rs_strip_rows,
-                [1],
-            )
-            if mma_warps == 2 or signals <= 2
-        ]
+    # (swizzle, signals_per_tile, rs_strip_rows, mma_warps) that
+    # gemm_rs_blackwell::entrypoint selects for M. Informational only: the
+    # kernel picks its own config, so keep this in sync with the .cu table.
+    def mkernel_tuned_config(self, M: int):
+        if M <= 4096:
+            return [(2, 2, 32, 1)]
+        elif M <= 16384:
+            return [(1, 2, 16, 1)]
+        elif M <= 32768:
+            return [(2, 2, 16, 1)]
+        raise ValueError(f"gemm_rs_blackwell is not tuned for M={M} > 32768")
 
     # Keys match the pinned CUTLASS example's CLI / run() keyword arguments:
     # https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/distributed_gemm_reduce_scatter_blackwell.py#L3009
@@ -188,7 +180,8 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
         )
         buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
         run_baseline(buffers)
-        for candidate in config.mkernel_candidates(M):
+
+        for candidate in config.mkernel_tuned_config(M):
             buffers.c_mkernel.data_.zero_()
             torch.cuda.synchronize()
             dist.barrier()
@@ -213,7 +206,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
                     f"ThunderKittens M={M} N={N} K={K}: {status}",
                     flush=True,
                 )
-        for candidate in config.mkernel_candidates(M):
+        for candidate in config.mkernel_tuned_config(M):
             buffers.mkernel_graph = capture_cuda_graph(
                 lambda: run_mkernel(mkernel_module, buffers, candidate)
             )
@@ -263,28 +256,9 @@ def gemm_rs_blackwell_prepare(
 
     # Autotune on graph replays; benchmark_cuda takes the max over ranks, so
     # every rank selects the same configuration.
-    mkernel_timings = []
-    for candidate in config.mkernel_candidates(M):
-        buffers.mkernel_graph = capture_cuda_graph(
-            lambda: run_mkernel(mkernel_module, buffers, candidate)
-        )
-        ms = benchmark_cuda(buffers.mkernel_graph.replay, warmup, iters)
-        mkernel_timings.append((candidate, ms))
-        buffers.mkernel_graph = None
-        time.sleep(5)
-    
-    best_candidate, _ = min(mkernel_timings, key=lambda item: item[1])
-    if config.is_chief:
-        for candidate, ms in sorted(mkernel_timings, key=lambda item: item[1]):
-            mark = " <- best" if candidate == best_candidate else ""
-            print(
-                f"  [autotune] mKernel {mkernel_config_label(candidate)}: "
-                f"{ms:8.3f} ms  {useful_tflops(M, N, K, ms):8.2f} TFLOP/s{mark}",
-                flush=True,
-            )
 
     def bench_mkernel_eager():
-        run_mkernel(mkernel_module, buffers, best_candidate)
+        run_mkernel(mkernel_module, buffers, config.mkernel_tuned_config(M))
 
     buffers.mkernel_graph = capture_cuda_graph(bench_mkernel_eager)
 
@@ -435,18 +409,11 @@ def mkernel_config_label(candidate) -> str:
 
 
 def run_mkernel(mkernel_module, buffers: BlackwellBenchVars, candidate=None):
-    """Launch one (swizzle, signals_per_tile, rs_strip_rows, mma_warps); None uses the
-    defaults."""
-    kwargs = {}
-    if candidate is not None:
-        swizzle, signals, rs_rows, mma_warps = candidate
-        kwargs = dict(
-            SCHEDULER_SWIZZLE_SIZE=swizzle, signals_per_tile=signals, rs_strip_rows=rs_rows,
-            mma_warps=mma_warps,
-        )
+    """Launch GEMM+RS. The kernel picks its tuned config from M; `candidate` is
+    accepted only so callers can keep labelling runs with it."""
     mkernel_module.gemm_rs_blackwell_launch(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
-        buffers.sync_mkernel, **kwargs,
+        buffers.sync_mkernel,
     )
 
 
