@@ -839,7 +839,7 @@ def main():
 
     else:
         config = BlackwellBenchConfig()
-        mkernel_module = load_module.load()
+        mkernel_module = load_module.load(config.KERNEL_NAME)
 
         dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
         fns = []
