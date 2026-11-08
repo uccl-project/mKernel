@@ -79,7 +79,7 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
             const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
-            reduce_load_16B(reduced[store_idx], src);
+            reduce_load_16B_no_clobber(reduced[store_idx], src);
         }
 
 #pragma unroll

@@ -31,9 +31,6 @@ else
     $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
 endif
 
-undefine BACKEND_DEFINES
-undefine BACKEND_LIBS
-
 # === Target GPU ===
 #   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
 #   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
@@ -203,10 +200,6 @@ $(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
 gemm-rs-blackwell: $(BUILD)/libgemm_rs_blackwell.so
-
-GEMM_RS_BLACKWELL_HEADERS := \
-	include/operators/gemm_rs/gemm_rs_blackwell.cuh \
-	include/operators/gemm_rs/gemm_rs_blackwell_session.cuh
 
 $(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu $(GEMM_RS_BLACKWELL_HEADERS) Makefile | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell $(COMMON_INC) \

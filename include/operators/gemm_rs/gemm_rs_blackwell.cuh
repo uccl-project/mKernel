@@ -331,7 +331,7 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
 }
 
 namespace {
-__device__ __forceinline__ void reduce_load_16B(uint32_t* out, const comm::bf16* src) {
+__device__ __forceinline__ void reduce_load_16B_no_clobber(uint32_t* out, const comm::bf16* src) {
     asm volatile(
         "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 "
         "{%0, %1, %2, %3}, [%4];"

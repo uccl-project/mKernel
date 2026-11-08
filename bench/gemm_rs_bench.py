@@ -475,6 +475,8 @@ def useful_tflops(M: int, N: int, K: int, elapsed_time_ms: float) -> float:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["check", "bench"], default="bench")
+    p.add_argument("--shapes", type=str, default=None,
+                    help="comma-separated shapes (default depends on --mode)")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--save-json", type=str, default=None)
@@ -482,8 +484,6 @@ def parse_args():
     p.add_argument("--node-idx", type=int, default=None)
     p.add_argument("--arch", type=str, default=HopperBenchConfig.arch, 
                    choices=[HopperBenchConfig.arch, BlackwellBenchConfig.arch])
-    p.add_argument("--shapes", type=str, default=None,
-                   help="comma-separated shapes (default depends on --mode)")
     args = p.parse_args()
 
     if args.shapes is None:
