@@ -105,8 +105,7 @@ class BlackwellBenchVars:
     tk_graph: torch.cuda.CUDAGraph | None = None
 
     c_mkernel: DistBufferLike | None = None
-    ready_mkernel: DistBufferLike | None = None
-    epochs_mkernel: DistBufferLike | None = None
+    sync_mkernel: DistBufferLike | None = None
     mkernel_graph: torch.cuda.CUDAGraph | None = None
 
 
@@ -182,21 +181,13 @@ def make_blackwell_buffers(
         (M, N), dtype=torch.bfloat16, local_rank=config.local_rank,
         local_world_size=config.world_size, multicast=True,
     )
-    buffers.ready_mkernel = mkernel_module.DistBuffer(
-        (
-            M // config.world_size // mkernel_module.gemm_rs_blackwell_ready_rows,
-            N // mkernel_module.gemm_rs_blackwell_ready_cols,
-        ),
-        dtype=torch.int32,
-        local_rank=config.local_rank, local_world_size=config.world_size, multicast=True,
-    )
-    buffers.epochs_mkernel = mkernel_module.DistBuffer(
-        (1,), dtype=torch.int32, local_rank=config.local_rank,
-        local_world_size=config.world_size, multicast=False,
+    # Completion epoch header followed by the ready counters, one per rank.
+    buffers.sync_mkernel = mkernel_module.DistBuffer(
+        mkernel_module.gemm_rs_blackwell_sync_shape, dtype=torch.int32,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=False,
     )
     mkernel_module.gemm_rs_blackwell_prepare(
-        buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
-        buffers.ready_mkernel, buffers.epochs_mkernel,
+        buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel, buffers.sync_mkernel,
     )
     # Every rank must finish its local reset before any peer publishes a tile.
     torch.cuda.synchronize()
@@ -244,12 +235,12 @@ def run_mkernel(mkernel_module, buffers: BlackwellBenchVars, candidate=None):
     if candidate is not None:
         swizzle, signals, rs_rows, mma_warps = candidate
         kwargs = dict(
-            swizzle_size=swizzle, signals_per_tile=signals, rs_strip_rows=rs_rows,
+            SCHEDULER_SWIZZLE_SIZE=swizzle, signals_per_tile=signals, rs_strip_rows=rs_rows,
             mma_warps=mma_warps,
         )
     mkernel_module.gemm_rs_blackwell_launch(
         buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
-        buffers.ready_mkernel, buffers.epochs_mkernel, **kwargs,
+        buffers.sync_mkernel, **kwargs,
     )
 
 

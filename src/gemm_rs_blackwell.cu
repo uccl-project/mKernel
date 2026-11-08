@@ -62,7 +62,7 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
                                                     comm::bf16* local_tile,
                                                     size_t row_stride,
                                                     int lane) {
-    constexpr int ELEMENTS_PER_STORE = 8;
+    constexpr int ELEMENTS_PER_STORE = 128 / 8 / sizeof(comm::bf16);
     constexpr int LANES_PER_ROW = TILE_COLS / ELEMENTS_PER_STORE;
     constexpr int ROWS_PER_STORE = 32 / LANES_PER_ROW;
     constexpr int ROWS_PER_BATCH = STORES_PER_BATCH * ROWS_PER_STORE;
@@ -82,7 +82,6 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
             reduce_load_16B(reduced[store_idx], src);
         }
 
-        // Recompute addresses instead of keeping a pointer array live with the payload.
 #pragma unroll
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
@@ -115,7 +114,7 @@ __device__ __forceinline__ std::tuple<int, int> calculate_tile_idx(int num_rows,
 }
 
 __host__ __device__ __forceinline__ bool epoch_reached(uint32_t observed, uint32_t expected) {
-    return uint32_t(observed - expected) < 0x80000000u;
+    return int32_t(observed - expected) >= 0;
 }
 
 }  // namespace
@@ -123,14 +122,29 @@ __host__ __device__ __forceinline__ bool epoch_reached(uint32_t observed, uint32
 // A normal same-stream launch after fused_kernel_stub establishes completion of
 // every local CTA and its global writes before this rank publishes its epoch.
 // Do not enable PDL or signal early launch completion in this barrier kernel.
-__global__ void exit_epoch_barrier(completion_epoch_dist_tensor epochs, int dev_idx) {
-    __shared__ uint32_t completed_epoch;
+//
+// It also zeroes this rank's used ready counters for the next launch. Plain stores
+// suffice: the RS warps saw every counter reach NUM_DEVICES, so no peer add is
+// still in flight, and no peer adds again until it acquires the epoch released
+// below, after the zeros.
+static constexpr int EXIT_BARRIER_THREADS = 256;
+
+__global__ void exit_epoch_barrier(int* local_ready,
+                                   int ready_numel,
+                                   completion_epoch_dist_tensor epochs,
+                                   int dev_idx) {
+    auto* local_epoch = epochs[dev_idx].raw_ptr;
+    // Every thread reads the epoch before the barrier, so none can see the bump.
+    const uint32_t completed_epoch = comm::atomic_u32::acquire_load_gpu(local_epoch) + 1u;
+
+    for (int i = threadIdx.x; i < ready_numel; i += blockDim.x) {
+        local_ready[i] = 0;
+    }
+    // Order every thread's zeros before the cumulative release.
+    __syncthreads();
     if (threadIdx.x == 0) {
-        auto* local_epoch = epochs[dev_idx].raw_ptr;
-        completed_epoch = comm::atomic_u32::acquire_load_gpu(local_epoch) + 1u;
         comm::atomic_u32::release_store_sys(local_epoch, completed_epoch);
     }
-    __syncthreads();
 
     for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES; peer += blockDim.x) {
         while (!epoch_reached(comm::atomic_u32::acquire_load_sys(epochs[peer].raw_ptr),
@@ -140,10 +154,16 @@ __global__ void exit_epoch_barrier(completion_epoch_dist_tensor epochs, int dev_
     }
 }
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
-__device__ __forceinline__ void gemm_rs_blackwell(
-    const fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>& G) {
-    using fg = fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
+__device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                                                                      _SIGNALS_PER_TILE,
+                                                                      _RS_STRIP_ROWS,
+                                                                      _CONSUMER_WARPS>& G) {
+    using fg =
+        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
 
     const int cta_rank = cluster_ctarank();
     const int warp_id = warpid();
@@ -313,6 +333,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         const int epilogue_semaphore_idx = consumer_id + 4;
 
         // This consumer closes a signal region's rows; its chunks close the columns.
+        // TODO: remove once I set the MMA tile to 256*256
         const bool closes_region_rows = (consumer_id + 1) % fg::CONSUMERS_PER_SIGNAL == 0;
 
         // Drain, then hand the region to the signal warp. The drain is what makes the
@@ -396,8 +417,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(
             if (elect_warp_leader()) {
                 int input_stage_id = 0;
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
-                    auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
-                        num_tile_rows_per_cluster, num_tile_cols, i);
+                    auto [tile_row_idx, tile_col_idx] =
+                        calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
+                            num_tile_rows_per_cluster, num_tile_cols, i);
                     load(tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
                              cta_rank * fg::CONSUMER_WARPS,
                          tile_col_idx,
@@ -429,7 +451,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                 const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP_ID;
 
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
-                    // TODO: check consume
                     consume(input_stage_id, epilogue_stage_id, consumer_id);
                 }
             }
@@ -446,38 +467,26 @@ __device__ __forceinline__ void gemm_rs_blackwell(
                 int signal_phase = 0;
                 for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_clusters) {
-                    auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
-                        num_tile_rows_per_cluster, num_tile_cols, tile_id);
+                    auto [tile_row_idx, tile_col_idx] =
+                        calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
+                            num_tile_rows_per_cluster, num_tile_cols, tile_id);
 #pragma unroll
                     for (int s = 0; s < fg::SIGNALS_PER_TILE; s++) {
-                        const int region_row = s / fg::SIGNAL_COL_SPLITS;
-                        const int region_col = s % fg::SIGNAL_COL_SPLITS;
-                        const int first_consumer = region_row * fg::CONSUMERS_PER_SIGNAL;
                         // The epilogue's mbarrier arrive releases its drained stores at
                         // CTA scope; the release below extends them to the owner.
                         wait(signal_full[signal_stage], signal_phase);
-                        // One fence releases every counter bump below, which a
-                        // red.release per counter would repeat.
                         comm::atomic_u32::fence_acq_rel_gpu();
-                        // Bump every counter the region covers: each counter then gets
-                        // NUM_DEVICES arrivals per launch at any granularity, so
-                        // configurations can share one `ready` buffer across launches.
-#pragma unroll
-                        for (int r = 0; r < fg::CONSUMERS_PER_SIGNAL; r++) {
-                            const int row_start =
-                                (tile_row_idx * fg::NUM_CLUSTERS * fg::CONSUMER_WARPS +
-                                 cta_rank * fg::CONSUMER_WARPS + first_consumer + r) *
-                                fg::A_tile::rows;
-                            const int device_to_signal = row_start / rows_per_device;
-                            const int ready_row = (row_start % rows_per_device) / fg::READY_ROWS;
-#pragma unroll
-                            for (int c = 0; c < fg::SIGNAL_COLS / fg::READY_COLS; c++) {
-                                const int ready_col = tile_col_idx * fg::READY_COLS_PER_TILE +
-                                    region_col * fg::SIGNAL_COLS / fg::READY_COLS + c;
-                                comm::atomic_u32::relaxed_add_gpu(
-                                    &G.C_barrier[device_to_signal][{ready_row, ready_col}], 1);
-                            }
-                        }
+                        // This CTA's tile lies within one rank's rows (checked on the
+                        // host), so the whole region goes to one counter on that rank.
+                        const int cta_row_start =
+                            (tile_row_idx * fg::NUM_CLUSTERS + cta_rank) * fg::ROW_BLOCK;
+                        const int device_to_signal = cta_row_start / rows_per_device;
+                        const int local_tile_row =
+                            (cta_row_start % rows_per_device) / fg::ROW_BLOCK;
+                        comm::atomic_u32::relaxed_add_gpu(
+                            G.C_barrier[device_to_signal].raw_ptr +
+                                fg::ready_idx(local_tile_row, tile_col_idx, num_tile_cols, s),
+                            1);
                         arrive(signal_empty[signal_stage]);
 
                         signal_stage = (signal_stage + 1) % fg::SIGNAL_PIPELINE_STAGES;
@@ -499,37 +508,35 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         pdl::wait();
         everyone::tma::cluster::wait();
 
-        // Should only read after PDL wait since the previous iteration may have modified the
-        // epoch
-        const uint32_t epoch =
-            comm::atomic_u32::acquire_load_gpu(G.completion_epochs[G.dev_idx].raw_ptr) + 1u;
-        const uint32_t ready_count = epoch * uint32_t(fg::NUM_DEVICES);
+        constexpr uint32_t ready_count = uint32_t(fg::NUM_DEVICES);
 
         const int rs_warp = warp_id - fg::FIRST_RS_WARP_ID;
         for (int unit_idx = blockIdx.x + rs_warp * fg::NUM_BLOCKS;
              unit_idx < tiles_per_device * fg::RS_STRIPS_PER_TILE;
              unit_idx += fg::NUM_BLOCKS * fg::REDUCE_SCATTER_WARPS) {
+            // split the tile into (tile, strip)
             const int strip_idx = unit_idx % fg::RS_STRIPS_PER_TILE;
+
             // Strips are numbered in the epilogue's signal order, region by region.
-            const int region = strip_idx / fg::RS_STRIPS_PER_SIGNAL;
+            // split the tile into (tile, region, strip_row, strip_col)
+            const int region =
+                strip_idx / fg::RS_STRIPS_PER_SIGNAL;  // each region is a RS::ROW x RS::COL chunk
             const int strip_row = (region / fg::SIGNAL_COL_SPLITS) * fg::SIGNAL_ROWS +
                 (strip_idx % fg::RS_STRIPS_PER_SIGNAL) * fg::RS_M_STRIP_SIZE;
             const int strip_col = (region % fg::SIGNAL_COL_SPLITS) * fg::SIGNAL_COLS;
             // Walk this device's tiles in the GEMM's rasterization so strips are taken
             // roughly in completion order.
-            const auto [local_tile_row, tile_col] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
+            const auto [local_tile_row, tile_col] = calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
                 tile_rows_per_device, num_tile_cols, unit_idx / fg::RS_STRIPS_PER_TILE);
 
             // These match the coordinates used by the epilogue's signal.
             if (elect_warp_leader()) {
-                // Peers publish tile arrivals with system-scope atomics.
-                const auto* ready_counter = &G.C_barrier[G.dev_idx][{
-                    local_tile_row * fg::READY_ROWS_PER_TILE + strip_row / fg::READY_ROWS,
-                    tile_col * fg::READY_COLS_PER_TILE + strip_col / fg::READY_COLS}];
-                uint32_t observed = comm::atomic_u32::acquire_load_gpu(ready_counter);
-                while (!epoch_reached(observed, ready_count)) {
+                // Seeing the region's counter complete also proves all of its adds
+                // have landed, which the exit barrier's reset relies on.
+                const auto* ready_counter = G.C_barrier[G.dev_idx].raw_ptr +
+                    fg::ready_idx(local_tile_row, tile_col, num_tile_cols, region);
+                while (comm::atomic_u32::acquire_load_gpu(ready_counter) < ready_count) {
                     __nanosleep(16);
-                    observed = comm::atomic_u32::acquire_load_gpu(ready_counter);
                 }
             }
             __syncwarp();
@@ -561,7 +568,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(
         tm_alloc.set_addr(tmem_addr);
 
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_clusters) {
-            auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SWIZZLE_SIZE>(
+            auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
                 num_tile_rows_per_cluster, num_tile_cols, tile_id);
 
             // The signal warp derives the same row from tile_id; keep the two in step.
@@ -598,40 +605,58 @@ __device__ __forceinline__ void gemm_rs_blackwell(
     }
 }
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 __global__ __cluster_dims__(
-    fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>::NUM_CLUSTERS,
+    fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>::
+        NUM_CLUSTERS,
     1,
     1)
     __launch_bounds__(
-        fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>::
+        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>::
             NUM_THREADS,
-        1) void fused_kernel_stub(const __grid_constant__ fused_globals<_SWIZZLE_SIZE,
+        1) void fused_kernel_stub(const __grid_constant__ fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                                         _SIGNALS_PER_TILE,
                                                                         _RS_STRIP_ROWS,
                                                                         _CONSUMER_WARPS> G) {
-    gemm_rs_blackwell<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>(G);
+    gemm_rs_blackwell<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>(
+        G);
 }
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
-inline void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>& G) {
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
+inline void initialize_gemm_rs_blackwell_state(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                                                                   _SIGNALS_PER_TILE,
+                                                                   _RS_STRIP_ROWS,
+                                                                   _CONSUMER_WARPS>& G) {
     cudaStream_t stream = G.stream;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream) {
         stream = at::cuda::getCurrentCUDAStream().stream();
     }
 #endif
-    const auto& ready = G.C_barrier[G.dev_idx];
-    const size_t ready_bytes = size_t(ready.rows()) * ready.cols() * sizeof(uint32_t);
-    MKERNEL_CUDACHECK(cudaMemsetAsync(ready.raw_ptr, 0, ready_bytes, stream));
+    // The epoch word starts this rank's sync buffer and the ready grid follows its
+    // header, so one memset clears both.
+    using fg =
+        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    const size_t sync_bytes =
+        SYNC_HEADER_BYTES + size_t(fg::ready_numel(G.M, G.N)) * sizeof(uint32_t);
     MKERNEL_CUDACHECK(
-        cudaMemsetAsync(G.completion_epochs[G.dev_idx].raw_ptr, 0, sizeof(uint32_t), stream));
+        cudaMemsetAsync(G.completion_epochs[G.dev_idx].raw_ptr, 0, sync_bytes, stream));
 }
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
-inline void launch_gemm_rs_blackwell(
-    const fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>& G) {
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
+inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                                                         _SIGNALS_PER_TILE,
+                                                         _RS_STRIP_ROWS,
+                                                         _CONSUMER_WARPS>& G) {
     cudaStream_t stream = G.stream;
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
@@ -640,13 +665,16 @@ inline void launch_gemm_rs_blackwell(
     }
 #endif
 
-    using fg = fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    using fg =
+        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
     constexpr int smem_size = fg::DYNAMIC_SHARED_MEMORY;
     constexpr int num_threads = fg::NUM_THREADS;
     constexpr int grid = fg::NUM_BLOCKS;
 
-    auto this_kernel =
-        fused_kernel_stub<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    auto this_kernel = fused_kernel_stub<_SCHEDULER_SWIZZLE_SIZE,
+                                         _SIGNALS_PER_TILE,
+                                         _RS_STRIP_ROWS,
+                                         _CONSUMER_WARPS>;
 
     MKERNEL_CUDACHECK(
         cudaFuncSetAttribute(this_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -668,47 +696,52 @@ inline void launch_gemm_rs_blackwell(
 
     // Full completion dependency, including in captured graphs. The next use
     // of these buffers on this stream cannot pass until every rank is done.
-    exit_epoch_barrier<<<1, 32, 0, stream>>>(G.completion_epochs, G.dev_idx);
+    // Clear only the prefix of the ready grid this launch's M and N used.
+    exit_epoch_barrier<<<1, EXIT_BARRIER_THREADS, 0, stream>>>(
+        G.C_barrier[G.dev_idx].raw_ptr, fg::ready_numel(G.M, G.N), G.completion_epochs, G.dev_idx);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
 inline void prepare(at::Tensor& A,
                     at::Tensor& B,
                     dist::ParallelBuffer& C,
-                    dist::ParallelBuffer& ready,
-                    dist::ParallelBuffer& completion_epochs) {
-    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_SWIZZLE_SIZE,
+                    dist::ParallelBuffer& sync) {
+    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                                                   DEFAULT_SIGNALS_PER_TILE,
                                                   DEFAULT_RS_STRIP_ROWS,
                                                   DEFAULT_NUM_CONSUMER_WARPS>(
         A,
         B,
         C,
-        ready,
-        completion_epochs,
+        sync,
         C.local_rank_,
         A.size(0),
         B.size(0),
         A.size(1),
         at::cuda::getCurrentCUDAStream().stream());
     initialize_gemm_rs_blackwell_state(globals);
+    // Launches may use any prefix of a worst-case allocation, so clear all of it,
+    // not just the prefix this A/B shape covers.
+    MKERNEL_CUDACHECK(cudaMemsetAsync(
+        sync.data_.data_ptr(), 0, sync.data_.nbytes(), at::cuda::getCurrentCUDAStream().stream()));
 }
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 inline void launch_with_config(at::Tensor& A,
                                at::Tensor& B,
                                dist::ParallelBuffer& C,
-                               dist::ParallelBuffer& ready,
-                               dist::ParallelBuffer& completion_epochs) {
+                               dist::ParallelBuffer& sync) {
     auto globals =
-        gemm_rs_blackwell_make_globals<_SWIZZLE_SIZE,
+        gemm_rs_blackwell_make_globals<_SCHEDULER_SWIZZLE_SIZE,
                                        _SIGNALS_PER_TILE,
                                        _RS_STRIP_ROWS,
                                        _CONSUMER_WARPS>(A,
                                                         B,
                                                         C,
-                                                        ready,
-                                                        completion_epochs,
+                                                        sync,
                                                         C.local_rank_,
                                                         A.size(0),
                                                         B.size(0),
@@ -717,73 +750,74 @@ inline void launch_with_config(at::Tensor& A,
     launch_gemm_rs_blackwell(globals);
 }
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS>
+template <int _SCHEDULER_SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS>
 inline void launch_with_rows(at::Tensor& A,
                              at::Tensor& B,
                              dist::ParallelBuffer& C,
-                             dist::ParallelBuffer& ready,
-                             dist::ParallelBuffer& completion_epochs,
+                             dist::ParallelBuffer& sync,
                              int mma_warps) {
     switch (mma_warps) {
         case 1:
-            // One MMA warp has a single 128-row half per tile, so four signals would
-            // split it into 64-column regions, finer than a ready counter.
+            // Four signals with one MMA warp would mean 64-column regions. The flat
+            // ready layout would allow it, but the configuration is untested.
             if constexpr (_SIGNALS_PER_TILE <= 2) {
-                return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, 1>(
-                    A, B, C, ready, completion_epochs);
+                return launch_with_config<_SCHEDULER_SWIZZLE_SIZE,
+                                          _SIGNALS_PER_TILE,
+                                          _RS_STRIP_ROWS,
+                                          1>(A, B, C, sync);
             } else {
                 TORCH_CHECK(false, "mma_warps=1 supports signals_per_tile 1 or 2");
             }
         case 2:
-            return launch_with_config<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, 2>(
-                A, B, C, ready, completion_epochs);
+            return launch_with_config<_SCHEDULER_SWIZZLE_SIZE,
+                                      _SIGNALS_PER_TILE,
+                                      _RS_STRIP_ROWS,
+                                      2>(A, B, C, sync);
         default:
             TORCH_CHECK(false, "mma_warps must be 1 or 2, got ", mma_warps);
     }
 }
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE>
+template <int _SCHEDULER_SWIZZLE_SIZE, int _SIGNALS_PER_TILE>
 inline void launch_with_signals(at::Tensor& A,
                                 at::Tensor& B,
                                 dist::ParallelBuffer& C,
-                                dist::ParallelBuffer& ready,
-                                dist::ParallelBuffer& completion_epochs,
+                                dist::ParallelBuffer& sync,
                                 int rs_strip_rows,
                                 int mma_warps) {
     switch (rs_strip_rows) {
         case 8:
-            return launch_with_rows<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 8>(
-                A, B, C, ready, completion_epochs, mma_warps);
+            return launch_with_rows<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 8>(
+                A, B, C, sync, mma_warps);
         case 16:
-            return launch_with_rows<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 16>(
-                A, B, C, ready, completion_epochs, mma_warps);
+            return launch_with_rows<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 16>(
+                A, B, C, sync, mma_warps);
         case 32:
-            return launch_with_rows<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 32>(
-                A, B, C, ready, completion_epochs, mma_warps);
+            return launch_with_rows<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, 32>(
+                A, B, C, sync, mma_warps);
         default:
             TORCH_CHECK(false, "rs_strip_rows must be 8, 16, or 32, got ", rs_strip_rows);
     }
 }
 
-template <int _SWIZZLE_SIZE>
+template <int _SCHEDULER_SWIZZLE_SIZE>
 inline void launch_with_swizzle(at::Tensor& A,
                                 at::Tensor& B,
                                 dist::ParallelBuffer& C,
-                                dist::ParallelBuffer& ready,
-                                dist::ParallelBuffer& completion_epochs,
+                                dist::ParallelBuffer& sync,
                                 int signals_per_tile,
                                 int rs_strip_rows,
                                 int mma_warps) {
     switch (signals_per_tile) {
         case 1:
-            return launch_with_signals<_SWIZZLE_SIZE, 1>(
-                A, B, C, ready, completion_epochs, rs_strip_rows, mma_warps);
+            return launch_with_signals<_SCHEDULER_SWIZZLE_SIZE, 1>(
+                A, B, C, sync, rs_strip_rows, mma_warps);
         case 2:
-            return launch_with_signals<_SWIZZLE_SIZE, 2>(
-                A, B, C, ready, completion_epochs, rs_strip_rows, mma_warps);
+            return launch_with_signals<_SCHEDULER_SWIZZLE_SIZE, 2>(
+                A, B, C, sync, rs_strip_rows, mma_warps);
         case 4:
-            return launch_with_signals<_SWIZZLE_SIZE, 4>(
-                A, B, C, ready, completion_epochs, rs_strip_rows, mma_warps);
+            return launch_with_signals<_SCHEDULER_SWIZZLE_SIZE, 4>(
+                A, B, C, sync, rs_strip_rows, mma_warps);
         default:
             TORCH_CHECK(false, "signals_per_tile must be 1, 2, or 4, got ", signals_per_tile);
     }
@@ -792,46 +826,47 @@ inline void launch_with_swizzle(at::Tensor& A,
 inline void launch(at::Tensor& A,
                    at::Tensor& B,
                    dist::ParallelBuffer& C,
-                   dist::ParallelBuffer& ready,
-                   dist::ParallelBuffer& completion_epochs,
-                   int swizzle_size,
+                   dist::ParallelBuffer& sync,
+                   int SCHEDULER_SWIZZLE_SIZE,
                    int signals_per_tile,
                    int rs_strip_rows,
                    int mma_warps) {
-    switch (swizzle_size) {
+    switch (SCHEDULER_SWIZZLE_SIZE) {
         case 1:
             return launch_with_swizzle<1>(
-                A, B, C, ready, completion_epochs, signals_per_tile, rs_strip_rows, mma_warps);
+                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
         case 2:
             return launch_with_swizzle<2>(
-                A, B, C, ready, completion_epochs, signals_per_tile, rs_strip_rows, mma_warps);
+                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
         case 4:
             return launch_with_swizzle<4>(
-                A, B, C, ready, completion_epochs, signals_per_tile, rs_strip_rows, mma_warps);
+                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
         case 8:
             return launch_with_swizzle<8>(
-                A, B, C, ready, completion_epochs, signals_per_tile, rs_strip_rows, mma_warps);
+                A, B, C, sync, signals_per_tile, rs_strip_rows, mma_warps);
         default:
-            TORCH_CHECK(false, "swizzle_size must be 1, 2, 4, or 8, got ", swizzle_size);
+            TORCH_CHECK(false,
+                        "SCHEDULER_SWIZZLE_SIZE must be 1, 2, 4, or 8, got ",
+                        SCHEDULER_SWIZZLE_SIZE);
     }
 }
 #endif
 
 // Instantiate the default API so the compile target checks the fused kernel,
 // initialization, and the exit-barrier launch rather than just template syntax.
-template void initialize_gemm_rs_blackwell_state<DEFAULT_SWIZZLE_SIZE,
+template void initialize_gemm_rs_blackwell_state<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                                                  DEFAULT_SIGNALS_PER_TILE,
                                                  DEFAULT_RS_STRIP_ROWS,
                                                  DEFAULT_NUM_CONSUMER_WARPS>(
-    const fused_globals<DEFAULT_SWIZZLE_SIZE,
+    const fused_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                         DEFAULT_SIGNALS_PER_TILE,
                         DEFAULT_RS_STRIP_ROWS,
                         DEFAULT_NUM_CONSUMER_WARPS>& G);
-template void launch_gemm_rs_blackwell<DEFAULT_SWIZZLE_SIZE,
+template void launch_gemm_rs_blackwell<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                                        DEFAULT_SIGNALS_PER_TILE,
                                        DEFAULT_RS_STRIP_ROWS,
                                        DEFAULT_NUM_CONSUMER_WARPS>(
-    const fused_globals<DEFAULT_SWIZZLE_SIZE,
+    const fused_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                         DEFAULT_SIGNALS_PER_TILE,
                         DEFAULT_RS_STRIP_ROWS,
                         DEFAULT_NUM_CONSUMER_WARPS>& G);

@@ -34,32 +34,57 @@
 namespace gemm_rs_blackwell {
 static constexpr int DEFAULT_NUM_CTA = 2;
 static constexpr int DEFAULT_NUM_CONSUMER_WARPS = 2;
-static constexpr int DEFAULT_SWIZZLE_SIZE = 4;
+static constexpr int DEFAULT_SCHEDULER_SWIZZLE_SIZE = 4;
 static constexpr int DEFAULT_SIGNALS_PER_TILE = 1;
 static constexpr int DEFAULT_RS_STRIP_ROWS = 32;
 
-// One persistent 32-bit word on each rank; no multicast allocation is needed.
+// Each rank's `sync` buffer (int32, no multicast) holds its completion epoch in
+// word 0, padded to one 32B L2 sector, followed by the ready-counter grid.
+static constexpr int SYNC_HEADER_BYTES = 32;
+static constexpr int SYNC_HEADER_WORDS = SYNC_HEADER_BYTES / sizeof(uint32_t);
+// The buffer has a fixed size of one 2MB VMM granule, which every allocation is
+// rounded up to anyway. It holds ~524K ready counters, so any practical M and N fit.
+static constexpr int SYNC_BUFFER_BYTES = 2 << 20;
+static constexpr int SYNC_BUFFER_WORDS = SYNC_BUFFER_BYTES / sizeof(uint32_t);
+
 // Only the owning rank writes its completed epoch. Peers acquire-load it.
 using completion_epoch_local_tensor = dist::local_tensor<uint32_t, 1, 1, 1, 1>;
 using completion_epoch_dist_tensor =
     dist::distributed_tensor<completion_epoch_local_tensor, INTRA_NUM_DEVICES, false>;
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 struct fused_globals;
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
-void launch_gemm_rs_blackwell(
-    const fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>& G);
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
+void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                                                  _SIGNALS_PER_TILE,
+                                                  _RS_STRIP_ROWS,
+                                                  _CONSUMER_WARPS>& G);
 
 // Call once before capture/replay, with no work using these buffers in flight.
 // Wait for this stream's initialization to finish locally, then synchronize all
-// ranks before the first launch. Keep the same tile layout and serialize launches
-// on G.stream; both allocations must remain alive across all graph replays.
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
-void initialize_gemm_rs_blackwell_state(
-    const fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>& G);
+// ranks before the first launch. Serialize launches on G.stream and keep the sync
+// buffer alive across all graph replays. M and N may change between launches:
+// each launch's exit barrier re-zeroes the ready counters it used.
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
+void initialize_gemm_rs_blackwell_state(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                                                            _SIGNALS_PER_TILE,
+                                                            _RS_STRIP_ROWS,
+                                                            _CONSUMER_WARPS>& G);
 
-template <int _SWIZZLE_SIZE, int _SIGNALS_PER_TILE, int _RS_STRIP_ROWS, int _CONSUMER_WARPS>
+template <int _SCHEDULER_SWIZZLE_SIZE,
+          int _SIGNALS_PER_TILE,
+          int _RS_STRIP_ROWS,
+          int _CONSUMER_WARPS>
 struct fused_globals {
     static constexpr int NUM_DEVICES = INTRA_NUM_DEVICES;
     static constexpr int NUM_BLOCKS = 148;
@@ -113,40 +138,45 @@ struct fused_globals {
     static constexpr int RED_BLOCK = 64;
     static constexpr int C_TILE_DIVISOR = 4;
 
-    // Ready counters cover READY_ROWS x READY_COLS, the finest region any signal
-    // granularity publishes, so one `ready` buffer serves every configuration.
-    static constexpr int READY_ROWS = ROW_BLOCK / CONSUMER_WARPS;
-    static constexpr int READY_COLS = COL_BLOCK / 2;
-    static constexpr int READY_ROWS_PER_TILE = ROW_BLOCK / READY_ROWS;
-    static constexpr int READY_COLS_PER_TILE = COL_BLOCK / READY_COLS;
-
     // Publications per tile, in epilogue store order: 1 is the whole tile, 2 is each
     // consumer's half (column halves with one consumer), and 4 also splits each half
     // by columns, published midway through its stores. Each covers SIGNAL_ROWS x
-    // SIGNAL_COLS; with one consumer, 4 would need 64-column ready counters.
+    // SIGNAL_COLS. One consumer with 4 signals (64-column regions) is not enabled.
     static constexpr int SIGNALS_PER_TILE = _SIGNALS_PER_TILE;
     static_assert(SIGNALS_PER_TILE == 1 || SIGNALS_PER_TILE == 2 || SIGNALS_PER_TILE == 4,
                   "SIGNALS_PER_TILE must be 1, 2, or 4");
+
     static constexpr int SIGNAL_ROW_SPLITS =
         SIGNALS_PER_TILE < CONSUMER_WARPS ? SIGNALS_PER_TILE : CONSUMER_WARPS;
+
     static constexpr int SIGNAL_COL_SPLITS = SIGNALS_PER_TILE / SIGNAL_ROW_SPLITS;
     static constexpr int SIGNAL_ROWS = ROW_BLOCK / SIGNAL_ROW_SPLITS;
     static constexpr int SIGNAL_COLS = COL_BLOCK / SIGNAL_COL_SPLITS;
     static constexpr int CONSUMERS_PER_SIGNAL = CONSUMER_WARPS / SIGNAL_ROW_SPLITS;
     static constexpr int C_CHUNKS_PER_SIGNAL = C_TILE_DIVISOR / SIGNAL_COL_SPLITS;
-    static_assert(SIGNAL_ROWS % READY_ROWS == 0 && SIGNAL_COLS % READY_COLS == 0,
-                  "A signal region must cover whole ready counters");
     static_assert(C_TILE_DIVISOR % SIGNAL_COL_SPLITS == 0,
                   "A signal region must end on a C chunk boundary");
 
+    __host__ __device__ static constexpr int ready_numel(int M, int N) {
+        return (M / NUM_DEVICES / ROW_BLOCK) * (N / COL_BLOCK) * SIGNALS_PER_TILE;
+    }
+
+    //  [tile_row, tile_col, region] indexing for the ready buffer
+    __host__ __device__ static constexpr int ready_idx(int local_tile_row,
+                                                       int tile_col,
+                                                       int num_tile_cols,
+                                                       int region) {
+        return (local_tile_row * num_tile_cols + tile_col) * SIGNALS_PER_TILE + region;
+    }
+
     // RS units are RS_M_STRIP_SIZE x RS_COLS strips inside one signal region, so each
-    // waits on exactly one ready counter.
+    // waits on its region's ready counter.
     static constexpr int RS_M_STRIP_SIZE = _RS_STRIP_ROWS;
     static constexpr int RS_COLS = SIGNAL_COLS;
     static_assert(SIGNAL_ROWS % RS_M_STRIP_SIZE == 0,
                   "An RS strip must not straddle two signal regions");
-    // Loads in flight per lane: a whole strip, capped at 32, so a batch never runs past
-    // the end of a strip.
+    // Loads in flight per lane: a whole strip, capped at 32, so a batch never does a larger than
+    // 512B load, which would exceed the width of the tensor
     static constexpr int RS_ROWS_PER_STORE = kittens::WARP_THREADS / (RS_COLS / 8);
     static constexpr int RS_STORES_PER_BATCH =
         RS_M_STRIP_SIZE / RS_ROWS_PER_STORE < 32 ? RS_M_STRIP_SIZE / RS_ROWS_PER_STORE : 32;
@@ -167,8 +197,8 @@ struct fused_globals {
     static constexpr int SIGNAL_PIPELINE_STAGES = 4;
 
     // Tile columns per supergroup in the tile rasterization.
-    static constexpr int SWIZZLE_SIZE = _SWIZZLE_SIZE;
-    static_assert(SWIZZLE_SIZE > 0, "SWIZZLE_SIZE must be greater than 0");
+    static constexpr int SCHEDULER_SWIZZLE_SIZE = _SCHEDULER_SWIZZLE_SIZE;
+    static_assert(SCHEDULER_SWIZZLE_SIZE > 0, "SCHEDULER_SWIZZLE_SIZE must be greater than 0");
 
     using A_tile = kittens::st_bf<ROW_BLOCK / CONSUMER_WARPS, RED_BLOCK>;  // [M, K]
     using B_tile = kittens::st_bf<COL_BLOCK / NUM_CLUSTERS, RED_BLOCK>;    // [N, K]
@@ -188,7 +218,9 @@ struct fused_globals {
     using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
     using C_dist_tensor = dist::distributed_tensor<C_local_tensor, NUM_DEVICES, true>;
 
-    using C_ready_barrier = dist::barrier_distributed_tensor<NUM_DEVICES>;
+    // Peers bump counters through unicast pointers, so no multicast VA is needed.
+    using C_ready_barrier =
+        dist::distributed_tensor<dist::local_tensor<int, -1, -1, -1, -1>, NUM_DEVICES, false>;
 
     int dev_idx;
     int M;
@@ -225,51 +257,70 @@ struct fused_globals {
 template <typename>
 inline constexpr bool always_false_v = false;
 
-template <int _SWIZZLE_SIZE,
+template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
           typename DistributedTensor,
           typename LocalTensor>
-__host__ inline fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>
+__host__ inline fused_globals<_SCHEDULER_SWIZZLE_SIZE,
+                              _SIGNALS_PER_TILE,
+                              _RS_STRIP_ROWS,
+                              _CONSUMER_WARPS>
 gemm_rs_blackwell_make_globals(LocalTensor& A,
                                LocalTensor& B,
                                DistributedTensor& C,
-                               DistributedTensor& C_barrier,
-                               DistributedTensor& completion_epochs,
+                               DistributedTensor& sync,
                                int dev_idx,
                                int M,
                                int N,
                                int K,
                                cudaStream_t stream) {
-    using fg = fused_globals<_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    using fg =
+        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
-        TORCH_CHECK(C_barrier.data_.dim() == 2 &&
-                        C_barrier.data_.size(0) == M / fg::NUM_DEVICES / fg::READY_ROWS &&
-                        C_barrier.data_.size(1) == N / fg::READY_COLS,
-                    "ready must have shape (M / world_size / ",
-                    fg::READY_ROWS,
-                    ", N / ",
-                    fg::READY_COLS,
-                    ")");
-        TORCH_CHECK(completion_epochs.data_.numel() == 1 &&
-                        completion_epochs.data_.element_size() == sizeof(uint32_t),
-                    "completion_epochs must contain one 32-bit word per rank");
-        return {
-            .dev_idx = dev_idx,
-            .M = M,
-            .N = N,
-            .K = K,
-            .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A),
-            .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-            .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(C),
-            .C_barrier =
-                dist::distributed_tensor_from_buffer<typename fg::C_ready_barrier>(C_barrier),
-            .completion_epochs = dist::distributed_tensor_from_buffer<completion_epoch_dist_tensor>(
-                completion_epochs),
-            .stream = stream};
+        // A CTA tile must not straddle two ranks' rows: the signal warp sends a whole
+        // region to one rank, and the RS warps enumerate whole tiles per rank.
+        TORCH_CHECK((M / fg::NUM_DEVICES) % fg::ROW_BLOCK == 0 && N % fg::COL_BLOCK == 0,
+                    "M / world_size must be a multiple of ",
+                    fg::ROW_BLOCK,
+                    " and N a multiple of ",
+                    fg::COL_BLOCK);
+        const int ready_numel = fg::ready_numel(M, N);
+        TORCH_CHECK(sync.data_.element_size() == sizeof(uint32_t) &&
+                        sync.data_.numel() == SYNC_BUFFER_WORDS,
+                    "sync must be an int32 buffer of shape gemm_rs_blackwell_sync_shape");
+        TORCH_CHECK(SYNC_HEADER_WORDS + ready_numel <= SYNC_BUFFER_WORDS,
+                    "M=",
+                    M,
+                    ", N=",
+                    N,
+                    " needs more ready counters than the sync buffer holds");
+        TORCH_CHECK(int(sync.raw_ptrs_.size()) == fg::NUM_DEVICES,
+                    "sync must span ",
+                    fg::NUM_DEVICES,
+                    " ranks");
+        // Slice each rank's sync buffer into the epoch word and the ready grid.
+        uint64_t epoch_ptrs[fg::NUM_DEVICES];
+        uint64_t ready_ptrs[fg::NUM_DEVICES];
+        for (int i = 0; i < fg::NUM_DEVICES; i++) {
+            epoch_ptrs[i] = reinterpret_cast<uint64_t>(sync.raw_ptrs_[i]);
+            ready_ptrs[i] = epoch_ptrs[i] + SYNC_HEADER_BYTES;
+        }
+        return {.dev_idx = dev_idx,
+                .M = M,
+                .N = N,
+                .K = K,
+                .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A),
+                .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
+                .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(C),
+                .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
+                    ready_ptrs, 1, 1, 1, ready_numel),
+                .completion_epochs = dist::make_distributed_tensor<completion_epoch_dist_tensor>(
+                    epoch_ptrs, 1, 1, 1, 1),
+                .stream = stream};
     } else {
         static_assert(always_false_v<LocalTensor>, "Unsupported LocalTensorType");
     }
@@ -284,16 +335,13 @@ __device__ __forceinline__ void reduce_load_16B(uint32_t* out, const comm::bf16*
         "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 "
         "{%0, %1, %2, %3}, [%4];"
         : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3])
-        : "l"(src)
-        // TODO: maybe I can remove the clobber here?
-        : "memory");
+        : "l"(src));
 }
 
 __device__ __forceinline__ void store_16B(comm::bf16* dst, const uint32_t* in) {
     asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};"
                  :
-                 : "l"(dst), "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3])
-                 : "memory");
+                 : "l"(dst), "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3]));
 }
 }  // namespace
 };  // namespace gemm_rs_blackwell
