@@ -119,14 +119,6 @@ __host__ __device__ __forceinline__ bool epoch_reached(uint32_t observed, uint32
 
 }  // namespace
 
-// A normal same-stream launch after fused_kernel_stub establishes completion of
-// every local CTA and its global writes before this rank publishes its epoch.
-// Do not enable PDL or signal early launch completion in this barrier kernel.
-//
-// It also zeroes this rank's used ready counters for the next launch. Plain stores
-// suffice: the RS warps saw every counter reach NUM_DEVICES, so no peer add is
-// still in flight, and no peer adds again until it acquires the epoch released
-// below, after the zeros.
 static constexpr int EXIT_BARRIER_THREADS = 256;
 
 __global__ void exit_epoch_barrier(int* local_ready,
@@ -137,6 +129,9 @@ __global__ void exit_epoch_barrier(int* local_ready,
     // Every thread reads the epoch before the barrier, so none can see the bump.
     const uint32_t completed_epoch = comm::atomic_u32::acquire_load_gpu(local_epoch) + 1u;
 
+    // we choose to clear the buffer rather than increment an epoch so that
+    // we are not bound to the same input length (so we can signal and poll different lengths of
+    // the ready buffer)
     for (int i = threadIdx.x; i < ready_numel; i += blockDim.x) {
         local_ready[i] = 0;
     }
@@ -333,7 +328,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         const int epilogue_semaphore_idx = consumer_id + 4;
 
         // This consumer closes a signal region's rows; its chunks close the columns.
-        // TODO: remove once I set the MMA tile to 256*256
         const bool closes_region_rows = (consumer_id + 1) % fg::CONSUMERS_PER_SIGNAL == 0;
 
         // Drain, then hand the region to the signal warp. The drain is what makes the
