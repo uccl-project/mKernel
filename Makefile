@@ -20,21 +20,32 @@
 #   BACKEND=cx7  → ConnectX-7 RC via libibverbs (InfiniBand / RoCE)
 #
 # Override with: `make BACKEND=cx7 all`
-BACKEND ?= efa
+#
+# when arch is blackwell, default to intranode build
+# when arch is hopper, default to efa backend
+GPU ?= hopper
+ifeq ($(GPU),blackwell)
+    BACKEND ?=
+else
+    BACKEND ?= efa
+endif
 ifeq ($(BACKEND),efa)
     BACKEND_DEFINES := -DINTERNODE_BACKEND_EFA
     BACKEND_LIBS    := -L$(EFA_HOME)/lib -lfabric -libverbs -lefa
 else ifeq ($(BACKEND),cx7)
     BACKEND_DEFINES := -DINTERNODE_BACKEND_IBVERBS
     BACKEND_LIBS    := -libverbs
+else ifeq ($(BACKEND)$(GPU),blackwell)
+    BACKEND_DEFINES :=
+    BACKEND_LIBS    :=
 else
-    $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
+    $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7$(if $(filter blackwell,$(GPU)), or leave it unset for GPU=blackwell).)
 endif
 
 # === Target GPU ===
 #   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
 #   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
-GPU ?= hopper
+
 ifeq ($(GPU),blackwell)
     ARCH              := -gencode arch=compute_103a,code=sm_103a
     ARCH_DEFINES      := -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05

@@ -253,10 +253,6 @@ def gemm_rs_blackwell_prepare(
         buffers.baseline_graph.replay()
 
     fns = [(bench_baseline, "baseline", True)]
-
-    # Autotune on graph replays; benchmark_cuda takes the max over ranks, so
-    # every rank selects the same configuration.
-
     def bench_mkernel_eager():
         run_mkernel(mkernel_module, buffers, config.mkernel_tuned_config(M))
 

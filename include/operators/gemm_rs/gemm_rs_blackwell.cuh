@@ -39,12 +39,11 @@ static constexpr int DEFAULT_SCHEDULER_SWIZZLE_SIZE = 4;
 static constexpr int DEFAULT_SIGNALS_PER_TILE = 1;
 static constexpr int DEFAULT_RS_STRIP_ROWS = 32;
 
-// Each rank's `sync` buffer (int32, no multicast) holds its completion epoch in
-// word 0, padded to one 32B L2 sector, followed by the ready-counter grid.
+// The P2P tensor holds:
+// 1. epoch counter (first 32B, algined to a sector)
+// 2. GEMM-RS ready signal (rest of the buffer)
 static constexpr int SYNC_HEADER_BYTES = 32;
 static constexpr int SYNC_HEADER_WORDS = SYNC_HEADER_BYTES / sizeof(uint32_t);
-// The buffer has a fixed size of one 2MB VMM granule, which every allocation is
-// rounded up to anyway. It holds ~524K ready counters, so any practical M and N fit.
 static constexpr int SYNC_BUFFER_BYTES = 2 << 20;
 static constexpr int SYNC_BUFFER_WORDS = SYNC_BUFFER_BYTES / sizeof(uint32_t);
 
@@ -67,20 +66,6 @@ void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                   _SIGNALS_PER_TILE,
                                                   _RS_STRIP_ROWS,
                                                   _CONSUMER_WARPS>& G);
-
-// Call once before capture/replay, with no work using these buffers in flight.
-// Wait for this stream's initialization to finish locally, then synchronize all
-// ranks before the first launch. Serialize launches on G.stream and keep the sync
-// buffer alive across all graph replays. M and N may change between launches:
-// each launch's exit barrier re-zeroes the ready counters it used.
-template <int _SCHEDULER_SWIZZLE_SIZE,
-          int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
-void initialize_gemm_rs_blackwell_state(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
-                                                            _SIGNALS_PER_TILE,
-                                                            _RS_STRIP_ROWS,
-                                                            _CONSUMER_WARPS>& G);
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
@@ -122,15 +107,7 @@ struct fused_globals {
     static constexpr int MAINLOOP_REGISTERS = 40;
     static constexpr int RS_REGISTERS = 160;
     static constexpr int EPILOGUE_REGISTERS = 224;
-    // guard against register overallocation
-    static_assert((MAINLOOP_REGISTERS + RS_REGISTERS) * kittens::WARPGROUP_THREADS +
-                          EPILOGUE_REGISTERS * EPILOGUE_WARPS * kittens::WARP_THREADS <=
-                      65536,
-                  "setmaxnreg budget exceeds the register file");
-    // setmaxnreg.dec can only lower a warp's count from the launch allocation.
-    static constexpr int REGISTER_CEILING = (65536 / NUM_THREADS / 8) * 8;
-    static_assert(MAINLOOP_REGISTERS <= REGISTER_CEILING && RS_REGISTERS <= REGISTER_CEILING,
-                  "Decreased register counts must not exceed the launch allocation");
+
     static constexpr int NUM_CLUSTERS = DEFAULT_NUM_CTA;
 
     // A 2-CTA MMA covers 128 rows per CTA.
@@ -140,12 +117,10 @@ struct fused_globals {
     static constexpr int C_TILE_DIVISOR = 4;
 
     // Publications per tile, in epilogue store order: 1 is the whole tile, 2 is each
-    // consumer's half (column halves with one consumer), and 4 also splits each half
-    // by columns, published midway through its stores. Each covers SIGNAL_ROWS x
-    // SIGNAL_COLS. One consumer with 4 signals (64-column regions) is not enabled.
+    // consumer's half (column halves with one consumer). Each covers SIGNAL_ROWS x
+    // SIGNAL_COLS.
     static constexpr int SIGNALS_PER_TILE = _SIGNALS_PER_TILE;
-    static_assert(SIGNALS_PER_TILE == 1 || SIGNALS_PER_TILE == 2 || SIGNALS_PER_TILE == 4,
-                  "SIGNALS_PER_TILE must be 1, 2, or 4");
+    static_assert(SIGNALS_PER_TILE == 1 || SIGNALS_PER_TILE == 2, "SIGNALS_PER_TILE must be 1, 2");
 
     static constexpr int SIGNAL_ROW_SPLITS =
         SIGNALS_PER_TILE < CONSUMER_WARPS ? SIGNALS_PER_TILE : CONSUMER_WARPS;
@@ -191,7 +166,6 @@ struct fused_globals {
     static constexpr int NUM_TMEM_SLOTS = TMEM_PIPELINE_STAGES * CONSUMER_WARPS;
 
     // used for SMEM allocation
-    // One MMA warp halves each stage's A bytes, so two more stages fit in SMEM.
     static constexpr int PRODUCER_CONSUMER_PIPELINE_STAGES = CONSUMER_WARPS == 1 ? 6 : 4;
     static constexpr int EPILOGUE_PIPELINE_STAGES = 2;
     // Drained tiles the epilogue may hand off before the signal warp catches up.

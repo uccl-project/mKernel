@@ -472,17 +472,15 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
                             num_tile_rows_per_cluster, num_tile_cols, tile_id);
 #pragma unroll
                     for (int s = 0; s < fg::SIGNALS_PER_TILE; s++) {
-                        // The epilogue's mbarrier arrive releases its drained stores at
-                        // CTA scope; the release below extends them to the owner.
                         wait(signal_full[signal_stage], signal_phase);
                         comm::atomic_u32::fence_acq_rel_gpu();
-                        // This CTA's tile lies within one rank's rows (checked on the
-                        // host), so the whole region goes to one counter on that rank.
+
                         const int cta_row_start =
                             (tile_row_idx * fg::NUM_CLUSTERS + cta_rank) * fg::ROW_BLOCK;
                         const int device_to_signal = cta_row_start / rows_per_device;
                         const int local_tile_row =
                             (cta_row_start % rows_per_device) / fg::ROW_BLOCK;
+
                         comm::atomic_u32::relaxed_add_gpu(
                             G.C_barrier[device_to_signal].raw_ptr +
                                 fg::ready_idx(local_tile_row, tile_col_idx, num_tile_cols, s),
@@ -517,15 +515,14 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             // split the tile into (tile, strip)
             const int strip_idx = unit_idx % fg::RS_STRIPS_PER_TILE;
 
-            // Strips are numbered in the epilogue's signal order, region by region.
             // split the tile into (tile, region, strip_row, strip_col)
             const int region =
                 strip_idx / fg::RS_STRIPS_PER_SIGNAL;  // each region is a RS::ROW x RS::COL chunk
             const int strip_row = (region / fg::SIGNAL_COL_SPLITS) * fg::SIGNAL_ROWS +
                 (strip_idx % fg::RS_STRIPS_PER_SIGNAL) * fg::RS_M_STRIP_SIZE;
             const int strip_col = (region % fg::SIGNAL_COL_SPLITS) * fg::SIGNAL_COLS;
-            // Walk this device's tiles in the GEMM's rasterization so strips are taken
-            // roughly in completion order.
+
+            // Walk this device's tiles in the GEMM's rasterization
             const auto [local_tile_row, tile_col] = calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
                 tile_rows_per_device, num_tile_cols, unit_idx / fg::RS_STRIPS_PER_TILE);
 
@@ -629,30 +626,6 @@ template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS>
-inline void initialize_gemm_rs_blackwell_state(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
-                                                                   _SIGNALS_PER_TILE,
-                                                                   _RS_STRIP_ROWS,
-                                                                   _CONSUMER_WARPS>& G) {
-    cudaStream_t stream = G.stream;
-#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
-    if (!stream) {
-        stream = at::cuda::getCurrentCUDAStream().stream();
-    }
-#endif
-    // The epoch word starts this rank's sync buffer and the ready grid follows its
-    // header, so one memset clears both.
-    using fg =
-        fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
-    const size_t sync_bytes =
-        SYNC_HEADER_BYTES + size_t(fg::ready_numel(G.M, G.N)) * sizeof(uint32_t);
-    MKERNEL_CUDACHECK(
-        cudaMemsetAsync(G.completion_epochs[G.dev_idx].raw_ptr, 0, sync_bytes, stream));
-}
-
-template <int _SCHEDULER_SWIZZLE_SIZE,
-          int _SIGNALS_PER_TILE,
-          int _RS_STRIP_ROWS,
-          int _CONSUMER_WARPS>
 inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                                                          _SIGNALS_PER_TILE,
                                                          _RS_STRIP_ROWS,
@@ -706,22 +679,10 @@ inline void prepare(at::Tensor& A,
                     at::Tensor& B,
                     dist::ParallelBuffer& C,
                     dist::ParallelBuffer& sync) {
-    auto globals = gemm_rs_blackwell_make_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
-                                                  DEFAULT_SIGNALS_PER_TILE,
-                                                  DEFAULT_RS_STRIP_ROWS,
-                                                  DEFAULT_NUM_CONSUMER_WARPS>(
-        A,
-        B,
-        C,
-        sync,
-        C.local_rank_,
-        A.size(0),
-        B.size(0),
-        A.size(1),
-        at::cuda::getCurrentCUDAStream().stream());
-    initialize_gemm_rs_blackwell_state(globals);
-    // Launches may use any prefix of a worst-case allocation, so clear all of it,
-    // not just the prefix this A/B shape covers.
+    // Shape checks on A, B and C run at launch, when the config is known.
+    TORCH_CHECK(
+        sync.data_.element_size() == sizeof(uint32_t) && sync.data_.numel() == SYNC_BUFFER_WORDS,
+        "sync must be an int32 buffer of shape gemm_rs_blackwell_sync_shape");
     MKERNEL_CUDACHECK(cudaMemsetAsync(
         sync.data_.data_ptr(), 0, sync.data_.nbytes(), at::cuda::getCurrentCUDAStream().stream()));
 }
@@ -766,16 +727,6 @@ inline void entrypoint(at::Tensor& A,
 
 #endif
 
-// Instantiate the default API so the compile target checks the fused kernel,
-// initialization, and the exit-barrier launch rather than just template syntax.
-template void initialize_gemm_rs_blackwell_state<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
-                                                 DEFAULT_SIGNALS_PER_TILE,
-                                                 DEFAULT_RS_STRIP_ROWS,
-                                                 DEFAULT_NUM_CONSUMER_WARPS>(
-    const fused_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
-                        DEFAULT_SIGNALS_PER_TILE,
-                        DEFAULT_RS_STRIP_ROWS,
-                        DEFAULT_NUM_CONSUMER_WARPS>& G);
 template void launch_gemm_rs_blackwell<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                                        DEFAULT_SIGNALS_PER_TILE,
                                        DEFAULT_RS_STRIP_ROWS,
