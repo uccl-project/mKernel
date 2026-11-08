@@ -213,4 +213,4 @@ $(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu $(GEMM_RS_BLACKWEL
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
 
 run-gemm-rs-blackwell: gemm-rs-blackwell
-	$(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_blackwell_bench.py --warmup 20 --iters 50
+	$(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_bench.py --arch blackwell --warmup 20 --iters 50

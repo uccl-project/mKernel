@@ -8,6 +8,9 @@ Per-shape SM split tuned to match the chunk512 numbers (see SM_SPLIT below).
 from __future__ import annotations
 import argparse, json, os, sys, time
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Protocol
+import itertools
 
 # Default binding behavior; callers can override for compatibility checks.
 os.environ.setdefault("MKERNEL_BIND_RETAINED_HANDLE", "1")
@@ -19,6 +22,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "python"))
 import load_module  # noqa: E402
+import load_thirdparty # noqa: E402
 from common import (  # noqa: E402
     check_close,
     compare_named_results,
@@ -29,69 +33,440 @@ from common import (  # noqa: E402
     rdma_policy_label,
 )
 
-KERNEL_NAME = "gemm_rs"
 from common import get_num_nodes  # noqa: E402
-NUM_NODES = get_num_nodes()
-ROW_BLOCK = 128
-COL_BLOCK = 256
 
-# Sweep shapes keep K=M/(NUM_NODES*8) on aligned values.
-DEFAULT_SHAPES = (
-    [3072, 6144, 12288, 24576, 49152]
-    if NUM_NODES == 3 else
-    [4096, 8192, 16384, 32768, 65536, 98304]
-    if NUM_NODES == 4 else
-    [2048, 4096, 8192, 16384, 32768]
-)
+class HopperBenchConfig:
+    arch = "hopper"
 
-# Tuned role split for the fused compute/intra/send/reduce path:
-# (n_comp, n_intra, n_send, n_reduce, chunk_tiles).
-SM_SPLIT = {
-    2048:  (112, 0, 10, 10, 2),
-    4096:  (114, 0, 10,  8,  2),
-    8192:  (118, 0, 6, 8, 4),
-    16384: (120, 0, 4,  8,  4),
-    32768: (120, 0, 4,  8,  8),
-    65536: (124, 0, 2,  6,  32),
-    98304: (118, 0, 6,  8,  4),
-    # Multi-node shapes use smaller chunks for M=24576 and conservative chunks
-    # at the extremes.
-    6144:  (116, 0, 8,  8,  4),
-    12288: (118, 0, 6,  8,  4),
-    24576: (120, 0, 4,  8,  2),
-    49152: (120, 0, 4,  8,  4),
-}
+    NUM_NODES = get_num_nodes()
+    ROW_BLOCK = 128
+    COL_BLOCK = 256
+    KERNEL_NAME = "gemm_rs"
 
+    # Sweep shapes keep K=M/(NUM_NODES*8) on aligned values.
+    DEFAULT_SHAPES = (
+        [3072, 6144, 12288, 24576, 49152]
+        if NUM_NODES == 3 else
+        [4096, 8192, 16384, 32768, 65536, 98304]
+        if NUM_NODES == 4 else
+        [2048, 4096, 8192, 16384, 32768]
+    )
 
-def split_for_shape(m: int) -> tuple[int, int, int, int, int]:
-    split = SM_SPLIT.get(m, (118, 0, 6, 8, 4))
-    if NUM_NODES == 4 and m == 4096 and "GEMM_RS_SPLIT" not in os.environ:
-        split = (116, 0, 8, 8, 2)
-    override = os.environ.get("GEMM_RS_SPLIT")
-    if override:
-        parts = [int(x) for x in override.replace(":", ",").split(",") if x.strip()]
-        if len(parts) != 5:
-            raise ValueError(
-                "GEMM_RS_SPLIT must be comp,intra,send,reduce,chunk_tiles"
+    # Tuned role split for the fused compute/intra/send/reduce path:
+    # (n_comp, n_intra, n_send, n_reduce, chunk_tiles).
+    SM_SPLIT = {
+        2048:  (112, 0, 10, 10, 2),
+        4096:  (114, 0, 10,  8,  2),
+        8192:  (118, 0, 6, 8, 4),
+        16384: (120, 0, 4,  8,  4),
+        32768: (120, 0, 4,  8,  8),
+        65536: (124, 0, 2,  6,  32),
+        98304: (118, 0, 6,  8,  4),
+        # Multi-node shapes use smaller chunks for M=24576 and conservative chunks
+        # at the extremes.
+        6144:  (116, 0, 8,  8,  4),
+        12288: (118, 0, 6,  8,  4),
+        24576: (120, 0, 4,  8,  2),
+        49152: (120, 0, 4,  8,  4),
+    }
+
+    @staticmethod
+    def split_for_shape(m: int) -> tuple[int, int, int, int, int]:
+        split = HopperBenchConfig.SM_SPLIT.get(m, (118, 0, 6, 8, 4))
+        if HopperBenchConfig.NUM_NODES == 4 and m == 4096 and "GEMM_RS_SPLIT" not in os.environ:
+            split = (116, 0, 8, 8, 2)
+        override = os.environ.get("GEMM_RS_SPLIT")
+        if override:
+            parts = [int(x) for x in override.replace(":", ",").split(",") if x.strip()]
+            if len(parts) != 5:
+                raise ValueError(
+                    "GEMM_RS_SPLIT must be comp,intra,send,reduce,chunk_tiles"
+                )
+            split = tuple(parts)
+
+        n_comp, n_intra, n_send, n_reduce, chunk_tiles = split
+        n_comp = int(os.environ.get("GEMM_RS_NUM_COMP_SMS", n_comp))
+        n_intra = int(os.environ.get("GEMM_RS_NUM_INTRA_COMM_SMS", n_intra))
+        n_send = int(os.environ.get("GEMM_RS_NUM_SEND_SMS", n_send))
+        n_reduce = int(os.environ.get("GEMM_RS_NUM_REDUCE_SMS", n_reduce))
+        chunk_tiles = int(os.environ.get("GEMM_RS_CHUNK_TILES", chunk_tiles))
+        return n_comp, n_intra, n_send, n_reduce, chunk_tiles
+
+    @staticmethod
+    def poll_tuning(m: int) -> tuple[int, int]:
+        if HopperBenchConfig.NUM_NODES > 2:
+            return (1, 100)
+        # Relaxed polling is the default timing path; acquire polling remains
+        # available through the kernel option when needed.
+        return (0, 100)
+
+class BlackwellBenchConfig:
+    arch = "blackwell"
+    KERNEL_NAME = "gemm_rs_blackwell"
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_chief = local_rank == 0
+    num_nodes = 1
+
+    DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
+    output_dim = 7168
+    split_inner_dim = 12288 // world_size
+
+    # Tile columns per rasterization supergroup; must match the instantiated
+    # values in gemm_rs_blackwell::launch.
+    mkernel_swizzle_sizes = [1, 2]
+    # Ready-counter publications per 256x256 tile and RS strip heights; must match
+    # the instantiated values in gemm_rs_blackwell::launch.
+    mkernel_signals_per_tile = [1, 2, 4]
+    mkernel_rs_strip_rows = [8, 16, 32]
+
+    def mkernel_candidates(self, M: int):
+        return [
+            (swizzle, signals, rs_rows, mma_warps)
+            for swizzle, signals, rs_rows, mma_warps in itertools.product(
+                self.mkernel_swizzle_sizes, self.mkernel_signals_per_tile,
+                self.mkernel_rs_strip_rows,
+                [1],
             )
-        split = tuple(parts)
+            if mma_warps == 2 or signals <= 2
+        ]
 
-    n_comp, n_intra, n_send, n_reduce, chunk_tiles = split
-    n_comp = int(os.environ.get("GEMM_RS_NUM_COMP_SMS", n_comp))
-    n_intra = int(os.environ.get("GEMM_RS_NUM_INTRA_COMM_SMS", n_intra))
-    n_send = int(os.environ.get("GEMM_RS_NUM_SEND_SMS", n_send))
-    n_reduce = int(os.environ.get("GEMM_RS_NUM_REDUCE_SMS", n_reduce))
-    chunk_tiles = int(os.environ.get("GEMM_RS_CHUNK_TILES", chunk_tiles))
-    return n_comp, n_intra, n_send, n_reduce, chunk_tiles
+    # Keys match the pinned CUTLASS example's CLI / run() keyword arguments:
+    # https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/distributed_gemm_reduce_scatter_blackwell.py#L3009
+    cutlass_fixed_config = {
+        "use_cuda_graph": True,
+        "use_2cta_instrs": True,
+        "benchmark_or_test": "benchmark",
+        # 2-CTA instructions require an even cluster M; the CLI default is 1.
+        "cluster_shape_mn": (2, 1),
+    }
+
+    # (raster_order, swizzle_size, mma_tiler_mn), keyed by M. Picked from an
+    # autotune sweep over raster {m,n} x swizzle {1,2,4,8} x tile {128,256}^2
+    # at N=7168, K_local=1536, 8 ranks; raster=m swizzle=1 is within 0.5% of
+    # the best everywhere, so it is also the fallback for untuned shapes.
+    cutlass_tuned_configs = {
+        2048: ("m", 1, (128, 128)),
+        4096: ("m", 1, (256, 256)),
+        8192: ("m", 1, (256, 256)),
+        16384: ("m", 2, (256, 256)),
+        32768: ("m", 1, (256, 256)),
+    }
+    cutlass_default_config = ("m", 1, (256, 256))
+
+class DistBufferLike(Protocol):
+    """Common tensor access for dynamically loaded distributed buffers."""
+    data_: torch.Tensor
+
+@dataclass
+class BlackwellBenchVars:
+    baseline_a: torch.Tensor | None = None
+    baseline_b: torch.Tensor | None = None
+    baseline_c: torch.Tensor | None = None
+    baseline_c_rs: torch.Tensor | None = None
+    baseline_graph: torch.cuda.CUDAGraph | None = None
+
+    a_tk: torch.Tensor | None = None
+    b_tk: torch.Tensor | None = None
+    c_tk_dist: DistBufferLike | None = None
+    c_tk_barrier: DistBufferLike | None = None
+    tk_graph: torch.cuda.CUDAGraph | None = None
+
+    c_mkernel: DistBufferLike | None = None
+    sync_mkernel: DistBufferLike | None = None
+    mkernel_graph: torch.cuda.CUDAGraph | None = None
+
+def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_module):
+    all_correct = True
+    for M in config.DEFAULT_SHAPES:
+        N, K = config.output_dim, config.split_inner_dim
+
+        tk_module = (
+            load_thirdparty.load_tk_extension("gemm_rs")
+            if tk_available(config, M, N, K) else None
+        )
+        buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
+        run_baseline(buffers)
+        for candidate in config.mkernel_candidates(M):
+            buffers.c_mkernel.data_.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            run_mkernel(mkernel_module, buffers, candidate)
+            torch.cuda.synchronize()
+            all_correct = check_close(
+                f"gemm_rs mKernel eager {mkernel_config_label(candidate)} M={M}",
+                mkernel_output(config, buffers), buffers.baseline_c_rs,
+            ) and all_correct
+
+        if tk_module is not None:
+            run_tk(tk_module, buffers)
+            torch.cuda.synchronize()
+
+            is_correct_tk = check_close(
+                f"gemm_rs TK M={M}", buffers.c_tk_dist.data_, buffers.baseline_c_rs,
+            )
+            all_correct = is_correct_tk and all_correct
+            status = "passed :)" if is_correct_tk else "FAILED :("
+            if config.is_chief:
+                print(
+                    f"ThunderKittens M={M} N={N} K={K}: {status}",
+                    flush=True,
+                )
+        for candidate in config.mkernel_candidates(M):
+            buffers.mkernel_graph = capture_cuda_graph(
+                lambda: run_mkernel(mkernel_module, buffers, candidate)
+            )
+            # Change inputs on each replay to expose stale counters/output. Prepare
+            # is deliberately never repeated: the graph must advance its own epoch.
+            for replay in range(3):
+                buffers.baseline_a.neg_()
+                run_baseline(buffers)
+                buffers.mkernel_graph.replay()
+                torch.cuda.synchronize()
+                all_correct = check_close(
+                    f"gemm_rs mKernel graph {mkernel_config_label(candidate)} "
+                    f"replay={replay + 1} M={M}",
+                    mkernel_output(config, buffers), buffers.baseline_c_rs,
+                ) and all_correct
+            buffers.mkernel_graph = None
+        del buffers
+
+    # All ranks must make the same decision before entering the timed collectives.
+    vote = torch.tensor([int(all_correct)], device="cuda")
+    dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+    all_correct = bool(vote.item())
+    if not all_correct:
+        raise RuntimeError("GEMM+RS correctness checks failed; skipping benchmarks.")
+    return True
+
+def gemm_rs_blackwell_prepare(
+    config: BlackwellBenchConfig, M: int, N: int, K: int, warmup: int, iters: int,
+    mkernel_module,
+):
+    """Return (fn, name, should_wrap); CUTLASS returns its own timing in ms."""
+    tk_module = (
+        load_thirdparty.load_tk_extension("gemm_rs")
+        if tk_available(config, M, N, K) else None
+    )
+    buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
+
+    def run_baseline_for_graph_capture():
+        run_baseline(buffers)
+
+    buffers.baseline_graph = capture_cuda_graph(run_baseline_for_graph_capture)
+
+    def bench_baseline():
+        buffers.baseline_graph.replay()
+
+    fns = [(bench_baseline, "baseline", True)]
+
+    # Autotune on graph replays; benchmark_cuda takes the max over ranks, so
+    # every rank selects the same configuration.
+    mkernel_timings = []
+    for candidate in config.mkernel_candidates(M):
+        buffers.mkernel_graph = capture_cuda_graph(
+            lambda: run_mkernel(mkernel_module, buffers, candidate)
+        )
+        ms = benchmark_cuda(buffers.mkernel_graph.replay, warmup, iters)
+        mkernel_timings.append((candidate, ms))
+        buffers.mkernel_graph = None
+        time.sleep(5)
+    
+    best_candidate, _ = min(mkernel_timings, key=lambda item: item[1])
+    if config.is_chief:
+        for candidate, ms in sorted(mkernel_timings, key=lambda item: item[1]):
+            mark = " <- best" if candidate == best_candidate else ""
+            print(
+                f"  [autotune] mKernel {mkernel_config_label(candidate)}: "
+                f"{ms:8.3f} ms  {useful_tflops(M, N, K, ms):8.2f} TFLOP/s{mark}",
+                flush=True,
+            )
+
+    def bench_mkernel_eager():
+        run_mkernel(mkernel_module, buffers, best_candidate)
+
+    buffers.mkernel_graph = capture_cuda_graph(bench_mkernel_eager)
+
+    def bench_mkernel_graph():
+        buffers.mkernel_graph.replay()
+
+    fns.append((bench_mkernel_eager, "mKernel eager", True))
+    fns.append((bench_mkernel_graph, "mKernel graph", True))
+    if cutlass_available(config):
+        candidate = config.cutlass_tuned_configs.get(M, config.cutlass_default_config)
+        if config.is_chief:
+            print(f"  [cutlass] {cutlass_config_label(candidate)}", flush=True)
+
+        def bench_cutlass():
+            return load_thirdparty.run_cutlass_reduce_scatter_once(
+                m=M, n=N, k=K, config=cutlass_config_kwargs(config, candidate),
+                warmup=warmup, iterations=iters,
+            )
+
+        fns.append((bench_cutlass, "cutlass", False))
+
+    if tk_module is not None:
+        def bench_tk_eager():
+            run_tk(tk_module, buffers)
+
+        buffers.tk_graph = capture_cuda_graph(bench_tk_eager)
+
+        def bench_tk_graph():
+            buffers.tk_graph.replay()
+
+        fns.append((bench_tk_eager, "ThunderKittens eager", True))
+        fns.append((bench_tk_graph, "ThunderKittens graph", True))
+
+    return fns
+
+def cutlass_config_label(candidate) -> str:
+    raster, swizzle, tile = candidate
+    return f"raster={raster} swizzle={swizzle} tile={tile[0]}x{tile[1]}"
 
 
-def poll_tuning(m: int) -> tuple[int, int]:
-    if NUM_NODES > 2:
-        return (1, 100)
-    # Relaxed polling is the default timing path; acquire polling remains
-    # available through the kernel option when needed.
-    return (0, 100)
+def cutlass_config_kwargs(config: BlackwellBenchConfig, candidate) -> dict:
+    raster, swizzle, tile = candidate
+    return {
+        **config.cutlass_fixed_config,
+        "raster_order": raster,
+        "swizzle_size": swizzle,
+        "mma_tiler_mn": tile,
+    }
 
+
+def cutlass_available(config: BlackwellBenchConfig) -> bool:
+    ok, why = load_thirdparty.cutlass_availability(
+        "distributed_gemm_reduce_scatter_blackwell.py"
+    )
+    vote = torch.tensor([int(ok)], device="cuda")
+    dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+    if not vote.item() and config.is_chief:
+        print(
+            f"[skip] CUTLASS GEMM reduce-scatter: {why or 'unavailable on a peer'}",
+            flush=True,
+        )
+    return bool(vote.item())
+
+
+def tk_available(config: BlackwellBenchConfig, M: int, N: int, K: int) -> bool:
+    tk_ok, tk_why = load_thirdparty.tk_availability(config.world_size, "gemm_rs")
+    # B200 has 512x256 cluster tiles and distributes 128-row tiles over 8 GPUs.
+    if tk_ok and (M % 1024 or N % 256 or K % 64):
+        tk_ok = False
+        tk_why = f"M={M}, N={N}, K={K} must be divisible by 1024, 256, 64"
+    tk_vote = torch.tensor([1 if tk_ok else 0], device="cuda")
+    dist.all_reduce(tk_vote, op=dist.ReduceOp.MIN)
+    tk_ok = bool(tk_vote.item())
+    if not tk_ok:
+        if config.is_chief:
+            print(
+                f"[skip] ThunderKittens: "
+                f"{tk_why or 'unavailable on a peer'}",
+                flush=True,
+            )
+
+    return tk_ok
+
+
+def make_blackwell_buffers(
+    config: BlackwellBenchConfig, M: int, N: int, K: int, mkernel_module, tk_module=None,
+) -> BlackwellBenchVars:
+    if M % config.world_size:
+        raise ValueError(f"M={M} must be divisible by world_size={config.world_size}")
+    torch.manual_seed(42 + config.local_rank)
+    buffers = BlackwellBenchVars(
+        baseline_a=torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / K**0.25,
+        baseline_b=torch.randn((N, K), device="cuda", dtype=torch.bfloat16) / K**0.25,
+        baseline_c=torch.empty((M, N), device="cuda", dtype=torch.bfloat16),
+        baseline_c_rs=torch.empty(
+            (M // config.world_size, N), device="cuda", dtype=torch.bfloat16,
+        ),
+    )
+    buffers.c_mkernel = mkernel_module.DistBuffer(
+        (M, N), dtype=torch.bfloat16, local_rank=config.local_rank,
+        local_world_size=config.world_size, multicast=True,
+    )
+    # Completion epoch header followed by the ready counters, one per rank.
+    buffers.sync_mkernel = mkernel_module.DistBuffer(
+        mkernel_module.gemm_rs_blackwell_sync_shape, dtype=torch.int32,
+        local_rank=config.local_rank, local_world_size=config.world_size, multicast=False,
+    )
+    mkernel_module.gemm_rs_blackwell_prepare(
+        buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel, buffers.sync_mkernel,
+    )
+    # Every rank must finish its local reset before any peer publishes a tile.
+    torch.cuda.synchronize()
+    dist.barrier()
+    if tk_module is not None:
+        buffers.a_tk = buffers.baseline_a.clone()
+        buffers.b_tk = buffers.baseline_b.clone()
+        buffers.c_tk_dist = tk_module.TKParallelTensor(
+            (M // config.world_size, N), dtype=torch.bfloat16,
+            local_rank=config.local_rank, local_world_size=config.world_size,
+            multicast=False,
+        )
+        buffers.c_tk_barrier = tk_module.TKParallelTensor(
+            (1, 1), dtype=torch.int,
+            local_rank=config.local_rank, local_world_size=config.world_size,
+            multicast=True,
+        )
+        buffers.c_tk_dist.data_.zero_()
+        buffers.c_tk_barrier.data_.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+    return buffers
+
+
+def run_baseline(buffers: BlackwellBenchVars):
+    torch.mm(buffers.baseline_a, buffers.baseline_b.T, out=buffers.baseline_c)
+    dist.reduce_scatter_tensor(buffers.baseline_c_rs, buffers.baseline_c)
+
+
+def run_tk(tk_module, buffers: BlackwellBenchVars):
+    tk_module.matmul_reduce_scatter(
+        buffers.a_tk, buffers.b_tk, buffers.c_tk_dist, buffers.c_tk_barrier,
+    )
+
+
+def mkernel_config_label(candidate) -> str:
+    swizzle, signals, rs_rows, mma_warps = candidate
+    return f"swizzle={swizzle} signals={signals} rs_rows={rs_rows} mma_warps={mma_warps}"
+
+
+def run_mkernel(mkernel_module, buffers: BlackwellBenchVars, candidate=None):
+    """Launch one (swizzle, signals_per_tile, rs_strip_rows, mma_warps); None uses the
+    defaults."""
+    kwargs = {}
+    if candidate is not None:
+        swizzle, signals, rs_rows, mma_warps = candidate
+        kwargs = dict(
+            SCHEDULER_SWIZZLE_SIZE=swizzle, signals_per_tile=signals, rs_strip_rows=rs_rows,
+            mma_warps=mma_warps,
+        )
+    mkernel_module.gemm_rs_blackwell_launch(
+        buffers.baseline_a, buffers.baseline_b, buffers.c_mkernel,
+        buffers.sync_mkernel, **kwargs,
+    )
+
+
+def mkernel_output(config: BlackwellBenchConfig, buffers: BlackwellBenchVars):
+    rows = buffers.baseline_c_rs.shape[0]
+    return buffers.c_mkernel.data_.narrow(0, config.local_rank * rows, rows)
+
+def capture_cuda_graph(run_once) -> torch.cuda.CUDAGraph:
+    """Warm up and capture one launch; return the graph for replay or checking."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run_once()
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run_once()
+    return graph
 
 def median_then_max_cuda(samples):
     median = sorted(float(x) for x in samples)[len(samples) // 2]
@@ -108,328 +483,437 @@ def median_then_max_cuda(samples):
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 
+def benchmark_cuda(run_once, warmup: int, iters: int) -> float:
+    """Time the supplied launch or graph replay, taking the slowest rank."""
+    for _ in range(warmup):
+        run_once()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        run_once()
+    end.record()
+    end.synchronize()
+    elapsed = torch.tensor([start.elapsed_time(end) / iters], dtype=torch.float64, device="cuda")
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return elapsed.item()
+
+def useful_tflops(M: int, N: int, K: int, elapsed_time_ms: float) -> float:
+    """Per-rank GEMM throughput, with elapsed time including reduce-scatter."""
+    return 2 * M * N * K / (elapsed_time_ms * 1.0e9)
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["check", "bench"], default="bench")
-    p.add_argument("--shapes", type=str,
-                   default=",".join(str(s) for s in DEFAULT_SHAPES))
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--save-json", type=str, default=None)
     p.add_argument("--compare-to", type=str, default=None)
     p.add_argument("--node-idx", type=int, default=None)
-    return p.parse_args()
+    p.add_argument("--arch", type=str, default=HopperBenchConfig.arch, 
+                   choices=[HopperBenchConfig.arch, BlackwellBenchConfig.arch])
+    p.add_argument("--shapes", type=str, default=None,
+                   help="comma-separated shapes (default depends on --mode)")
+    args = p.parse_args()
 
+    if args.shapes is None:
+        shapes = (HopperBenchConfig.DEFAULT_SHAPES if args.arch == HopperBenchConfig.arch
+                  else BlackwellBenchConfig.DEFAULT_SHAPES)
+        args.shapes = ",".join(str(s) for s in shapes)
+
+    return args
 
 def main():
     args = parse_args()
+    correctness_ok = True
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ["WORLD_SIZE"]))
+    is_chief = local_rank == 0
+
     torch.cuda.set_device(local_rank)
-    dist_backend = os.environ.get("MKERNEL_DIST_BACKEND", "nccl")
-    if dist_backend == "nccl":
-        dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
-    else:
-        dist.init_process_group(dist_backend)
 
-    node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
-    is_chief = (local_rank == 0 and node_idx == 0)
-    node_groups = [
-        dist.new_group([node * world_size + lr for lr in range(world_size)])
-        for node in range(NUM_NODES)
-    ]
-    same_local_rank_groups = [
-        dist.new_group([node * world_size + lr for node in range(NUM_NODES)])
-        for lr in range(world_size)
-    ]
+    if args.arch == HopperBenchConfig.arch:
+        dist_backend = os.environ.get("MKERNEL_DIST_BACKEND", "nccl")
+        if dist_backend == "nccl":
+            dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+        else:
+            dist.init_process_group(dist_backend)
 
-    peer_ip = os.environ.get("PEER_IP")
-    if not peer_ip:
-        peer_node = 1 if node_idx == 0 else 0
-        peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+        node_idx = args.node_idx if args.node_idx is not None else int(os.environ.get("NODE_IDX", "0"))
+        is_chief = (local_rank == 0 and node_idx == 0)
+        node_groups = [
+            dist.new_group([node * world_size + lr for lr in range(world_size)])
+            for node in range(HopperBenchConfig.NUM_NODES)
+        ]
+        same_local_rank_groups = [
+            dist.new_group([node * world_size + lr for node in range(HopperBenchConfig.NUM_NODES)])
+            for lr in range(world_size)
+        ]
+
+        peer_ip = os.environ.get("PEER_IP")
         if not peer_ip:
-            raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
-    tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
+            peer_node = 1 if node_idx == 0 else 0
+            peer_ip = os.environ.get(f"NODE{peer_node}_IP")
+            if not peer_ip:
+                raise RuntimeError(f"NODE{peer_node}_IP must be set, or set PEER_IP explicitly")
+        tcp_port = int(os.environ.get("TCP_PORT", "19790")) + local_rank
 
-    mod = load_module.load(KERNEL_NAME)
-
-    if is_chief:
-        print(f"[gemm_rs] world={world_size*NUM_NODES} per_node={world_size} "
-              f"shapes={args.shapes}", flush=True)
-
-    shapes = [int(x) for x in args.shapes.split(",") if x.strip()]
-    global_gpu_idx = node_idx * world_size + local_rank
-
-    result_sizes, result_fused = [], []
-    correctness_ok = True
-
-    for m in shapes:
-        n = m
-        k = m // (NUM_NODES * world_size)
-        m_local = m // world_size  # each rank owns M/8 rows after intra-RS
-
-        n_comp, n_intra, n_send, n_reduce, chunk_tiles = split_for_shape(m)
-        # Per-shape override: MKERNEL_GEMM_RS_SPLIT_<M>="comp,intra,send,reduce,ct".
-        # Layered on top of split_for_shape so per-shape env wins over the
-        # global GEMM_RS_SPLIT / GEMM_RS_NUM_*_SMS knobs handled there.
-        _ovr = os.environ.get(f"MKERNEL_GEMM_RS_SPLIT_{m}")
-        if _ovr:
-            _vals = [int(x) for x in _ovr.split(",")]
-            assert len(_vals) == 5, f"MKERNEL_GEMM_RS_SPLIT_{m} must be 5 ints"
-            n_comp, n_intra, n_send, n_reduce, chunk_tiles = _vals
+        mod = load_module.load(HopperBenchConfig.KERNEL_NAME)
 
         if is_chief:
-            print(f"\n[gemm_rs] M={m} K={k} N={n} m_local={m_local} "
-                  f"split=({n_comp},{n_intra},{n_send},{n_reduce}) ct={chunk_tiles}",
-                  flush=True)
+            print(f"[gemm_rs] world={world_size*HopperBenchConfig.NUM_NODES} per_node={world_size} "
+                f"shapes={args.shapes}", flush=True)
 
-        torch.manual_seed(42 + global_gpu_idx)
-        torch.cuda.manual_seed(42 + global_gpu_idx)
-        A = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
-        B = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
+        shapes = [int(x) for x in args.shapes.split(",") if x.strip()]
+        global_gpu_idx = node_idx * world_size + local_rank
 
-        workspace = mod.DistBuffer(
-            (m, n), dtype=torch.bfloat16,
-            local_rank=local_rank, local_world_size=world_size, multicast=False,
-        )
-        workspace.data_.zero_()
+        result_sizes, result_fused = [], []
+        correctness_ok = True
 
-        output = mod.DistBuffer(
-            (m_local, n), dtype=torch.bfloat16,
-            local_rank=local_rank, local_world_size=world_size, multicast=False,
-        )
-        output.data_.zero_()
+        for m in shapes:
+            n = m
+            k = m // (HopperBenchConfig.NUM_NODES * world_size)
+            m_local = m // world_size  # each rank owns M/8 rows after intra-RS
 
-        barrier = mod.DistBuffer(
-            (2, 1024, 1024), dtype=torch.int,
-            local_rank=local_rank, local_world_size=world_size, multicast=True,
-        )
-        barrier.data_.zero_()
+            n_comp, n_intra, n_send, n_reduce, chunk_tiles = HopperBenchConfig.split_for_shape(m)
+            # Per-shape override: MKERNEL_GEMM_RS_SPLIT_<M>="comp,intra,send,reduce,ct".
+            # Layered on top of split_for_shape so per-shape env wins over the
+            # global GEMM_RS_SPLIT / GEMM_RS_NUM_*_SMS knobs handled there.
+            _ovr = os.environ.get(f"MKERNEL_GEMM_RS_SPLIT_{m}")
+            if _ovr:
+                _vals = [int(x) for x in _ovr.split(",")]
+                assert len(_vals) == 5, f"MKERNEL_GEMM_RS_SPLIT_{m} must be 5 ints"
+                n_comp, n_intra, n_send, n_reduce, chunk_tiles = _vals
 
-        total_compute_tiles = (m // ROW_BLOCK) * (n // COL_BLOCK)
-        ready = torch.zeros(total_compute_tiles, device="cuda", dtype=torch.int32)
+            if is_chief:
+                print(f"\n[gemm_rs] M={m} K={k} N={n} m_local={m_local} "
+                    f"split=({n_comp},{n_intra},{n_send},{n_reduce}) ct={chunk_tiles}",
+                    flush=True)
 
-        def ready_entries(m_):
-            ct_ = SM_SPLIT.get(m_, (0,0,0,0,4))[4]
-            return (m_ // ROW_BLOCK) * (m_ // COL_BLOCK // max(ct_, 1))
-        ready_max = max(ready_entries(m_) for m_ in shapes)
-        ready_cap = 4096
-        while ready_cap < ready_max * 2:
-            ready_cap *= 2
-        ready_chunk = mod.DistBuffer(
-            (ready_cap,), dtype=torch.int32,
-            local_rank=local_rank, local_world_size=world_size, multicast=True,
-        )
-        ready_chunk.data_.zero_()
+            torch.manual_seed(42 + global_gpu_idx)
+            torch.cuda.manual_seed(42 + global_gpu_idx)
+            A = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
+            B = torch.randn((k, n), device="cuda", dtype=torch.bfloat16) / (k ** 0.25)
 
-        # The staging buffer is the RDMA source for GEMM_RS.
-        staging_backing = rdma_backing()
-        staging_dbuf = make_dist_buffer(
-            mod,
-            (m_local, n), dtype=torch.bfloat16,
-            local_rank=local_rank, local_world_size=world_size,
-            multicast=False, backing=staging_backing,
-        )
-        staging_dbuf.data_.zero_()
-        staging_buf = staging_dbuf.data_
-        if is_chief:
-            print(rdma_policy_label(KERNEL_NAME, source=staging_backing), flush=True)
-
-        os.environ["GEMM_RS_RDMA_CHUNK_TILES_RT"] = str(chunk_tiles)
-
-        staging_bytes = m_local * n * 2  # bf16
-        # Per-peer sizing (1× at N == 2, identical to legacy).
-        n_peers = NUM_NODES - 1
-        recv_bytes = n_peers * staging_bytes
-        per_peer_inter_tiles = (m_local // ROW_BLOCK) * (n // COL_BLOCK)
-        total_inter_tiles = n_peers * per_peer_inter_tiles
-        fifo_cap = 2048
-        while fifo_cap < total_inter_tiles * 2:
-            fifo_cap *= 2
-
-        dist.barrier()
-        peer_ips = get_peer_ips(node_idx, NUM_NODES)
-        mod.create_session(
-            node_idx, peer_ip, tcp_port,
-            staging_buf.data_ptr(), staging_bytes,
-            recv_bytes, total_inter_tiles, fifo_cap, local_rank,
-            peer_ips=peer_ips,
-            peer_tcp_ports=get_peer_ports(node_idx, NUM_NODES, tcp_port),
-        )
-        fifo = mod.get_fifo_handles()
-        arrival_ptr = mod.get_arrival_flags_ptr()
-        recv_ptr = mod.get_recv_buf_ptr()
-
-        epoch = 1
-        mod.set_epoch(epoch)
-        dist.barrier(); time.sleep(0.5)
-
-        use_acquire_poll, reduce_poll_sleep_ns = poll_tuning(m)
-
-        use_prepare_epoch = hasattr(mod, "prepare_epoch")
-
-        def reset_state():
-            workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
-            barrier.data_.zero_(); ready_chunk.data_.zero_()
-            staging_dbuf.data_.zero_()
-            if hasattr(mod, "zero_recv_buf"):
-                mod.zero_recv_buf()
-
-        def advance_epoch(next_epoch: int):
-            # Queue-mode arrivals carry packed work, not an epoch value. Keep
-            # all nodes quiesced before any rank clears arrival slots.
-            if use_prepare_epoch:
-                mod.prepare_epoch()
-                dist.barrier()
-                mod.commit_epoch(next_epoch)
-            else:
-                mod.set_epoch(next_epoch)
-
-        def run_once():
-            mod.gemm_rs_fused(
-                A, B, workspace, output, barrier, ready,
-                recv_ptr, staging_buf.data_ptr(),
-                fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
-                arrival_ptr, epoch, node_idx,
-                n_comp, n_intra, n_send, n_reduce,
-                use_acquire_poll, reduce_poll_sleep_ns,
-                ready_chunk,
-                staging_dbuf,
-                num_nodes=NUM_NODES,
+            workspace = mod.DistBuffer(
+                (m, n), dtype=torch.bfloat16,
+                local_rank=local_rank, local_world_size=world_size, multicast=False,
             )
+            workspace.data_.zero_()
 
-        def start_iter():
-            nonlocal epoch
-            if use_prepare_epoch:
-                epoch += 1
-                advance_epoch(epoch)
-                reset_state()
-            else:
-                # Clear local state before publishing the next epoch to the session.
-                reset_state()
-                epoch += 1
-                advance_epoch(epoch)
+            output = mod.DistBuffer(
+                (m_local, n), dtype=torch.bfloat16,
+                local_rank=local_rank, local_world_size=world_size, multicast=False,
+            )
+            output.data_.zero_()
 
-        for wi in range(args.warmup):
-            start_iter()
-            dist.barrier(); time.sleep(0.1)
-            run_once(); torch.cuda.synchronize()
+            barrier = mod.DistBuffer(
+                (2, 1024, 1024), dtype=torch.int,
+                local_rank=local_rank, local_world_size=world_size, multicast=True,
+            )
+            barrier.data_.zero_()
+
+            total_compute_tiles = (m // HopperBenchConfig.ROW_BLOCK) * (n // HopperBenchConfig.COL_BLOCK)
+            ready = torch.zeros(total_compute_tiles, device="cuda", dtype=torch.int32)
+
+            def ready_entries(m_):
+                ct_ = HopperBenchConfig.SM_SPLIT.get(m_, (0,0,0,0,4))[4]
+                return (m_ // HopperBenchConfig.ROW_BLOCK) * (m_ // HopperBenchConfig.COL_BLOCK // max(ct_, 1))
+            ready_max = max(ready_entries(m_) for m_ in shapes)
+            ready_cap = 4096
+            while ready_cap < ready_max * 2:
+                ready_cap *= 2
+            ready_chunk = mod.DistBuffer(
+                (ready_cap,), dtype=torch.int32,
+                local_rank=local_rank, local_world_size=world_size, multicast=True,
+            )
+            ready_chunk.data_.zero_()
+
+            # The staging buffer is the RDMA source for GEMM_RS.
+            staging_backing = rdma_backing()
+            staging_dbuf = make_dist_buffer(
+                mod,
+                (m_local, n), dtype=torch.bfloat16,
+                local_rank=local_rank, local_world_size=world_size,
+                multicast=False, backing=staging_backing,
+            )
+            staging_dbuf.data_.zero_()
+            staging_buf = staging_dbuf.data_
+            if is_chief:
+                print(rdma_policy_label(HopperBenchConfig.KERNEL_NAME, source=staging_backing), flush=True)
+
+            os.environ["GEMM_RS_RDMA_CHUNK_TILES_RT"] = str(chunk_tiles)
+
+            staging_bytes = m_local * n * 2  # bf16
+            # Per-peer sizing (1× at N == 2, identical to legacy).
+            n_peers = HopperBenchConfig.NUM_NODES - 1
+            recv_bytes = n_peers * staging_bytes
+            per_peer_inter_tiles = (m_local // HopperBenchConfig.ROW_BLOCK) * (n // HopperBenchConfig.COL_BLOCK)
+            total_inter_tiles = n_peers * per_peer_inter_tiles
+            fifo_cap = 2048
+            while fifo_cap < total_inter_tiles * 2:
+                fifo_cap *= 2
+
             dist.barrier()
+            peer_ips = get_peer_ips(node_idx, HopperBenchConfig.NUM_NODES)
+            mod.create_session(
+                node_idx, peer_ip, tcp_port,
+                staging_buf.data_ptr(), staging_bytes,
+                recv_bytes, total_inter_tiles, fifo_cap, local_rank,
+                peer_ips=peer_ips,
+                peer_tcp_ports=get_peer_ports(node_idx, HopperBenchConfig.NUM_NODES, tcp_port),
+            )
+            fifo = mod.get_fifo_handles()
+            arrival_ptr = mod.get_arrival_flags_ptr()
+            recv_ptr = mod.get_recv_buf_ptr()
 
-        samples = []
-        # Per-iter inter-node sync is the default: gemm_rs advances a fresh epoch
-        # each iter, which deadlocks the proxy without a per-iter barrier+settle.
-        # MKERNEL_BENCH_NO_SYNC=1 (or MKERNEL_BENCH_LEGACY_SYNC=0) forces the
-        # NCCL-style back-to-back path.
-        legacy_sync = os.environ.get("MKERNEL_BENCH_NO_SYNC") != "1"
-        if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "0":
-            legacy_sync = False
-        if not legacy_sync:
-            # No-sync (steady-state): per-iter reset_state + epoch bump (which
-            # internally syncs the proxy-side via set_epoch) but skip the
-            # per-iter dist.barrier + sleep + cuda.synchronize + elapsed_time
-            # readout. Defer event-pair elapsed_time to the end (mirrors
-            # gemm_ar's GEMM_AR_STEADY_STATE_BENCH path).
-            samples_pairs = []
-            for _ in range(args.iters):
+            epoch = 1
+            mod.set_epoch(epoch)
+            dist.barrier(); time.sleep(0.5)
+
+            use_acquire_poll, reduce_poll_sleep_ns = HopperBenchConfig.poll_tuning(m)
+
+            use_prepare_epoch = hasattr(mod, "prepare_epoch")
+
+            def reset_state():
+                workspace.data_.zero_(); output.data_.zero_(); ready.zero_()
+                barrier.data_.zero_(); ready_chunk.data_.zero_()
+                staging_dbuf.data_.zero_()
+                if hasattr(mod, "zero_recv_buf"):
+                    mod.zero_recv_buf()
+
+            def advance_epoch(next_epoch: int):
+                # Queue-mode arrivals carry packed work, not an epoch value. Keep
+                # all nodes quiesced before any rank clears arrival slots.
+                if use_prepare_epoch:
+                    mod.prepare_epoch()
+                    dist.barrier()
+                    mod.commit_epoch(next_epoch)
+                else:
+                    mod.set_epoch(next_epoch)
+
+            def run_once():
+                mod.gemm_rs_fused(
+                    A, B, workspace, output, barrier, ready,
+                    recv_ptr, staging_buf.data_ptr(),
+                    fifo[0], fifo[1], fifo[2], fifo[3], fifo[4],
+                    arrival_ptr, epoch, node_idx,
+                    n_comp, n_intra, n_send, n_reduce,
+                    use_acquire_poll, reduce_poll_sleep_ns,
+                    ready_chunk,
+                    staging_dbuf,
+                    num_nodes=HopperBenchConfig.NUM_NODES,
+                )
+
+            def start_iter():
+                nonlocal epoch
+                if use_prepare_epoch:
+                    epoch += 1
+                    advance_epoch(epoch)
+                    reset_state()
+                else:
+                    # Clear local state before publishing the next epoch to the session.
+                    reset_state()
+                    epoch += 1
+                    advance_epoch(epoch)
+
+            for wi in range(args.warmup):
                 start_iter()
-                # NO dist.barrier + sleep here — that's the sync this fix removes.
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
-                s.record(); run_once(); e.record()
-                samples_pairs.append((s, e))
+                dist.barrier(); time.sleep(0.1)
+                run_once(); torch.cuda.synchronize()
+                dist.barrier()
+
+            samples = []
+            # Per-iter inter-node sync is the default: gemm_rs advances a fresh epoch
+            # each iter, which deadlocks the proxy without a per-iter barrier+settle.
+            # MKERNEL_BENCH_NO_SYNC=1 (or MKERNEL_BENCH_LEGACY_SYNC=0) forces the
+            # NCCL-style back-to-back path.
+            legacy_sync = os.environ.get("MKERNEL_BENCH_NO_SYNC") != "1"
+            if os.environ.get("MKERNEL_BENCH_LEGACY_SYNC") == "0":
+                legacy_sync = False
+            if not legacy_sync:
+                # No-sync (steady-state): per-iter reset_state + epoch bump (which
+                # internally syncs the proxy-side via set_epoch) but skip the
+                # per-iter dist.barrier + sleep + cuda.synchronize + elapsed_time
+                # readout. Defer event-pair elapsed_time to the end (mirrors
+                # gemm_ar's GEMM_AR_STEADY_STATE_BENCH path).
+                samples_pairs = []
+                for _ in range(args.iters):
+                    start_iter()
+                    # NO dist.barrier + sleep here — that's the sync this fix removes.
+                    s = torch.cuda.Event(enable_timing=True)
+                    e = torch.cuda.Event(enable_timing=True)
+                    s.record(); run_once(); e.record()
+                    samples_pairs.append((s, e))
+                torch.cuda.synchronize()
+                dist.barrier()
+                samples = [s.elapsed_time(e) for (s, e) in samples_pairs]
+                if is_chief:
+                    print(f"[gemm_rs-nosync] M={m} samples={[f'{x:.4f}' for x in samples]}",
+                        flush=True)
+            else:
+                for _ in range(args.iters):
+                    start_iter()
+                    dist.barrier(); time.sleep(0.05)
+                    s = torch.cuda.Event(enable_timing=True)
+                    e = torch.cuda.Event(enable_timing=True)
+                    s.record(); run_once(); e.record(); torch.cuda.synchronize()
+                    samples.append(s.elapsed_time(e))
+                    dist.barrier()
+
+            wall_ms = median_then_max_cuda(samples)
+            if is_chief:
+                print(f"[gemm_rs] M={m} wall={wall_ms:.3f} ms", flush=True)
+                if samples:
+                    _ss = sorted(float(x) for x in samples)
+                    _n = len(_ss)
+                    _med = _ss[_n // 2]
+                    _p99 = _ss[min(_n - 1, int(0.99 * _n))]
+                    print(f"[gemm_rs-dist] M={m} n={_n} min={_ss[0]:.3f} "
+                        f"med={_med:.3f} p99={_p99:.3f} max={_ss[-1]:.3f}", flush=True)
+            C_ref = None
+            for target_lr in range(world_size):
+                row_lo = target_lr * m_local
+                row_hi = row_lo + m_local
+                # Mirror the kernel topology: first reduce this row slice across
+                # all 8 local GPUs in the node, then reduce the owning local-rank
+                # slice across nodes.
+                # Keep on GPU so the NCCL backend can all_reduce/all_gather it.
+                ref_slice = torch.matmul(A[row_lo:row_hi], B)
+                dist.all_reduce(
+                    ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
+                )
+                if local_rank == target_lr:
+                    node_refs = [torch.empty_like(ref_slice) for _ in range(HopperBenchConfig.NUM_NODES)]
+                    dist.all_gather(
+                        node_refs, ref_slice,
+                        group=same_local_rank_groups[target_lr],
+                    )
+                    C_ref = node_refs[0]
+                    for node_ref in node_refs[1:]:
+                        C_ref = C_ref + node_ref
+                    if os.environ.get("GEMM_RS_RECEIVER_OWNER_RS", "0") == "1":
+                        # Receiver-owner RS: each tile chunk is owned by exactly
+                        # one node, so this rank's output buffer contains only
+                        # chunks where chunk_id % HopperBenchConfig.NUM_NODES == node_idx.
+                        sparse_ref = torch.zeros_like(C_ref)
+                        chunks_per_row = (n // HopperBenchConfig.COL_BLOCK + chunk_tiles - 1) // chunk_tiles
+                        for rb in range(m_local // HopperBenchConfig.ROW_BLOCK):
+                            row_lo2 = rb * HopperBenchConfig.ROW_BLOCK
+                            row_hi2 = row_lo2 + HopperBenchConfig.ROW_BLOCK
+                            for ci in range(chunks_per_row):
+                                chunk_id = rb * chunks_per_row + ci
+                                if chunk_id % HopperBenchConfig.NUM_NODES != node_idx:
+                                    continue
+                                col_lo = ci * chunk_tiles * HopperBenchConfig.COL_BLOCK
+                                col_hi = min(n, col_lo + chunk_tiles * HopperBenchConfig.COL_BLOCK)
+                                sparse_ref[row_lo2:row_hi2, col_lo:col_hi] = \
+                                    C_ref[row_lo2:row_hi2, col_lo:col_hi]
+                        C_ref = sparse_ref
+            # Only the destination local-rank owns this reduce-scatter shard.
+            # Non-owners still participate in the distributed check_close()
+            # collective, but compare against themselves so only owner ranks
+            # determine the global correctness result.
+            if C_ref is None:
+                C_ref = output.data_
+            correctness_ok = check_close(
+                f"gemm_rs M={m}", output.data_, C_ref, atol=0.75, rtol=0.15
+            ) and correctness_ok
+            result_sizes.append(f"M={m}")
+            result_fused.append(wall_ms)
+
+        if is_chief and args.save_json:
+            # Merge with existing JSON so a single-shape bench doesn't erase others.
+            from common import write_results_json
+            write_results_json(Path(args.save_json), "gemm_rs",
+                            result_sizes, result_fused,
+                            note=f"release gemm_rs bench timing={'legacy_sync' if legacy_sync else 'steady_state'} world={world_size*HopperBenchConfig.NUM_NODES}")
+            print(f"[gemm_rs] wrote {args.save_json}", flush=True)
+
+        if is_chief and args.compare_to:
+            correctness_ok = compare_named_results("gemm_rs", result_sizes, result_fused, args.compare_to) and correctness_ok
+
+    else:
+        config = BlackwellBenchConfig()
+        mkernel_module = load_module.load()
+
+        dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
+        fns = []
+        fn = None
+        try:
+            check_correctness_gemm_rs_blackwell(config, mkernel_module)
+
+            shapes = [] if args.mode == "check" else config.DEFAULT_SHAPES
+            for M in shapes:
+                N, K = config.output_dim, config.split_inner_dim
+                # Release the previous shape's graphs before their backing buffers.
+                fn = None
+                fns.clear()
+                fns = gemm_rs_blackwell_prepare(
+                    config, M, N, K, args.warmup, args.iters, mkernel_module,
+                )
+                results = {}
+                for fn, name, should_wrap in fns:
+                    ms = (
+                        benchmark_cuda(fn, args.warmup, args.iters)
+                        if should_wrap else fn()
+                    )
+                    if ms is not None:
+                        results[name] = ms
+                        if config.is_chief:
+                            print(
+                                f"M={M} N={N} K_local={K} {name}: "
+                                f"{ms:.3f} ms  {useful_tflops(M, N, K, ms):.2f} TFLOP/s",
+                                flush=True,
+                            )
+                    time.sleep(5)
+                if config.is_chief and "cutlass" in results:
+                    print(
+                        f"  CUTLASS speedup vs cuBLAS+NCCL: "
+                        f"{results['baseline'] / results['cutlass']:.3f}x",
+                        flush=True,
+                    )
+                if config.is_chief:
+                    for name in ("mKernel eager", "mKernel graph", "ThunderKittens eager", "ThunderKittens graph"):
+                        if name in results:
+                            print(
+                                f"  {name} speedup vs cuBLAS+NCCL: "
+                                f"{results['baseline'] / results[name]:.3f}x",
+                                flush=True,
+                            )
+                    if "ThunderKittens eager" in results and "ThunderKittens graph" in results:
+                        print(
+                            f"  TK graph speedup vs eager: "
+                            f"{results['ThunderKittens eager'] / results['ThunderKittens graph']:.3f}x",
+                            flush=True,
+                        )
+                    # Like-for-like launch modes against TK; CUTLASS times itself.
+                    for mkernel_name, other_name in (
+                        ("mKernel eager", "ThunderKittens eager"),
+                        ("mKernel graph", "ThunderKittens graph"),
+                        ("mKernel graph", "cutlass"),
+                    ):
+                        if mkernel_name in results and other_name in results:
+                            print(
+                                f"  {mkernel_name} speedup vs {other_name}: "
+                                f"{results[other_name] / results[mkernel_name]:.3f}x",
+                                flush=True,
+                            )
+        finally:
+            # all cudagraphs referencing the NCCL communicator have to be released first,
+            # else there would be a teardown deadlock
+            fn = None
+            fns.clear()
             torch.cuda.synchronize()
             dist.barrier()
-            samples = [s.elapsed_time(e) for (s, e) in samples_pairs]
-            if is_chief:
-                print(f"[gemm_rs-nosync] M={m} samples={[f'{x:.4f}' for x in samples]}",
-                      flush=True)
-        else:
-            for _ in range(args.iters):
-                start_iter()
-                dist.barrier(); time.sleep(0.05)
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
-                s.record(); run_once(); e.record(); torch.cuda.synchronize()
-                samples.append(s.elapsed_time(e))
-                dist.barrier()
 
-        wall_ms = median_then_max_cuda(samples)
-        if is_chief:
-            print(f"[gemm_rs] M={m} wall={wall_ms:.3f} ms", flush=True)
-            if samples:
-                _ss = sorted(float(x) for x in samples)
-                _n = len(_ss)
-                _med = _ss[_n // 2]
-                _p99 = _ss[min(_n - 1, int(0.99 * _n))]
-                print(f"[gemm_rs-dist] M={m} n={_n} min={_ss[0]:.3f} "
-                      f"med={_med:.3f} p99={_p99:.3f} max={_ss[-1]:.3f}", flush=True)
-        C_ref = None
-        for target_lr in range(world_size):
-            row_lo = target_lr * m_local
-            row_hi = row_lo + m_local
-            # Mirror the kernel topology: first reduce this row slice across
-            # all 8 local GPUs in the node, then reduce the owning local-rank
-            # slice across nodes.
-            # Keep on GPU so the NCCL backend can all_reduce/all_gather it.
-            ref_slice = torch.matmul(A[row_lo:row_hi], B)
-            dist.all_reduce(
-                ref_slice, op=dist.ReduceOp.SUM, group=node_groups[node_idx]
-            )
-            if local_rank == target_lr:
-                node_refs = [torch.empty_like(ref_slice) for _ in range(NUM_NODES)]
-                dist.all_gather(
-                    node_refs, ref_slice,
-                    group=same_local_rank_groups[target_lr],
-                )
-                C_ref = node_refs[0]
-                for node_ref in node_refs[1:]:
-                    C_ref = C_ref + node_ref
-                if os.environ.get("GEMM_RS_RECEIVER_OWNER_RS", "0") == "1":
-                    # Receiver-owner RS: each tile chunk is owned by exactly
-                    # one node, so this rank's output buffer contains only
-                    # chunks where chunk_id % NUM_NODES == node_idx.
-                    sparse_ref = torch.zeros_like(C_ref)
-                    chunks_per_row = (n // COL_BLOCK + chunk_tiles - 1) // chunk_tiles
-                    for rb in range(m_local // ROW_BLOCK):
-                        row_lo2 = rb * ROW_BLOCK
-                        row_hi2 = row_lo2 + ROW_BLOCK
-                        for ci in range(chunks_per_row):
-                            chunk_id = rb * chunks_per_row + ci
-                            if chunk_id % NUM_NODES != node_idx:
-                                continue
-                            col_lo = ci * chunk_tiles * COL_BLOCK
-                            col_hi = min(n, col_lo + chunk_tiles * COL_BLOCK)
-                            sparse_ref[row_lo2:row_hi2, col_lo:col_hi] = \
-                                C_ref[row_lo2:row_hi2, col_lo:col_hi]
-                    C_ref = sparse_ref
-        # Only the destination local-rank owns this reduce-scatter shard.
-        # Non-owners still participate in the distributed check_close()
-        # collective, but compare against themselves so only owner ranks
-        # determine the global correctness result.
-        if C_ref is None:
-            C_ref = output.data_
-        correctness_ok = check_close(
-            f"gemm_rs M={m}", output.data_, C_ref, atol=0.75, rtol=0.15
-        ) and correctness_ok
-        result_sizes.append(f"M={m}")
-        result_fused.append(wall_ms)
-
-    if is_chief and args.save_json:
-        # Merge with existing JSON so a single-shape bench doesn't erase others.
-        from common import write_results_json
-        write_results_json(Path(args.save_json), "gemm_rs",
-                           result_sizes, result_fused,
-                           note=f"release gemm_rs bench timing={'legacy_sync' if legacy_sync else 'steady_state'} world={world_size*NUM_NODES}")
-        print(f"[gemm_rs] wrote {args.save_json}", flush=True)
-
-    if is_chief and args.compare_to:
-        ok = compare_named_results("gemm_rs", result_sizes, result_fused, args.compare_to)
-        ok = ok and correctness_ok
+    if is_chief:
         dist.destroy_process_group()
-        if not ok: return 1
+        if not correctness_ok: return 1
         return 0
     if not correctness_ok:
         dist.destroy_process_group()
