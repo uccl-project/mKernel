@@ -119,36 +119,6 @@ __host__ __device__ __forceinline__ bool epoch_reached(uint32_t observed, uint32
 
 }  // namespace
 
-static constexpr int EXIT_BARRIER_THREADS = 256;
-
-__global__ void exit_epoch_barrier(int* local_ready,
-                                   int ready_numel,
-                                   completion_epoch_dist_tensor epochs,
-                                   int dev_idx) {
-    auto* local_epoch = epochs[dev_idx].raw_ptr;
-    // Every thread reads the epoch before the barrier, so none can see the bump.
-    const uint32_t completed_epoch = comm::atomic_u32::acquire_load_gpu(local_epoch) + 1u;
-
-    // we choose to clear the buffer rather than increment an epoch so that
-    // we are not bound to the same input length (so we can signal and poll different lengths of
-    // the ready buffer)
-    for (int i = threadIdx.x; i < ready_numel; i += blockDim.x) {
-        local_ready[i] = 0;
-    }
-    // Order every thread's zeros before the cumulative release.
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        comm::atomic_u32::release_store_sys(local_epoch, completed_epoch);
-    }
-
-    for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES; peer += blockDim.x) {
-        while (!epoch_reached(comm::atomic_u32::acquire_load_sys(epochs[peer].raw_ptr),
-                              completed_epoch)) {
-            __nanosleep(16);
-        }
-    }
-}
-
 template <int _SCHEDULER_SWIZZLE_SIZE,
           int _SIGNALS_PER_TILE,
           int _RS_STRIP_ROWS,
@@ -594,6 +564,56 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             tm_alloc.deprovision();
         }
     }
+
+    static constexpr int EXIT_BARRIER_THREADS = 256;
+    uint32_t* block_completion_counter = G.completion_epochs[G.dev_idx].raw_ptr + 1;
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ctr(*block_completion_counter);
+    __shared__ int completion_counter;
+
+    // Every role in this CTA has finished before it counts itself done.
+    __syncthreads();
+    if (warp_id == 0 && elect_warp_leader()) {
+        completion_counter = ctr.fetch_add(1u, cuda::memory_order_acq_rel) + 1u;
+    }
+    // Publish the count to the whole CTA before anyone branches on it.
+    __syncthreads();
+
+    if (completion_counter == fg::NUM_BLOCKS) {
+        auto* local_epoch = G.completion_epochs[G.dev_idx].raw_ptr;
+        uint32_t completed_epoch = 0;
+        if (laneid() == 0) {
+            completed_epoch = comm::atomic_u32::acquire_load_gpu(local_epoch) + 1u;
+        }
+        // ensure that all threads read the same completed epoch before subsequent store
+        completed_epoch = __shfl_sync(0xffffffff, completed_epoch, 0);
+
+        // we choose to clear the buffer rather than increment an epoch so that
+        // we are not bound to the same input length (so we can signal and poll different
+        // lengths of the ready buffer)
+        for (int i = threadIdx.x; i < fg::ready_numel(G.M, G.N); i += blockDim.x) {
+            G.C_barrier[G.dev_idx].raw_ptr[i] = 0;
+        }
+        group<8>::sync(2);
+
+        if (warp_id == 0 && threadIdx.x == 0) {
+            comm::atomic_u32::release_store_sys(local_epoch, completed_epoch);
+        }
+
+        for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES; peer += EXIT_BARRIER_THREADS) {
+            while (!epoch_reached(
+                comm::atomic_u32::acquire_load_sys(G.completion_epochs[peer].raw_ptr),
+                completed_epoch)) {
+                __nanosleep(16);
+            }
+        }
+
+        if (warp_id == 0) {
+            if (elect_warp_leader()) {
+                ctr.store(0, cuda::memory_order_relaxed);
+            }
+        }
+    }
+    __syncthreads();
 }
 
 template <int _SCHEDULER_SWIZZLE_SIZE,
@@ -659,13 +679,6 @@ inline void launch_gemm_rs_blackwell(const fused_globals<_SCHEDULER_SWIZZLE_SIZE
     launch_config.numAttrs = 1;
 
     MKERNEL_CUDACHECK(cudaLaunchKernelEx(&launch_config, this_kernel, G));
-    MKERNEL_CUDACHECK(cudaGetLastError());
-
-    // Full completion dependency, including in captured graphs. The next use
-    // of these buffers on this stream cannot pass until every rank is done.
-    // Clear only the prefix of the ready grid this launch's M and N used.
-    exit_epoch_barrier<<<1, EXIT_BARRIER_THREADS, 0, stream>>>(
-        G.C_barrier[G.dev_idx].raw_ptr, fg::ready_numel(G.M, G.N), G.completion_epochs, G.dev_idx);
     MKERNEL_CUDACHECK(cudaGetLastError());
 }
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
