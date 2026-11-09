@@ -593,7 +593,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         for (int i = threadIdx.x; i < fg::ready_numel(G.M, G.N); i += blockDim.x) {
             G.C_barrier[G.dev_idx].raw_ptr[i] = 0;
         }
-        group<8>::sync(2);
+        group<fg::NUM_WARPS>::sync(2);
 
         if (warp_id == 0 && threadIdx.x == 0) {
             comm::atomic_u32::release_store_sys(local_epoch, completed_epoch);
