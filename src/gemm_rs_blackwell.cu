@@ -565,7 +565,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         }
     }
 
-    static constexpr int EXIT_BARRIER_THREADS = 256;
     uint32_t* block_completion_counter = G.completion_epochs[G.dev_idx].raw_ptr + 1;
     cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ctr(*block_completion_counter);
     __shared__ int completion_counter;
@@ -593,13 +592,13 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         for (int i = threadIdx.x; i < fg::ready_numel(G.M, G.N); i += blockDim.x) {
             G.C_barrier[G.dev_idx].raw_ptr[i] = 0;
         }
-        group<fg::NUM_WARPS>::sync(2);
+        __syncthreads();
 
         if (warp_id == 0 && threadIdx.x == 0) {
             comm::atomic_u32::release_store_sys(local_epoch, completed_epoch);
         }
 
-        for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES; peer += EXIT_BARRIER_THREADS) {
+        for (int peer = threadIdx.x; peer < INTRA_NUM_DEVICES; peer += blockDim.x) {
             while (!epoch_reached(
                 comm::atomic_u32::acquire_load_sys(G.completion_epochs[peer].raw_ptr),
                 completed_epoch)) {
