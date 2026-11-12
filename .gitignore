@@ -9,3 +9,4 @@ bench/source_of_truth
 compile_commands.json
 compile_commands.events.json
 .cache/
+traces*

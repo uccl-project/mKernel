@@ -20,21 +20,32 @@
 #   BACKEND=cx7  → ConnectX-7 RC via libibverbs (InfiniBand / RoCE)
 #
 # Override with: `make BACKEND=cx7 all`
-BACKEND ?= efa
+#
+# when arch is blackwell, default to intranode build
+# when arch is hopper, default to efa backend
+GPU ?= hopper
+ifeq ($(GPU),blackwell)
+    BACKEND ?=
+else
+    BACKEND ?= efa
+endif
 ifeq ($(BACKEND),efa)
     BACKEND_DEFINES := -DINTERNODE_BACKEND_EFA
     BACKEND_LIBS    := -L$(EFA_HOME)/lib -lfabric -libverbs -lefa
 else ifeq ($(BACKEND),cx7)
     BACKEND_DEFINES := -DINTERNODE_BACKEND_IBVERBS
     BACKEND_LIBS    := -libverbs
+else ifeq ($(BACKEND)$(GPU),blackwell)
+    BACKEND_DEFINES :=
+    BACKEND_LIBS    :=
 else
-    $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7.)
+    $(error Unknown BACKEND=$(BACKEND). Use BACKEND=efa or BACKEND=cx7$(if $(filter blackwell,$(GPU)), or leave it unset for GPU=blackwell).)
 endif
 
 # === Target GPU ===
 #   GPU=hopper    → sm_90a, wgmma MMA path (default, upstream behaviour)
 #   GPU=blackwell → sm_103a, tcgen05 MMA path (B300; gemm_rs only so far)
-GPU ?= hopper
+
 ifeq ($(GPU),blackwell)
     ARCH              := -gencode arch=compute_103a,code=sm_103a
     ARCH_DEFINES      := -DKITTENS_SM10X -DKITTENS_BLACKWELL -DMKERNEL_TCGEN05
@@ -178,7 +189,8 @@ plots:
 .PHONY: all dispatch-gemm-blackwell dispatch-gemm-sm-specialization \
 	dispatch-gemm-warp-specialization run-dispatch-gemm-blackwell \
 	gemm-ar-blackwell run-gemm-ar-blackwell clean bench check \
-	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized
+	test-slot-math plots ag-gemm-warp-specialized run-ag-gemm-warp-specialized \
+	gemm-rs-blackwell run-gemm-rs-blackwell
 
 run-gemm-ar-blackwell : gemm_ar_blackwell
 	python -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_ar_blackwell_bench.py
@@ -197,3 +209,12 @@ ag-gemm-warp-specialized : $(BUILD)/libag_gemm_warp_specialized.so
 $(BUILD)/libag_gemm_warp_specialized.so : $(SRC)/ag_gemm_warp_specialized.cu | $(BUILD)
 	$(NVCC) $(COMMON_FLAGS) $(GEMM_AR_BLACKWELL_SANITIZE) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_ag_gemm_warp_specialized $(DEFS_gemm_ar_blackwell) $(COMMON_INC) \
 	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+gemm-rs-blackwell: $(BUILD)/libgemm_rs_blackwell.so
+
+$(BUILD)/libgemm_rs_blackwell.so: $(SRC)/gemm_rs_blackwell.cu $(GEMM_RS_BLACKWELL_HEADERS) Makefile | $(BUILD)
+	$(NVCC) $(COMMON_FLAGS) -lineinfo --ptxas-options=-v $(COMMON_DEFINES) -DTORCH_EXTENSION_NAME=mkernel_release_gemm_rs_blackwell $(COMMON_INC) \
+	    --compiler-options '-fPIC' $(LDFLAGS) $< -o $@
+
+run-gemm-rs-blackwell: gemm-rs-blackwell
+	$(PYTHON) -m torch.distributed.run --standalone --nproc-per-node=$(INTRA_NUM_DEVICES) bench/gemm_rs_bench.py --arch blackwell --warmup 20 --iters 50

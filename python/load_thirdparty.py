@@ -45,7 +45,7 @@ def _load_cutlass_example(kernel_name: str):
         raise FileNotFoundError(f"{path} does not exist")
 
     spec = importlib.util.spec_from_file_location(
-        "cutlass_distributed_all_gather_gemm_blackwell", path
+        f"cutlass_{Path(kernel_name).stem}", path
     )
     if spec is None or spec.loader is None:
         raise ImportError(f"could not create an import spec for {path}")
@@ -130,6 +130,104 @@ def run_cutlass_once(
     return float(time_us) / 1000.0
 
 
+def run_cutlass_reduce_scatter_once(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    config: dict,
+    warmup: int,
+    iterations: int,
+    check: bool = False,
+) -> float | None:
+    """Run the pinned RS example in the caller's existing process group.
+
+    Return max-rank milliseconds, or None if any rank rejects the candidate.
+    In check mode the upstream GEMM, RS, and barrier assertions run instead.
+    Call the distributed helpers directly: run() discards their timing result
+    and destroys the process group, so it cannot be used for repeated tuning.
+    Set CUTLASS_VERBOSE=1 to show upstream benchmark stdout.
+    """
+    import cutlass
+
+    example = _load_cutlass_example("distributed_gemm_reduce_scatter_blackwell.py")
+    kwargs = dict(
+        mnkl=(m, n, k, 1),
+        ab_dtype=cutlass.BFloat16,
+        c_dtype=cutlass.BFloat16,
+        acc_dtype=cutlass.Float32,
+        a_major="k",
+        b_major="k",  # B is [N, K], matching the cuBLAS baseline.
+        c_major="n",
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        swizzle_size=1,
+        raster_order="m",
+        use_2cta_instrs=True,
+        use_tma_store=True,
+        reduce_scatter="LDMC",
+    )
+    settings = dict(config)
+    mode = settings.pop("benchmark_or_test", "benchmark")
+    if mode != "benchmark":
+        raise ValueError("RS tuning requires benchmark_or_test='benchmark'")
+    use_cuda_graph = settings.pop("use_cuda_graph", True)
+    csv_report = settings.pop("csv_report", "/tmp/mkernel_gemm_rs_cutlass.csv")
+    kwargs.update(settings)
+    kwargs.update(
+        global_rank=dist.get_rank(),
+        world_size=dist.get_world_size(),
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+
+    # Vote before allocating symmetric memory or launching any collective GPU
+    # work. A post-launch vote cannot recover a peer stuck inside a kernel.
+    try:
+        kernel = example.Sm100PersistentDenseGemmReduceScatterLDMCKernel(
+            kwargs["acc_dtype"], kwargs["c_dtype"], kwargs["use_2cta_instrs"],
+            kwargs["mma_tiler_mn"], kwargs["cluster_shape_mn"], kwargs["use_tma_store"],
+            rank_id=kwargs["global_rank"], num_ranks=kwargs["world_size"],
+            reduce_scatter=kwargs["reduce_scatter"],
+            swizzle_size=kwargs["swizzle_size"], raster_order=kwargs["raster_order"],
+        )
+        supported = kernel.can_implement(
+            kwargs["mnkl"], kwargs["ab_dtype"], kwargs["c_dtype"],
+            kwargs["a_major"], kwargs["b_major"], kwargs["c_major"],
+        )
+    except example.testing.CantImplementError as exc:
+        if kwargs["global_rank"] == 0:
+            print(f"[skip] CUTLASS GEMM reduce-scatter: {exc}", flush=True)
+        supported = False
+    vote = torch.tensor([int(supported)], device="cuda")
+    dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+    if not vote.item():
+        return None
+
+    if check:
+        example.run_distributed_test(**kwargs)
+        torch.cuda.synchronize()
+        return 0.0
+
+    # Upstream prints a timing from every rank, even for a single candidate.
+    stdout_context = (
+        contextlib.nullcontext() if os.environ.get("CUTLASS_VERBOSE", "0") == "1"
+        else contextlib.redirect_stdout(io.StringIO())
+    )
+    with stdout_context:
+        time_us = example.run_distributed_benchmark(
+            **kwargs,
+            warmup_iterations=warmup,
+            iterations=iterations,
+            use_cuda_graph=use_cuda_graph,
+            benchmark_all=False,
+            csv_report=csv_report,
+        )
+    torch.cuda.synchronize()
+    elapsed = torch.tensor([float(time_us) / 1000.0], dtype=torch.float64, device="cuda")
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return elapsed.item()
+
+
 # TK import helper
 
 _TK_ENV_ROOT = "THUNDERKITTENS_PATH"
@@ -176,7 +274,11 @@ def _load_tk_extension(kernel_folder_path: str):
         raise ImportError(f"could not create an import spec for {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    for symbol in ("TKParallelTensor", "all_gather_matmul"):
+    kernel_symbol = (
+        "matmul_reduce_scatter" if kernel_folder_path == "gemm_rs"
+        else "all_gather_matmul"
+    )
+    for symbol in ("TKParallelTensor", kernel_symbol):
         if not hasattr(module, symbol):
             raise AttributeError(f"{path} does not define {symbol}")
     _TK_MODULE = module
@@ -189,7 +291,7 @@ def load_tk_extension(kernel_folder_path: str):
 
 def tk_availability(world_size: int, kernel_folder_path: str) -> tuple[bool, str]:
     if world_size != 8:
-        return False, "upstream TK kernels only support intranode communication"
+        return False, "upstream TK kernels require 8 GPUs on one node"
     try:
         _load_tk_extension(kernel_folder_path)
     except Exception as exc:
