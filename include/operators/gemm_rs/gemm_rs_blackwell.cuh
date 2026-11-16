@@ -237,7 +237,8 @@ template <int _SCHEDULER_SWIZZLE_SIZE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
           typename DistributedTensor,
-          typename LocalTensor>
+          typename LocalTensor,
+          typename ReadyTensor>
 __host__ inline fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                               _SIGNALS_PER_TILE,
                               _RS_STRIP_ROWS,
@@ -245,7 +246,7 @@ __host__ inline fused_globals<_SCHEDULER_SWIZZLE_SIZE,
 gemm_rs_blackwell_make_globals(LocalTensor& A,
                                LocalTensor& B,
                                DistributedTensor& C,
-                               DistributedTensor& sync,
+                               ReadyTensor& sync,
                                int dev_idx,
                                int M,
                                int N,
@@ -253,6 +254,10 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                                cudaStream_t stream) {
     using fg =
         fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    // Slice each rank's sync buffer into the epoch word and the ready grid.
+    uint64_t epoch_ptrs[fg::NUM_DEVICES];
+    uint64_t ready_ptrs[fg::NUM_DEVICES];
+
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
@@ -277,9 +282,6 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                     "sync must span ",
                     fg::NUM_DEVICES,
                     " ranks");
-        // Slice each rank's sync buffer into the epoch word and the ready grid.
-        uint64_t epoch_ptrs[fg::NUM_DEVICES];
-        uint64_t ready_ptrs[fg::NUM_DEVICES];
         for (int i = 0; i < fg::NUM_DEVICES; i++) {
             epoch_ptrs[i] = reinterpret_cast<uint64_t>(sync.raw_ptrs_[i]);
             ready_ptrs[i] = epoch_ptrs[i] + SYNC_HEADER_BYTES;
@@ -300,7 +302,39 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
         static_assert(always_false_v<LocalTensor>, "Unsupported LocalTensorType");
     }
 #else
-    static_assert(always_false_v<LocalTensor>, "Construct fused_globals directly without Torch");
+    if constexpr (std::is_same_v<LocalTensor, comm::bf16*> &&
+                  dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16> &&
+                  dist::RawDistributedTensorLike<ReadyTensor, comm::bf16>) {
+        for (int i = 0; i < fg::NUM_DEVICES; i++) {
+            epoch_ptrs[i] = reinterpret_cast<uint64_t>(sync.uc_ptrs[i]);
+            ready_ptrs[i] = epoch_ptrs[i] + SYNC_HEADER_BYTES;
+        }
+        return {
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N,
+            .K = K,
+            .A = dist::make_local_tensor<typename fg::A_local_tensor>(
+                reinterpret_cast<uint64_t>(A), 1, 1, M, K),
+            .B = dist::make_local_tensor<typename fg::B_local_tensor>(
+                reinterpret_cast<uint64_t>(B), 1, 1, N, K),
+            .C = dist::make_distributed_tensor<typename fg::C_dist_tensor>(
+                reinterpret_cast<uint64_t>(C.mc),
+                reinterpret_cast<uint64_t*>(C.uc_ptrs),
+                1,
+                fg::NUM_DEVICES,
+                M,
+                N),
+            .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
+                ready_ptrs, 1, 1, 1, ready_numel),
+            .completion_epochs =
+                dist::make_distributed_tensor<completion_epoch_dist_tensor>(epoch_ptrs, 1, 1, 1, 1),
+            .stream = stream,
+        };
+    } else {
+        static_assert(always_false_v<LocalTensor>,
+                      "Construct fused_globals directly without Torch");
+    }
 #endif
 }
 

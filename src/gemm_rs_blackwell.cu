@@ -695,36 +695,39 @@ inline void prepare(at::Tensor& A,
 
 // Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps> for M.
 // Keep in sync with BlackwellBenchConfig.mkernel_candidates in gemm_rs_bench.py.
-inline void entrypoint(at::Tensor& A,
-                       at::Tensor& B,
-                       dist::ParallelBuffer& C,
-                       dist::ParallelBuffer& sync,
-                       cudaStream_t stream = nullptr) {
-    const int M = A.size(0);
-
+template <typename LocalTensor, typename DistributedTensor, typename ReadyTensor>
+inline void launch(LocalTensor& A,
+                   LocalTensor& B,
+                   DistributedTensor& C,
+                   ReadyTensor& sync,
+                   const int M,
+                   const int N,
+                   const int K,
+                   const int dev_idx,
+                   cudaStream_t stream = nullptr) {
     if (!stream) {
         stream = at::cuda::getCurrentCUDAStream().stream();
     }
 
     if (M <= 2048) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        auto globals =
+            gemm_rs_blackwell_make_globals<2, 2, 32, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 4096) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        auto globals =
+            gemm_rs_blackwell_make_globals<2, 2, 32, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 8192) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        auto globals =
+            gemm_rs_blackwell_make_globals<1, 2, 16, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 16384) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        auto globals =
+            gemm_rs_blackwell_make_globals<1, 2, 16, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
         launch_gemm_rs_blackwell(globals);
     } else if (M <= 32768) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 16, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
+        auto globals =
+            gemm_rs_blackwell_make_globals<2, 2, 16, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
         launch_gemm_rs_blackwell(globals);
     } else {
         TORCH_CHECK(false, "gemm_rs_blackwell is not tuned for M > 32768, got M=", M);

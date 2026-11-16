@@ -488,9 +488,10 @@ concept RawDistributedMulticastTensorLike = requires (const T& mapping) {
     { mapping.uc_ptrs } -> std::convertible_to<dtype**>;
 };
 
+// p2p tensor without mc
 template <typename T, typename dtype>
 concept RawDistributedTensorLike = requires (const T& mapping) {
-    { mapping.mc } -> std::convertible_to<dtype*>;
+    { mapping.uc_ptrs } -> std::convertible_to<dtype**>;
 };
 
 } // namespace dist
