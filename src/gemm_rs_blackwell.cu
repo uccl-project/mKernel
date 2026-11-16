@@ -692,6 +692,7 @@ inline void prepare(at::Tensor& A,
     MKERNEL_CUDACHECK(cudaMemsetAsync(
         sync.data_.data_ptr(), 0, sync.data_.nbytes(), at::cuda::getCurrentCUDAStream().stream()));
 }
+#endif  // MKERNEL_COMPILE_WITHOUT_TORCH
 
 // Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps> for M.
 // Keep in sync with BlackwellBenchConfig.mkernel_candidates in gemm_rs_bench.py.
@@ -705,9 +706,11 @@ inline void launch(LocalTensor& A,
                    const int K,
                    const int dev_idx,
                    cudaStream_t stream = nullptr) {
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream) {
         stream = at::cuda::getCurrentCUDAStream().stream();
     }
+#endif
 
     if (M <= 2048) {
         auto globals =
@@ -730,11 +733,10 @@ inline void launch(LocalTensor& A,
             gemm_rs_blackwell_make_globals<2, 2, 16, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
         launch_gemm_rs_blackwell(globals);
     } else {
-        TORCH_CHECK(false, "gemm_rs_blackwell is not tuned for M > 32768, got M=", M);
+        std::fprintf(stderr, "gemm_rs_blackwell is not tuned for M > 32768, got M=%d\n", M);
+        std::abort();
     }
 }
-
-#endif
 
 template void launch_gemm_rs_blackwell<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
                                        DEFAULT_SIGNALS_PER_TILE,

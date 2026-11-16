@@ -326,7 +326,7 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                 M,
                 N),
             .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
-                ready_ptrs, 1, 1, 1, ready_numel),
+                ready_ptrs, 1, 1, 1, fg::ready_numel(M, N)),
             .completion_epochs =
                 dist::make_distributed_tensor<completion_epoch_dist_tensor>(epoch_ptrs, 1, 1, 1, 1),
             .stream = stream,
