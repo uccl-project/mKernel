@@ -214,6 +214,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
     everyone::tma::cluster::arrive_aligned();
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
+        // Split once per tile, ahead of the first mma_finish wait.
+        const int device_idx = tile_row_idx / tile_rows_per_device;
+        const int device_row_idx = tile_row_idx % tile_rows_per_device;
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile(&A_smem)[fg::CONSUMER_WARPS] = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
@@ -230,8 +233,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
-            const int device_idx = tile_row_idx / tile_rows_per_device;
-            const int device_row_idx = tile_row_idx % tile_rows_per_device;
 #pragma unroll
             for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
                 tma::cluster::load_async(A_smem[c],
