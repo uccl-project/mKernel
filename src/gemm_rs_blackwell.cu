@@ -145,20 +145,24 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         G.C[G.dev_idx].template prefetch_tma<typename fg::C_tile>();
     }
 
-    const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
+    auto cluster_idx_fn = []() { return int(blockIdx.x) / fg::NUM_CLUSTERS; };
     constexpr int num_clusters = fg::NUM_BLOCKS / fg::NUM_CLUSTERS;
 
     const int tile_rows_per_device = ((G.A.rows() + fg::ROW_BLOCK - 1) / fg::ROW_BLOCK) *
         fg::CONSUMER_WARPS;  // include the padding that each device needs
-    const int num_tile_rows_total = fg::NUM_DEVICES *
-        tile_rows_per_device;  // ensure that every device's rounded rows are taken into account
     const int cta_tile_rows_per_device = tile_rows_per_device / fg::CONSUMER_WARPS;
-    const int num_tile_rows_per_cta = num_tile_rows_total / fg::CONSUMER_WARPS;
-    const int num_tile_rows_per_cluster = num_tile_rows_per_cta / fg::NUM_CLUSTERS;
+    // Scheduler bounds are derived from G inside each role rather than held across the
+    // role branches, where ptxas spills them.
+    auto num_tile_rows_per_cluster_fn = [&]() {
+        return fg::NUM_DEVICES * ((G.A.rows() + fg::ROW_BLOCK - 1) / fg::ROW_BLOCK) /
+            fg::NUM_CLUSTERS;
+    };
 
     const int num_tile_cols = G.N / G.COL_BLOCK;
 
-    const int total_num_tiles = num_tile_rows_per_cluster * num_tile_cols;
+    auto total_num_tiles_fn = [&]() {
+        return num_tile_rows_per_cluster_fn() * (G.N / fg::COL_BLOCK);
+    };
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator smem_allocator((int*)&__shm[0]);
@@ -214,9 +218,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
     everyone::tma::cluster::arrive_aligned();
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
-        // Split once per tile, ahead of the first mma_finish wait.
-        const int device_idx = tile_row_idx / tile_rows_per_device;
-        const int device_row_idx = tile_row_idx % tile_rows_per_device;
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile(&A_smem)[fg::CONSUMER_WARPS] = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
@@ -233,6 +234,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
                                      (uint16_t)(1 << cta_rank),
                                      0);
 
+            const int device_idx = tile_row_idx / tile_rows_per_device;
+            const int device_row_idx = tile_row_idx % tile_rows_per_device;
 #pragma unroll
             for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
                 tma::cluster::load_async(A_smem[c],
@@ -398,6 +401,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 
             if (elect_warp_leader()) {
                 int input_stage_id = 0;
+                const int cluster_idx = cluster_idx_fn();
+                const int num_tile_rows_per_cluster = num_tile_rows_per_cluster_fn();
+                const int total_num_tiles = total_num_tiles_fn();
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     auto [tile_row_idx, tile_col_idx] =
                         calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
@@ -432,6 +438,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
                 int epilogue_stage_id = 0;
                 const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP_ID;
 
+                const int cluster_idx = cluster_idx_fn();
+                const int total_num_tiles = total_num_tiles_fn();
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     consume(input_stage_id, epilogue_stage_id, consumer_id);
                 }
@@ -447,6 +455,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             if (elect_warp_leader()) {
                 int signal_stage = 0;
                 int signal_phase = 0;
+                const int cluster_idx = cluster_idx_fn();
+                const int num_tile_rows_per_cluster = num_tile_rows_per_cluster_fn();
+                const int total_num_tiles = total_num_tiles_fn();
                 for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_clusters) {
                     auto [tile_row_idx, tile_col_idx] =
@@ -541,6 +552,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         // Tile views and the eventual deallocation use the published base.
         tm_alloc.set_addr(tmem_addr);
 
+        const int cluster_idx = cluster_idx_fn();
+        const int num_tile_rows_per_cluster = num_tile_rows_per_cluster_fn();
+        const int total_num_tiles = total_num_tiles_fn();
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_clusters) {
             auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
                 num_tile_rows_per_cluster, num_tile_cols, tile_id);
