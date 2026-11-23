@@ -29,7 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](at::Tensor A, at::Tensor B, dist::ParallelBuffer& C, dist::ParallelBuffer& sync) {
             c10::cuda::CUDAGuard device_guard(C.local_rank_);
             gemm_rs_blackwell::launch(
-                A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1));
+                A, B, C, sync, A.size(0), B.size(0), A.size(1), C.local_rank_);
         },
         pybind11::arg("A"),
         pybind11::arg("B"),
