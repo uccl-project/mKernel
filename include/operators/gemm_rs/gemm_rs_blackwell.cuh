@@ -267,7 +267,7 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
                   std::is_same_v<DistributedTensor, dist::ParallelBuffer> &&
-                  std::is_same_v<ReadyTensor, dist::barrier_distributed_tensor<fg::NUM_DEVICES>>) {
+                  std::is_same_v<ReadyTensor, dist::ParallelBuffer>) {
         // A CTA tile must not straddle two ranks' rows: the signal warp sends a whole
         // region to one rank, and the RS warps enumerate whole tiles per rank.
         TORCH_CHECK(M % fg::NUM_DEVICES == 0 && N % fg::COL_BLOCK == 0,
