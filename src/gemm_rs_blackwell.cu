@@ -327,6 +327,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             }
         };
 
+        // Split once per tile, before waiting on the MMA: computed inside the elected
+        // store branch, the division was repeated per chunk and delayed every TMA store.
+        const int device_idx = tile_row_idx / tile_rows_per_device;
+        const int device_row_idx = tile_row_idx % tile_rows_per_device;
+
         const int tmem_slot_idx = consumer_id * fg::TMEM_PIPELINE_STAGES + epilogue_stage_id;
         wait(epilogue_ready[tmem_slot_idx], (phasebits >> epilogue_semaphore_idx) & 0b1);
 
@@ -358,8 +363,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             warpgroup::sync(1);
 
             if (warp_id == 0 && elect_warp_leader()) {
-                const int device_idx = tile_row_idx / tile_rows_per_device;
-                const int device_row_idx = tile_row_idx % tile_rows_per_device;
                 dist::tma::store_async(
                     G.C[G.dev_idx],
                     C_smem[epilogue_smem_idx],
@@ -448,14 +451,15 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
                     auto [tile_row_idx, tile_col_idx] =
                         calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
                             num_tile_rows_per_cluster, num_tile_cols, tile_id);
+                    // Split once per tile, before waiting on the epilogue, so the
+                    // division stays off the path from drained stores to the signal.
+                    const int cta_tile_row = tile_row_idx * fg::NUM_CLUSTERS + cta_rank;
+                    const int device_to_signal = cta_tile_row / cta_tile_rows_per_device;
+                    const int local_tile_row = cta_tile_row % cta_tile_rows_per_device;
 #pragma unroll
                     for (int s = 0; s < fg::SIGNALS_PER_TILE; s++) {
                         wait(signal_full[signal_stage], signal_phase);
                         comm::atomic_u32::fence_acq_rel_gpu();
-
-                        const int cta_tile_row = tile_row_idx * fg::NUM_CLUSTERS + cta_rank;
-                        const int device_to_signal = cta_tile_row / cta_tile_rows_per_device;
-                        const int local_tile_row = cta_tile_row % cta_tile_rows_per_device;
 
                         comm::atomic_u32::relaxed_add_gpu(
                             G.C_barrier[device_to_signal].raw_ptr +
