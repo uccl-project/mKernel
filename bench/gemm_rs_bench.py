@@ -127,7 +127,7 @@ class BlackwellBenchConfig:
 
     # 8195 pads to 8200 (1025 rows per rank at TP=8), which exercises the kernel's
     # per-rank tile padding; the others split into whole tiles per rank.
-    DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
+    DEFAULT_SHAPES = [2048, 4096, 8192, 8195, 16384, 32768]
     output_dim = 7168
     split_inner_dim = 12288 // world_size
 
