@@ -57,7 +57,7 @@ __device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semap
     kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
-template <int TILE_ROWS, int TILE_COLS, int STORES_PER_BATCH>
+template <int TILE_ROWS, int TILE_COLS, int STORES_PER_BATCH, bool CHECK_ROWS>
 __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_tile,
                                                     comm::bf16* local_tile,
                                                     size_t row_stride,
@@ -79,19 +79,29 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
 #pragma unroll
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
-            // if (row < rows_remaining) {
-            const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
-            reduce_load_16B_no_clobber(reduced[store_idx], src);
-            // }
+            if constexpr (CHECK_ROWS) {
+                if (row < rows_remaining) {
+                    const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
+                    reduce_load_16B_no_clobber(reduced[store_idx], src);
+                }
+            } else {
+                const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
+                reduce_load_16B_no_clobber(reduced[store_idx], src);
+            }
         }
 
 #pragma unroll
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
-            // if (row < rows_remaining) {
-            comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
-            store_16B(dst, reduced[store_idx]);
-            // }
+            if constexpr (CHECK_ROWS) {
+                if (row < rows_remaining) {
+                    comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
+                    store_16B(dst, reduced[store_idx]);
+                }
+            } else {
+                comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
+                store_16B(dst, reduced[store_idx]);
+            }
         }
     }
 }
@@ -529,12 +539,28 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 
             const int local_row = local_tile_row * fg::ROW_BLOCK + strip_row;
             const int tile_col_start = tile_col * fg::COL_BLOCK + strip_col;
-            reduce_scatter_tile<fg::RS_M_STRIP_SIZE, fg::RS_COLS, fg::RS_STORES_PER_BATCH>(
-                G.C.mc_ptr_at({G.dev_idx, local_row, tile_col_start}),
-                &G.C[G.dev_idx][{G.dev_idx, local_row, tile_col_start}],
-                G.C[G.dev_idx].cols(),
-                lane,
-                G.A.rows() - local_row);
+            const comm::bf16* mc_strip = G.C.mc_ptr_at({G.dev_idx, local_row, tile_col_start});
+            comm::bf16* local_strip = &G.C[G.dev_idx][{G.dev_idx, local_row, tile_col_start}];
+            const size_t row_stride = G.C[G.dev_idx].cols();
+            const int rows_remaining = G.A.rows() - local_row;
+
+            // The check version adds 1-2% of overhead to the speed of this kernel, so we want to
+            // avoid it as much as possible
+            if (rows_remaining < fg::RS_M_STRIP_SIZE) {
+                // Cold tail strip: a smaller batch keeps its hoisted per-row addresses from
+                // holding registers across the loop, which made the full path spill.
+                constexpr int TAIL_STORES_PER_BATCH =
+                    fg::RS_STORES_PER_BATCH < 4 ? fg::RS_STORES_PER_BATCH : 4;
+                reduce_scatter_tile<fg::RS_M_STRIP_SIZE,
+                                    fg::RS_COLS,
+                                    TAIL_STORES_PER_BATCH,
+                                    true>(mc_strip, local_strip, row_stride, lane, rows_remaining);
+            } else {
+                reduce_scatter_tile<fg::RS_M_STRIP_SIZE,
+                                    fg::RS_COLS,
+                                    fg::RS_STORES_PER_BATCH,
+                                    false>(mc_strip, local_strip, row_stride, lane, rows_remaining);
+            }
         }
 
         pdl::arrive();
