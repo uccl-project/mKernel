@@ -551,10 +551,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
                 // holding registers across the loop, which made the full path spill.
                 constexpr int TAIL_STORES_PER_BATCH =
                     fg::RS_STORES_PER_BATCH < 4 ? fg::RS_STORES_PER_BATCH : 4;
-                reduce_scatter_tile<fg::RS_M_STRIP_SIZE,
-                                    fg::RS_COLS,
-                                    TAIL_STORES_PER_BATCH,
-                                    true>(mc_strip, local_strip, row_stride, lane, rows_remaining);
+                reduce_scatter_tile<fg::RS_M_STRIP_SIZE, fg::RS_COLS, TAIL_STORES_PER_BATCH, true>(
+                    mc_strip, local_strip, row_stride, lane, rows_remaining);
             } else {
                 reduce_scatter_tile<fg::RS_M_STRIP_SIZE,
                                     fg::RS_COLS,
@@ -790,15 +788,6 @@ inline void launch(LocalTensor& A,
         std::abort();
     }
 }
-
-template void launch_gemm_rs_blackwell<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
-                                       DEFAULT_SIGNALS_PER_TILE,
-                                       DEFAULT_RS_STRIP_ROWS,
-                                       DEFAULT_NUM_CONSUMER_WARPS>(
-    const fused_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
-                        DEFAULT_SIGNALS_PER_TILE,
-                        DEFAULT_RS_STRIP_ROWS,
-                        DEFAULT_NUM_CONSUMER_WARPS>& G);
 };  // namespace gemm_rs_blackwell
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
