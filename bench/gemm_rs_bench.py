@@ -125,7 +125,9 @@ class BlackwellBenchConfig:
     is_chief = local_rank == 0
     num_nodes = 1
 
-    DEFAULT_SHAPES = [2048, 4096, 8192, 16384, 32768]
+    # 8195 pads to 8200 (1025 rows per rank at TP=8), which exercises the kernel's
+    # per-rank tile padding; the others split into whole tiles per rank.
+    DEFAULT_SHAPES = [2048, 4096, 8192, 8195, 16384, 32768]
     output_dim = 7168
     split_inner_dim = 12288 // world_size
 
@@ -186,26 +188,31 @@ class BlackwellBenchVars:
     sync_mkernel: DistBufferLike | None = None
     mkernel_graph: torch.cuda.CUDAGraph | None = None
 
+def round_up(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
 def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_module):
     all_correct = True
     for M in config.DEFAULT_SHAPES:
         N, K = config.output_dim, config.split_inner_dim
 
+        padded_M = round_up(M, 8)
+
         tk_module = (
             load_thirdparty.load_tk_extension("gemm_rs")
-            if tk_available(config, M, N, K) else None
+            if tk_available(config, padded_M, N, K) else None
         )
-        buffers = make_blackwell_buffers(config, M, N, K, mkernel_module, tk_module)
+        buffers = make_blackwell_buffers(config, padded_M, N, K, mkernel_module, tk_module)
         run_baseline(buffers)
 
-        for candidate in config.mkernel_tuned_config(M):
+        for candidate in config.mkernel_tuned_config(padded_M):
             buffers.c_mkernel.data_.zero_()
             torch.cuda.synchronize()
             dist.barrier()
             run_mkernel(mkernel_module, buffers, candidate)
             torch.cuda.synchronize()
             all_correct = check_close(
-                f"gemm_rs mKernel eager {mkernel_config_label(candidate)} M={M}",
+                f"gemm_rs mKernel eager {mkernel_config_label(candidate)} M={M}, {padded_M=}",
                 mkernel_output(config, buffers), buffers.baseline_c_rs,
             ) and all_correct
 
@@ -214,7 +221,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
             torch.cuda.synchronize()
 
             is_correct_tk = check_close(
-                f"gemm_rs TK M={M}", buffers.c_tk_dist.data_, buffers.baseline_c_rs,
+                f"gemm_rs TK M={M}, {padded_M=}", buffers.c_tk_dist.data_, buffers.baseline_c_rs,
             )
             all_correct = is_correct_tk and all_correct
             status = "passed :)" if is_correct_tk else "FAILED :("
@@ -223,7 +230,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
                     f"ThunderKittens M={M} N={N} K={K}: {status}",
                     flush=True,
                 )
-        for candidate in config.mkernel_tuned_config(M):
+        for candidate in config.mkernel_tuned_config(padded_M):
             buffers.mkernel_graph = capture_cuda_graph(
                 lambda: run_mkernel(mkernel_module, buffers, candidate)
             )
@@ -236,7 +243,7 @@ def check_correctness_gemm_rs_blackwell(config: BlackwellBenchConfig, mkernel_mo
                 torch.cuda.synchronize()
                 all_correct = check_close(
                     f"gemm_rs mKernel graph {mkernel_config_label(candidate)} "
-                    f"replay={replay + 1} M={M}",
+                    f"replay={replay + 1} M={M} {padded_M=}",
                     mkernel_output(config, buffers), buffers.baseline_c_rs,
                 ) and all_correct
             buffers.mkernel_graph = None
@@ -467,7 +474,11 @@ def benchmark_cuda(run_once, warmup: int, iters: int) -> float:
     return elapsed.item()
 
 def useful_tflops(M: int, N: int, K: int, elapsed_time_ms: float) -> float:
-    """Per-rank GEMM throughput, with elapsed time including reduce-scatter."""
+    """Per-rank GEMM throughput, with elapsed time including reduce-scatter.
+
+    Pass the unpadded M: rows added to reach a multiple of 8 (and the kernel's
+    per-rank tile padding) are not useful work, so they do not count as FLOPs.
+    """
     return 2 * M * N * K / (elapsed_time_ms * 1.0e9)
 
 def blackwell_main(args, local_rank: int) -> int:
@@ -482,13 +493,16 @@ def blackwell_main(args, local_rank: int) -> int:
 
         shapes = [] if args.mode == "check" else config.DEFAULT_SHAPES
         for M in shapes:
+            padded_M = round_up(M, 8)
             N, K = config.output_dim, config.split_inner_dim
             # Release the previous shape's graphs before their backing buffers.
             fn = None
             fns.clear()
+            # Every implementation runs on the padded problem; FLOPs below use the real M.
             fns = gemm_rs_blackwell_prepare(
-                config, M, N, K, args.warmup, args.iters, mkernel_module,
+                config, padded_M, N, K, args.warmup, args.iters, mkernel_module,
             )
+            shape_label = f"M={M}" if padded_M == M else f"M={M} (padded {padded_M})"
             results = {}
             for fn, name, should_wrap in fns:
                 ms = (
@@ -499,7 +513,7 @@ def blackwell_main(args, local_rank: int) -> int:
                     results[name] = ms
                     if config.is_chief:
                         print(
-                            f"M={M} N={N} K_local={K} {name}: "
+                            f"{shape_label} N={N} K_local={K} {name}: "
                             f"{ms:.3f} ms  {useful_tflops(M, N, K, ms):.2f} TFLOP/s",
                             flush=True,
                         )

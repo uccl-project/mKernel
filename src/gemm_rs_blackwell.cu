@@ -57,11 +57,12 @@ __device__ __forceinline__ void mma_ABt_ncta(D& d, const A& a, const B& b, semap
     kittens::mma<transpose::N, transpose::T, D, A, B, 1, NUM_CTA>(d, a, b, sem);
 }
 
-template <int TILE_ROWS, int TILE_COLS, int STORES_PER_BATCH>
+template <int TILE_ROWS, int TILE_COLS, int STORES_PER_BATCH, bool CHECK_ROWS>
 __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_tile,
                                                     comm::bf16* local_tile,
                                                     size_t row_stride,
-                                                    int lane) {
+                                                    int lane,
+                                                    const int rows_remaining) {
     constexpr int ELEMENTS_PER_STORE = 128 / 8 / sizeof(comm::bf16);
     constexpr int LANES_PER_ROW = TILE_COLS / ELEMENTS_PER_STORE;
     constexpr int ROWS_PER_STORE = 32 / LANES_PER_ROW;
@@ -78,15 +79,29 @@ __device__ __forceinline__ void reduce_scatter_tile(const comm::bf16* multicast_
 #pragma unroll
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
-            const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
-            reduce_load_16B_no_clobber(reduced[store_idx], src);
+            if constexpr (CHECK_ROWS) {
+                if (row < rows_remaining) {
+                    const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
+                    reduce_load_16B_no_clobber(reduced[store_idx], src);
+                }
+            } else {
+                const comm::bf16* src = multicast_tile + size_t(row) * row_stride + lane_col;
+                reduce_load_16B_no_clobber(reduced[store_idx], src);
+            }
         }
 
 #pragma unroll
         for (int store_idx = 0; store_idx < STORES_PER_BATCH; ++store_idx) {
             const int row = batch_row + store_idx * ROWS_PER_STORE + lane_row;
-            comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
-            store_16B(dst, reduced[store_idx]);
+            if constexpr (CHECK_ROWS) {
+                if (row < rows_remaining) {
+                    comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
+                    store_16B(dst, reduced[store_idx]);
+                }
+            } else {
+                comm::bf16* dst = local_tile + size_t(row) * row_stride + lane_col;
+                store_16B(dst, reduced[store_idx]);
+            }
         }
     }
 }
@@ -140,27 +155,33 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         G.C[G.dev_idx].template prefetch_tma<typename fg::C_tile>();
     }
 
-    const int cluster_idx = blockIdx.x / fg::NUM_CLUSTERS;
+    auto cluster_idx_fn = []() { return int(blockIdx.x) / fg::NUM_CLUSTERS; };
     constexpr int num_clusters = fg::NUM_BLOCKS / fg::NUM_CLUSTERS;
 
-    const int num_tile_rows_total = G.M / (fg::A_tile::rows);
-    const int num_tile_rows_per_cta = num_tile_rows_total / fg::CONSUMER_WARPS;
-    const int num_tile_rows_per_cluster = num_tile_rows_per_cta / fg::NUM_CLUSTERS;
+    const int tile_rows_per_device = ((G.A.rows() + fg::ROW_BLOCK - 1) / fg::ROW_BLOCK) *
+        fg::CONSUMER_WARPS;  // include the padding that each device needs
+    const int cta_tile_rows_per_device = tile_rows_per_device / fg::CONSUMER_WARPS;
+    // Scheduler bounds are derived from G inside each role rather than held across the
+    // role branches, where ptxas spills them.
+    auto num_tile_rows_per_cluster_fn = [&]() {
+        return fg::NUM_DEVICES * ((G.A.rows() + fg::ROW_BLOCK - 1) / fg::ROW_BLOCK) /
+            fg::NUM_CLUSTERS;
+    };
 
     const int num_tile_cols = G.N / G.COL_BLOCK;
 
-    const int total_num_tiles = num_tile_rows_per_cluster * num_tile_cols;
-
-    // RS calculations
-    const int rows_per_device = G.M / fg::NUM_DEVICES;
+    auto total_num_tiles_fn = [&]() {
+        return num_tile_rows_per_cluster_fn() * (G.N / fg::COL_BLOCK);
+    };
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator smem_allocator((int*)&__shm[0]);
 
     typename fg::pipeline_inputs(&inputs_smem)[fg::PRODUCER_CONSUMER_PIPELINE_STAGES] =
-        smem_allocator.allocate<fg::pipeline_inputs, fg::PRODUCER_CONSUMER_PIPELINE_STAGES>();
+        smem_allocator
+            .allocate<typename fg::pipeline_inputs, fg::PRODUCER_CONSUMER_PIPELINE_STAGES>();
     typename fg::C_tile(&C_smem)[fg::EPILOGUE_PIPELINE_STAGES] =
-        smem_allocator.allocate<fg::C_tile, fg::EPILOGUE_PIPELINE_STAGES>();
+        smem_allocator.allocate<typename fg::C_tile, fg::EPILOGUE_PIPELINE_STAGES>();
 
     __shared__ semaphore mma_finish[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
     __shared__ semaphore tma_load[fg::PRODUCER_CONSUMER_PIPELINE_STAGES];
@@ -207,25 +228,30 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
     everyone::tma::cluster::arrive_aligned();
 
     auto load = [&](int tile_row_idx, int tile_col_idx, int& input_stage_id) {
+        const int device_idx = tile_row_idx / tile_rows_per_device;
+        const int device_row_idx = tile_row_idx % tile_rows_per_device;
+
         for (int iter_k = 0; iter_k < G.K / fg::RED_BLOCK; iter_k++) {
             typename fg::A_tile(&A_smem)[fg::CONSUMER_WARPS] = inputs_smem[input_stage_id].A;
             typename fg::B_tile& B_smem = inputs_smem[input_stage_id].B;
             wait(mma_finish[input_stage_id], (phasebits & 0b1));
 
-            tma::cluster::expect_bytes(tma_load[input_stage_id],
-                                       sizeof(fg::A_tile) * fg::CONSUMER_WARPS + sizeof(fg::B_tile),
-                                       0);
+            tma::cluster::expect_bytes(
+                tma_load[input_stage_id],
+                sizeof(typename fg::A_tile) * fg::CONSUMER_WARPS + sizeof(typename fg::B_tile),
+                0);
             tma::cluster::load_async(B_smem,
                                      G.B,
                                      {tile_col_idx * fg::NUM_CLUSTERS + cta_rank, iter_k},
                                      tma_load[input_stage_id],
                                      (uint16_t)(1 << cta_rank),
                                      0);
+
 #pragma unroll
             for (int c = 0; c < fg::CONSUMER_WARPS; c++) {
                 tma::cluster::load_async(A_smem[c],
                                          G.A,
-                                         {tile_row_idx + c, iter_k},
+                                         {device_idx, device_row_idx + c, iter_k},
                                          tma_load[input_stage_id],
                                          (uint16_t)(1 << cta_rank),
                                          0);
@@ -316,6 +342,11 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             }
         };
 
+        // Split once per tile, before waiting on the MMA: computed inside the elected
+        // store branch, the division was repeated per chunk and delayed every TMA store.
+        const int device_idx = tile_row_idx / tile_rows_per_device;
+        const int device_row_idx = tile_row_idx % tile_rows_per_device;
+
         const int tmem_slot_idx = consumer_id * fg::TMEM_PIPELINE_STAGES + epilogue_stage_id;
         wait(epilogue_ready[tmem_slot_idx], (phasebits >> epilogue_semaphore_idx) & 0b1);
 
@@ -347,9 +378,10 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             warpgroup::sync(1);
 
             if (warp_id == 0 && elect_warp_leader()) {
-                dist::tma::store_async(G.C[G.dev_idx],
-                                       C_smem[epilogue_smem_idx],
-                                       {tile_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
+                dist::tma::store_async(
+                    G.C[G.dev_idx],
+                    C_smem[epilogue_smem_idx],
+                    {device_idx, device_row_idx, tile_col_idx * fg::C_TILE_DIVISOR + i});
             }
 
             epilogue_smem_idx = (epilogue_smem_idx + 1) % fg::EPILOGUE_PIPELINE_STAGES;
@@ -380,6 +412,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 
             if (elect_warp_leader()) {
                 int input_stage_id = 0;
+                const int cluster_idx = cluster_idx_fn();
+                const int num_tile_rows_per_cluster = num_tile_rows_per_cluster_fn();
+                const int total_num_tiles = total_num_tiles_fn();
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     auto [tile_row_idx, tile_col_idx] =
                         calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
@@ -414,6 +449,8 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
                 int epilogue_stage_id = 0;
                 const int consumer_id = warp_id - fg::FIRST_CONSUMER_WARP_ID;
 
+                const int cluster_idx = cluster_idx_fn();
+                const int total_num_tiles = total_num_tiles_fn();
                 for (int i = cluster_idx; i < total_num_tiles; i += num_clusters) {
                     consume(input_stage_id, epilogue_stage_id, consumer_id);
                 }
@@ -429,21 +466,23 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             if (elect_warp_leader()) {
                 int signal_stage = 0;
                 int signal_phase = 0;
+                const int cluster_idx = cluster_idx_fn();
+                const int num_tile_rows_per_cluster = num_tile_rows_per_cluster_fn();
+                const int total_num_tiles = total_num_tiles_fn();
                 for (int tile_id = cluster_idx; tile_id < total_num_tiles;
                      tile_id += num_clusters) {
                     auto [tile_row_idx, tile_col_idx] =
                         calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
                             num_tile_rows_per_cluster, num_tile_cols, tile_id);
+                    // Split once per tile, before waiting on the epilogue, so the
+                    // division stays off the path from drained stores to the signal.
+                    const int cta_tile_row = tile_row_idx * fg::NUM_CLUSTERS + cta_rank;
+                    const int device_to_signal = cta_tile_row / cta_tile_rows_per_device;
+                    const int local_tile_row = cta_tile_row % cta_tile_rows_per_device;
 #pragma unroll
                     for (int s = 0; s < fg::SIGNALS_PER_TILE; s++) {
                         wait(signal_full[signal_stage], signal_phase);
                         comm::atomic_u32::fence_acq_rel_gpu();
-
-                        const int cta_row_start =
-                            (tile_row_idx * fg::NUM_CLUSTERS + cta_rank) * fg::ROW_BLOCK;
-                        const int device_to_signal = cta_row_start / rows_per_device;
-                        const int local_tile_row =
-                            (cta_row_start % rows_per_device) / fg::ROW_BLOCK;
 
                         comm::atomic_u32::relaxed_add_gpu(
                             G.C_barrier[device_to_signal].raw_ptr +
@@ -462,10 +501,6 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
     } else if (warpgroup_id == fg::RS_WARPGROUP) {
         warpgroup::decrease_registers<fg::RS_REGISTERS>();
         const int lane = laneid();
-        const int tile_rows_per_device = rows_per_device / fg::ROW_BLOCK;
-        const int tiles_per_device = tile_rows_per_device * num_tile_cols;
-
-        const int device_row_start = G.dev_idx * rows_per_device;
 
         pdl::wait();
         everyone::tma::cluster::wait();
@@ -474,7 +509,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 
         const int rs_warp = warp_id - fg::FIRST_RS_WARP_ID;
         for (int unit_idx = blockIdx.x + rs_warp * fg::NUM_BLOCKS;
-             unit_idx < tiles_per_device * fg::RS_STRIPS_PER_TILE;
+             unit_idx < cta_tile_rows_per_device * num_tile_cols * fg::RS_STRIPS_PER_TILE;
              unit_idx += fg::NUM_BLOCKS * fg::REDUCE_SCATTER_WARPS) {
             // split the tile into (tile, strip)
             const int strip_idx = unit_idx % fg::RS_STRIPS_PER_TILE;
@@ -488,7 +523,7 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
 
             // Walk this device's tiles in the GEMM's rasterization
             const auto [local_tile_row, tile_col] = calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
-                tile_rows_per_device, num_tile_cols, unit_idx / fg::RS_STRIPS_PER_TILE);
+                cta_tile_rows_per_device, num_tile_cols, unit_idx / fg::RS_STRIPS_PER_TILE);
 
             // These match the coordinates used by the epilogue's signal.
             if (elect_warp_leader()) {
@@ -502,14 +537,28 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
             }
             __syncwarp();
 
-            const int tile_row_start =
-                device_row_start + local_tile_row * fg::ROW_BLOCK + strip_row;
+            const int local_row = local_tile_row * fg::ROW_BLOCK + strip_row;
             const int tile_col_start = tile_col * fg::COL_BLOCK + strip_col;
-            reduce_scatter_tile<fg::RS_M_STRIP_SIZE, fg::RS_COLS, fg::RS_STORES_PER_BATCH>(
-                G.C.mc_ptr_at({tile_row_start, tile_col_start}),
-                &G.C[G.dev_idx][{tile_row_start, tile_col_start}],
-                G.C[G.dev_idx].cols(),
-                lane);
+            const comm::bf16* mc_strip = G.C.mc_ptr_at({G.dev_idx, local_row, tile_col_start});
+            comm::bf16* local_strip = &G.C[G.dev_idx][{G.dev_idx, local_row, tile_col_start}];
+            const size_t row_stride = G.C[G.dev_idx].cols();
+            const int rows_remaining = G.A.rows() - local_row;
+
+            // The check version adds 1-2% of overhead to the speed of this kernel, so we want to
+            // avoid it as much as possible
+            if (rows_remaining < fg::RS_M_STRIP_SIZE) {
+                // Cold tail strip: a smaller batch keeps its hoisted per-row addresses from
+                // holding registers across the loop, which made the full path spill.
+                constexpr int TAIL_STORES_PER_BATCH =
+                    fg::RS_STORES_PER_BATCH < 4 ? fg::RS_STORES_PER_BATCH : 4;
+                reduce_scatter_tile<fg::RS_M_STRIP_SIZE, fg::RS_COLS, TAIL_STORES_PER_BATCH, true>(
+                    mc_strip, local_strip, row_stride, lane, rows_remaining);
+            } else {
+                reduce_scatter_tile<fg::RS_M_STRIP_SIZE,
+                                    fg::RS_COLS,
+                                    fg::RS_STORES_PER_BATCH,
+                                    false>(mc_strip, local_strip, row_stride, lane, rows_remaining);
+            }
         }
 
         pdl::arrive();
@@ -528,6 +577,9 @@ __device__ __forceinline__ void gemm_rs_blackwell(const fused_globals<_SCHEDULER
         // Tile views and the eventual deallocation use the published base.
         tm_alloc.set_addr(tmem_addr);
 
+        const int cluster_idx = cluster_idx_fn();
+        const int num_tile_rows_per_cluster = num_tile_rows_per_cluster_fn();
+        const int total_num_tiles = total_num_tiles_fn();
         for (int tile_id = cluster_idx; tile_id < total_num_tiles; tile_id += num_clusters) {
             auto [tile_row_idx, tile_col_idx] = calculate_tile_idx<fg::SCHEDULER_SWIZZLE_SIZE>(
                 num_tile_rows_per_cluster, num_tile_cols, tile_id);
@@ -692,55 +744,50 @@ inline void prepare(at::Tensor& A,
     MKERNEL_CUDACHECK(cudaMemsetAsync(
         sync.data_.data_ptr(), 0, sync.data_.nbytes(), at::cuda::getCurrentCUDAStream().stream()));
 }
+#endif  // MKERNEL_COMPILE_WITHOUT_TORCH
 
-// Picks the tuned <swizzle, signals_per_tile, rs_strip_rows, mma_warps> for M.
-// Keep in sync with BlackwellBenchConfig.mkernel_candidates in gemm_rs_bench.py.
-inline void entrypoint(at::Tensor& A,
-                       at::Tensor& B,
-                       dist::ParallelBuffer& C,
-                       dist::ParallelBuffer& sync,
-                       cudaStream_t stream = nullptr) {
-    const int M = A.size(0);
-
+// NOTE: assume that M is rounded up to the nearest multple of 8
+template <typename LocalTensor, typename DistributedTensor, typename ReadyTensor>
+inline void launch(LocalTensor& A,
+                   LocalTensor& B,
+                   DistributedTensor& C,
+                   ReadyTensor& sync,
+                   const int M,
+                   const int N,
+                   const int K,
+                   const int dev_idx,
+                   cudaStream_t stream = nullptr) {
+#ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if (!stream) {
         stream = at::cuda::getCurrentCUDAStream().stream();
     }
-
-    if (M <= 2048) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
-    } else if (M <= 4096) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 32, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
-    } else if (M <= 8192) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
-    } else if (M <= 16384) {
-        auto globals = gemm_rs_blackwell_make_globals<1, 2, 16, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
-    } else if (M <= 32768) {
-        auto globals = gemm_rs_blackwell_make_globals<2, 2, 16, 1>(
-            A, B, C, sync, C.local_rank_, A.size(0), B.size(0), A.size(1), stream);
-        launch_gemm_rs_blackwell(globals);
-    } else {
-        TORCH_CHECK(false, "gemm_rs_blackwell is not tuned for M > 32768, got M=", M);
-    }
-}
-
 #endif
 
-template void launch_gemm_rs_blackwell<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
-                                       DEFAULT_SIGNALS_PER_TILE,
-                                       DEFAULT_RS_STRIP_ROWS,
-                                       DEFAULT_NUM_CONSUMER_WARPS>(
-    const fused_globals<DEFAULT_SCHEDULER_SWIZZLE_SIZE,
-                        DEFAULT_SIGNALS_PER_TILE,
-                        DEFAULT_RS_STRIP_ROWS,
-                        DEFAULT_NUM_CONSUMER_WARPS>& G);
+    if (M <= 2048) {
+        auto globals =
+            gemm_rs_blackwell_make_globals<2, 2, 32, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 4096) {
+        auto globals =
+            gemm_rs_blackwell_make_globals<2, 2, 32, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 8192) {
+        auto globals =
+            gemm_rs_blackwell_make_globals<1, 2, 16, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 16384) {
+        auto globals =
+            gemm_rs_blackwell_make_globals<1, 2, 16, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
+        launch_gemm_rs_blackwell(globals);
+    } else if (M <= 32768) {
+        auto globals =
+            gemm_rs_blackwell_make_globals<2, 2, 16, 1>(A, B, C, sync, dev_idx, M, N, K, stream);
+        launch_gemm_rs_blackwell(globals);
+    } else {
+        std::fprintf(stderr, "gemm_rs_blackwell is not tuned for M > 32768, got M=%d\n", M);
+        std::abort();
+    }
+}
 };  // namespace gemm_rs_blackwell
 
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH

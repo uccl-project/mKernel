@@ -134,7 +134,8 @@ struct fused_globals {
                   "A signal region must end on a C chunk boundary");
 
     __host__ __device__ static constexpr int ready_numel(int M, int N) {
-        return (M / NUM_DEVICES / ROW_BLOCK) * (N / COL_BLOCK) * SIGNALS_PER_TILE;
+        constexpr int divisor = NUM_DEVICES * ROW_BLOCK;
+        return ((M + divisor - 1) / divisor) * (N / COL_BLOCK) * SIGNALS_PER_TILE;
     }
 
     //  [tile_row, tile_col, region] indexing for the ready buffer
@@ -188,9 +189,13 @@ struct fused_globals {
     static constexpr bool SMEM_FITS = DYNAMIC_SHARED_MEMORY <= MAX_DYNAMIC_SHARED_MEMORY;
     static_assert(SMEM_FITS, "Pipeline stages exceed dynamic shared memory");
 
-    using A_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, A_tile>;
+    // we use the [TP, local_M, N] style for the tensor descriptor so we can minimize the amount of
+    // padding required for non-nice sequence lengths to just be just the nearest multiple of 8
+
+    // the TMA itself will handle the padding of local_M to the nearest tile multiple
+    using A_local_tensor = dist::local_tensor<comm::bf16, 1, -1, -1, -1, A_tile>;
     using B_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, B_tile>;
-    using C_local_tensor = dist::local_tensor<comm::bf16, 1, 1, -1, -1, C_tile>;
+    using C_local_tensor = dist::local_tensor<comm::bf16, 1, -1, -1, -1, C_tile>;
     using C_dist_tensor = dist::distributed_tensor<C_local_tensor, NUM_DEVICES, true>;
 
     // Peers bump counters through unicast pointers, so no multicast VA is needed.
@@ -237,7 +242,8 @@ template <int _SCHEDULER_SWIZZLE_SIZE,
           int _RS_STRIP_ROWS,
           int _CONSUMER_WARPS,
           typename DistributedTensor,
-          typename LocalTensor>
+          typename LocalTensor,
+          typename ReadyTensor>
 __host__ inline fused_globals<_SCHEDULER_SWIZZLE_SIZE,
                               _SIGNALS_PER_TILE,
                               _RS_STRIP_ROWS,
@@ -245,7 +251,7 @@ __host__ inline fused_globals<_SCHEDULER_SWIZZLE_SIZE,
 gemm_rs_blackwell_make_globals(LocalTensor& A,
                                LocalTensor& B,
                                DistributedTensor& C,
-                               DistributedTensor& sync,
+                               ReadyTensor& sync,
                                int dev_idx,
                                int M,
                                int N,
@@ -253,17 +259,22 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                                cudaStream_t stream) {
     using fg =
         fused_globals<_SCHEDULER_SWIZZLE_SIZE, _SIGNALS_PER_TILE, _RS_STRIP_ROWS, _CONSUMER_WARPS>;
+    // Slice each rank's sync buffer into the epoch word and the ready grid.
+    uint64_t epoch_ptrs[fg::NUM_DEVICES];
+    uint64_t ready_ptrs[fg::NUM_DEVICES];
+    const int ready_numel = fg::ready_numel(M, N);
+
 #ifndef MKERNEL_COMPILE_WITHOUT_TORCH
     if constexpr (std::is_same_v<LocalTensor, at::Tensor> &&
-                  std::is_same_v<DistributedTensor, dist::ParallelBuffer>) {
+                  std::is_same_v<DistributedTensor, dist::ParallelBuffer> &&
+                  std::is_same_v<ReadyTensor, dist::ParallelBuffer>) {
         // A CTA tile must not straddle two ranks' rows: the signal warp sends a whole
         // region to one rank, and the RS warps enumerate whole tiles per rank.
-        TORCH_CHECK((M / fg::NUM_DEVICES) % fg::ROW_BLOCK == 0 && N % fg::COL_BLOCK == 0,
+        TORCH_CHECK(M % fg::NUM_DEVICES == 0 && N % fg::COL_BLOCK == 0,
                     "M / world_size must be a multiple of ",
                     fg::ROW_BLOCK,
                     " and N a multiple of ",
                     fg::COL_BLOCK);
-        const int ready_numel = fg::ready_numel(M, N);
         TORCH_CHECK(sync.data_.element_size() == sizeof(uint32_t) &&
                         sync.data_.numel() == SYNC_BUFFER_WORDS,
                     "sync must be an int32 buffer of shape gemm_rs_blackwell_sync_shape");
@@ -277,9 +288,6 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                     "sync must span ",
                     fg::NUM_DEVICES,
                     " ranks");
-        // Slice each rank's sync buffer into the epoch word and the ready grid.
-        uint64_t epoch_ptrs[fg::NUM_DEVICES];
-        uint64_t ready_ptrs[fg::NUM_DEVICES];
         for (int i = 0; i < fg::NUM_DEVICES; i++) {
             epoch_ptrs[i] = reinterpret_cast<uint64_t>(sync.raw_ptrs_[i]);
             ready_ptrs[i] = epoch_ptrs[i] + SYNC_HEADER_BYTES;
@@ -288,9 +296,11 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
                 .M = M,
                 .N = N,
                 .K = K,
-                .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(A),
+                .A = dist::local_tensor_from_tensor<typename fg::A_local_tensor>(
+                    A, 1, fg::NUM_DEVICES, M / fg::NUM_DEVICES, K),
                 .B = dist::local_tensor_from_tensor<typename fg::B_local_tensor>(B),
-                .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(C),
+                .C = dist::distributed_tensor_from_buffer<typename fg::C_dist_tensor>(
+                    C, 1, fg::NUM_DEVICES, M / fg::NUM_DEVICES, N),
                 .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
                     ready_ptrs, 1, 1, 1, ready_numel),
                 .completion_epochs = dist::make_distributed_tensor<completion_epoch_dist_tensor>(
@@ -300,7 +310,39 @@ gemm_rs_blackwell_make_globals(LocalTensor& A,
         static_assert(always_false_v<LocalTensor>, "Unsupported LocalTensorType");
     }
 #else
-    static_assert(always_false_v<LocalTensor>, "Construct fused_globals directly without Torch");
+    if constexpr (std::is_same_v<LocalTensor, comm::bf16*> &&
+                  dist::RawDistributedMulticastTensorLike<DistributedTensor, comm::bf16> &&
+                  dist::RawDistributedTensorLike<ReadyTensor, comm::bf16>) {
+        for (int i = 0; i < fg::NUM_DEVICES; i++) {
+            epoch_ptrs[i] = reinterpret_cast<uint64_t>(sync.uc_ptrs[i]);
+            ready_ptrs[i] = epoch_ptrs[i] + SYNC_HEADER_BYTES;
+        }
+        return {
+            .dev_idx = dev_idx,
+            .M = M,
+            .N = N,
+            .K = K,
+            .A = dist::make_local_tensor<typename fg::A_local_tensor>(
+                reinterpret_cast<uint64_t>(A), 1, fg::NUM_DEVICES, M / fg::NUM_DEVICES, K),
+            .B = dist::make_local_tensor<typename fg::B_local_tensor>(
+                reinterpret_cast<uint64_t>(B), 1, 1, N, K),
+            .C = dist::make_distributed_tensor<typename fg::C_dist_tensor>(
+                reinterpret_cast<uint64_t>(C.mc),
+                reinterpret_cast<uint64_t*>(C.uc_ptrs),
+                1,
+                fg::NUM_DEVICES,
+                M / fg::NUM_DEVICES,
+                N),
+            .C_barrier = dist::make_distributed_tensor<typename fg::C_ready_barrier>(
+                ready_ptrs, 1, 1, 1, fg::ready_numel(M, N)),
+            .completion_epochs =
+                dist::make_distributed_tensor<completion_epoch_dist_tensor>(epoch_ptrs, 1, 1, 1, 1),
+            .stream = stream,
+        };
+    } else {
+        static_assert(always_false_v<LocalTensor>,
+                      "Construct fused_globals directly without Torch");
+    }
 #endif
 }
 
